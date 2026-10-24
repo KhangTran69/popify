@@ -1,4 +1,4 @@
-# CommerceOps
+# PoPify
 
 A local e-commerce operations demonstration: receive an order, detect a delay, prepare a grounded reply, request human approval, and audit a **mock** outcome. Three n8n workflows orchestrate durable work; FastAPI implements business rules and PostgreSQL preserves state. The operator console uses Jinja templates, CSS, and a small form-submission enhancement.
 
