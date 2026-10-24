@@ -739,6 +739,137 @@ def test_queue_context_survives_detail_navigation_and_approval_facts_are_grouped
     assert "Information gaps" in detail.text
 
 
+def test_approval_snapshots_request_policy_and_delay_evidence():
+    sign_in()
+    with TestingSession() as db:
+        order = Order(
+            external_id="snapshot-1", order_number="#SNAPSHOT-1",
+            email="buyer@example.test", fulfillment_status="unfulfilled",
+            created_at=utcnow() - timedelta(hours=72), payload={},
+        )
+        db.add(order)
+        db.commit()
+        support = create_support_case(
+            db, "Where is my order?", order.order_number, order.email
+        )
+        approval = db.scalar(select(Approval).where(
+            Approval.subject_type == "case", Approval.subject_id == support.id,
+            Approval.proposed_action == "send_reply",
+        ))
+        assert approval.supporting_facts["customer_message"] == "Where is my order?"
+        assert approval.supporting_facts["policy"] == settings.store_policies["order_status"]
+        support_id = approval.id
+        order_id = order.id
+    support_page = client.get(f"/approvals/{support_id}").text
+    assert "Captured when this approval was created" in support_page
+    assert "Where is my order?" in support_page
+    assert settings.store_policies["order_status"] in support_page
+
+    response = client.post(
+        "/api/n8n/delayed-exceptions",
+        headers={"X-N8N-Secret": settings.n8n_webhook_secret},
+    )
+    assert response.status_code == 200
+    with TestingSession() as db:
+        delayed = db.scalar(select(Approval).where(
+            Approval.subject_type == "order", Approval.subject_id == order_id,
+            Approval.proposed_action == "review_delayed_order",
+        ))
+        assert delayed.supporting_facts["hours_threshold"] == settings.order_delay_hours
+        delay_id = delayed.id
+    delay_page = client.get(f"/approvals/{delay_id}").text
+    assert "Applicable delay rule" in delay_page
+    assert f"{settings.order_delay_hours} hours" in delay_page
+    assert "Related support draft" not in delay_page
+
+
+def test_navigation_survives_decision_retry_and_related_links():
+    token = sign_in()
+    with TestingSession() as db:
+        order = Order(external_id="nav-1", order_number="#NAV-1", payload={})
+        db.add(order)
+        db.flush()
+        approval = create_approval(
+            db, "exception", "order", order.id, "review_delayed_order",
+            {"order_number": order.order_number, "hours_threshold": 48},
+        )
+        db.commit()
+        approval_id, order_id = approval.id, order.id
+    context = "?from_queue=approvals&q=review&status=pending&page=1"
+    detail = client.get(f"/approvals/{approval_id}{context}").text
+    assert f"/orders/{order_id}?from_queue=approvals&amp;q=review&amp;status=pending&amp;page=1" in detail
+    response = client.post(
+        f"/approvals/{approval_id}/decision{context}",
+        data={"csrf_token": token, "decision": "approved"}, follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/approvals/{approval_id}{context}"
+    assert 'href="/queues/approvals?q=review&amp;status=pending&amp;page=1"' in client.get(response.headers["location"]).text
+
+    with TestingSession() as db:
+        approval = db.get(Approval, approval_id)
+        approval.execution_status = "exhausted"
+        approval.next_attempt_at = None
+        db.commit()
+    failure_context = "?from_queue=failures&q=review&status=exhausted&page=1"
+    failure_page = client.get(f"/approvals/{approval_id}{failure_context}").text
+    assert "Eligible on the next worker run after requeue" in failure_page
+    retried = client.post(
+        f"/approvals/{approval_id}/retry{failure_context}",
+        data={"csrf_token": token}, follow_redirects=False,
+    )
+    assert retried.headers["location"] == f"/approvals/{approval_id}{failure_context}"
+    invalid = client.get(f"/approvals/{approval_id}?from_queue=//evil.test&status=exhausted&page=-1").text
+    assert 'href="/queues/approvals"' in invalid
+
+
+def test_guided_rejection_stops_outcome_and_links_back_to_run():
+    from app.models import Case
+
+    token = sign_in()
+    started = client.post(
+        "/demo/start", data={"csrf_token": token}, follow_redirects=False
+    )
+    delivery_id = int(started.headers["location"].rsplit("/", 1)[1])
+    with TestingSession() as db:
+        delivery = db.get(Delivery, delivery_id)
+        delivery.status = "processed"
+        order = Order(
+            shop_domain=delivery.shop_domain,
+            external_id=str(delivery.payload["id"]),
+            order_number=delivery.payload["name"], payload={},
+        )
+        db.add(order)
+        db.flush()
+        create_approval(
+            db, "exception", "order", order.id, "review_delayed_order",
+            {"order_number": order.order_number},
+        )
+        case = Case(
+            message="Where is my order?", status="needs_review",
+            request_key=f"guided-support:{delivery_id}", order_id=order.id,
+        )
+        db.add(case)
+        db.flush()
+        reply = create_approval(
+            db, "support", "case", case.id, "send_reply",
+            {"order_number": order.order_number,
+             "correlation_id": f"guided-support:{delivery_id}"},
+        )
+        db.commit()
+        reply_id = reply.id
+    rejected = client.post(
+        f"/approvals/{reply_id}/decision?from_demo={delivery_id}",
+        data={"csrf_token": token, "decision": "rejected"},
+        follow_redirects=False,
+    )
+    assert rejected.headers["location"] == f"/approvals/{reply_id}?from_demo={delivery_id}"
+    assert f'href="/demo/{delivery_id}"' in client.get(rejected.headers["location"]).text
+    demo = client.get(f"/demo/{delivery_id}").text
+    assert "Stopped · approval rejected" in demo
+    assert "No mock reply will run" in demo
+
+
 def test_retry_after_lower_bound_and_cap():
     from app.services import retry_delay
 
@@ -962,6 +1093,7 @@ def test_dashboard_distinguishes_worker_failure_from_business_completion():
     assert "1</strong><span>Retries eligible now" in page.text
     assert "Oldest intake queue age" in page.text
     assert "Last worker failure" in page.text
+    assert "retrying or failed items to monitor" in page.text
 
 
 def test_guided_demo_does_not_present_failed_triage_as_complete():

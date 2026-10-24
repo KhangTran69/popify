@@ -256,6 +256,11 @@ def create_support_case(
     )
     facts = {
         "order_number": order.order_number if order else None,
+        "customer_message": message,
+        "policy": policies[category],
+        "order_fulfillment_status": order.fulfillment_status if order else None,
+        "order_total": f"{order.currency} {order.total}" if order else None,
+        "order_source_updated_at": order.source_updated_at.isoformat() if order and order.source_updated_at else None,
         "category": category,
         "confidence": confidence,
         "draft": draft,

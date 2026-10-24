@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.db import Base, engine, get_db
 from app.config import settings
 from app.models import Order, Delivery, Case, Approval, Audit, ActionExecution, utcnow
+from app.presentation import record_navigation, retry_guidance, snapshot_utc
 from app.services import (
     verify_shopify,
     process_delivery,
@@ -26,6 +27,7 @@ from app.services import (
     execute_approved,
     audit,
     as_utc,
+    parse_dt,
     SupportRequestKeyConflict,
 )
 
@@ -35,6 +37,7 @@ templates = Jinja2Templates(directory="app/templates")
 templates.env.filters["utc"] = lambda value: (
     as_utc(value).strftime("%d %b %Y · %H:%M UTC") if value else "Not recorded"
 )
+templates.env.filters["snapshot_utc"] = snapshot_utc
 
 
 @asynccontextmanager
@@ -245,6 +248,11 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         + count(Case, Case.status == "exhausted")
         + count(Approval, Approval.execution_status == "exhausted")
     )
+    counts["needs_operator"] = (
+        count(Approval, Approval.execution_status.in_(["exhausted", "ambiguous"]))
+        + count(Delivery, Delivery.status == "exhausted")
+        + count(Case, Case.status == "exhausted")
+    )
     oldest = min(
         (
             as_utc(value)
@@ -414,6 +422,8 @@ def guided_demo(
     order, exception, case, reply, automatic_work_pending = guided_demo_records(
         delivery, db
     )
+    source_created = order.created_at if order else parse_dt(delivery.payload.get("created_at"))
+    order_age_hours = max(0, int((utcnow() - as_utc(source_created)).total_seconds() // 3600))
     return templates.TemplateResponse(
         request,
         "demo.html",
@@ -429,6 +439,7 @@ def guided_demo(
             "reply": reply,
             "auto_refresh": automatic_work_pending,
             "delay_hours": settings.order_delay_hours,
+            "order_age_hours": order_age_hours,
             "now": utcnow(),
         },
     )
@@ -669,19 +680,12 @@ def detail_response(kind, record_id, request, actor, db):
         if kind == "order"
         else f"{kind.title()} #{entity.id}"
     )
-    from_queue = request.query_params.get("from_queue", "")
-    back_url = "/queues/" + from_queue if from_queue in {
-        "orders", "cases", "approvals", "failures", "deliveries"
-    } else "/queues/" + {
-        "order": "orders", "case": "cases", "approval": "approvals", "delivery": "deliveries"
-    }[kind]
-    back_params = {
-        key: request.query_params[key]
-        for key in ("q", "status", "page")
-        if key in request.query_params
-    }
-    if back_params:
-        back_url += "?" + urlencode(back_params)
+    detail_query, back_url = record_navigation(request.query_params, kind)
+    subject = None
+    current_order = None
+    if kind == "approval":
+        subject = db.get(Order if entity.subject_type == "order" else Case, entity.subject_id)
+        current_order = subject if entity.subject_type == "order" else subject.order if subject else None
     return templates.TemplateResponse(
         request,
         "detail.html",
@@ -695,6 +699,10 @@ def detail_response(kind, record_id, request, actor, db):
             "timeline": timeline,
             "related": related,
             "back_url": back_url,
+            "detail_query": detail_query,
+            "retry_guidance": retry_guidance,
+            "subject": subject,
+            "current_order": current_order,
         },
     )
 
@@ -766,7 +774,8 @@ def retry_delivery(
         correlation_id=delivery.webhook_id,
     )
     db.commit()
-    return RedirectResponse(f"/deliveries/{delivery_id}", status_code=303)
+    suffix, _ = record_navigation(request.query_params, "delivery")
+    return RedirectResponse(f"/deliveries/{delivery_id}{suffix}", status_code=303)
 
 
 @app.post("/approvals/{approval_id}/decision")
@@ -785,7 +794,8 @@ def approval_decision(
         decide_approval(db, approval_id, decision, actor)
     except LookupError:
         raise HTTPException(404)
-    return RedirectResponse(f"/approvals/{approval_id}", status_code=303)
+    suffix, _ = record_navigation(request.query_params, "approval")
+    return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 
 
 @app.post("/approvals/{approval_id}/retry")
@@ -815,7 +825,8 @@ def retry(
         approval.next_attempt_at = utcnow()
     audit(db, "approval", approval.id, "manual_retry_queued", actor)
     db.commit()
-    return RedirectResponse(f"/approvals/{approval_id}", status_code=303)
+    suffix, _ = record_navigation(request.query_params, "approval")
+    return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 
 
 @app.post("/webhooks/shopify/orders")
@@ -1017,7 +1028,8 @@ def retry_case(
         correlation_id=case.correlation_id,
     )
     db.commit()
-    return RedirectResponse(f"/cases/{case.id}", 303)
+    suffix, _ = record_navigation(request.query_params, "case")
+    return RedirectResponse(f"/cases/{case.id}{suffix}", 303)
 
 
 @app.get("/support", response_class=HTMLResponse)
@@ -1127,6 +1139,9 @@ def scan_delayed(
                 "order_number": o.order_number,
                 "hours_threshold": settings.order_delay_hours,
                 "created_at": o.created_at.isoformat(),
+                "order_fulfillment_status": o.fulfillment_status,
+                "order_total": f"{o.currency} {o.total}",
+                "order_source_updated_at": o.source_updated_at.isoformat(),
             },
         )
         created.append(a.id)
