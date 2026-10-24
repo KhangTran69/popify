@@ -620,6 +620,9 @@ def queue_page(
             "page": page,
             "pages": pages,
             "total": total,
+            "record_query": urlencode(
+                {"from_queue": section, "q": q, "status": status, "page": page}
+            ),
             "previous": "?" + urlencode({"q": q, "status": status, "page": page - 1}),
             "next": "?" + urlencode({"q": q, "status": status, "page": page + 1}),
         },
@@ -666,6 +669,19 @@ def detail_response(kind, record_id, request, actor, db):
         if kind == "order"
         else f"{kind.title()} #{entity.id}"
     )
+    from_queue = request.query_params.get("from_queue", "")
+    back_url = "/queues/" + from_queue if from_queue in {
+        "orders", "cases", "approvals", "failures", "deliveries"
+    } else "/queues/" + {
+        "order": "orders", "case": "cases", "approval": "approvals", "delivery": "deliveries"
+    }[kind]
+    back_params = {
+        key: request.query_params[key]
+        for key in ("q", "status", "page")
+        if key in request.query_params
+    }
+    if back_params:
+        back_url += "?" + urlencode(back_params)
     return templates.TemplateResponse(
         request,
         "detail.html",
@@ -678,6 +694,7 @@ def detail_response(kind, record_id, request, actor, db):
             "kind": kind,
             "timeline": timeline,
             "related": related,
+            "back_url": back_url,
         },
     )
 
