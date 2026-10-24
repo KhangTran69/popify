@@ -137,7 +137,11 @@ def workflow_activity(db):
     ]:
         last = db.scalar(
             select(Audit)
-            .where(Audit.entity_type == "workflow", Audit.entity_id == number)
+            .where(
+                Audit.entity_type == "workflow",
+                Audit.entity_id == number,
+                Audit.event.in_(["work_completed", "work_failed", "poll_completed"]),
+            )
             .order_by(Audit.id.desc())
             .limit(1)
         )
@@ -151,6 +155,16 @@ def workflow_activity(db):
             .order_by(Audit.id.desc())
             .limit(1)
         )
+        failure = db.scalar(
+            select(Audit)
+            .where(
+                Audit.entity_type == "workflow",
+                Audit.entity_id == number,
+                Audit.event == "work_failed",
+            )
+            .order_by(Audit.id.desc())
+            .limit(1)
+        )
         recent = bool(
             last and (utcnow() - as_utc(last.created_at)).total_seconds() < 180
         )
@@ -160,18 +174,19 @@ def workflow_activity(db):
                 "label": label,
                 "last": last,
                 "success": success,
+                "failure": failure,
                 "recent": recent,
             }
         )
     return result
 
 
-def heartbeat(db, number, result, completed=False):
+def heartbeat(db, number, result, completed=False, failed=False):
     audit(
         db,
         "workflow",
         number,
-        "work_completed" if completed else "poll_completed",
+        "work_failed" if failed else "work_completed" if completed else "poll_completed",
         details=result,
     )
     db.commit()
@@ -204,6 +219,44 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         + count(Case, Case.status == "queued")
         + count(Approval, Approval.execution_status == "queued"),
     }
+    now = utcnow()
+    counts["due_retries"] = (
+        count(
+            Delivery,
+            Delivery.status.in_(["failed", "received"]),
+            Delivery.attempts > 0,
+            Delivery.next_attempt_at <= now,
+        )
+        + count(
+            Case,
+            Case.status.in_(["failed", "queued"]),
+            Case.attempts > 0,
+            Case.next_attempt_at <= now,
+        )
+        + count(
+            Approval,
+            Approval.execution_status.in_(["retryable", "queued"]),
+            Approval.attempts > 0,
+            Approval.next_attempt_at <= now,
+        )
+    )
+    counts["exhausted"] = (
+        count(Delivery, Delivery.status == "exhausted")
+        + count(Case, Case.status == "exhausted")
+        + count(Approval, Approval.execution_status == "exhausted")
+    )
+    oldest = min(
+        (
+            as_utc(value)
+            for value in (
+                db.scalar(select(func.min(Delivery.received_at)).where(Delivery.status == "received")),
+                db.scalar(select(func.min(Case.created_at)).where(Case.status == "queued")),
+            )
+            if value is not None
+        ),
+        default=None,
+    )
+    counts["oldest_queue_minutes"] = max(0, int((now - oldest).total_seconds() // 60)) if oldest else None
     done = db.execute(
         select(Delivery.received_at, Delivery.processed_at).where(
             Delivery.processed_at.is_not(None)
@@ -335,7 +388,7 @@ def guided_demo_records(delivery, db):
                 )
             )
     automatic_work_pending = (
-        delivery.status == "received"
+        delivery.status in ("received", "failed")
         or (order is not None and exception is None)
         or (case is not None and case.status in ("queued", "failed"))
         or any(
@@ -863,7 +916,11 @@ def n8n_next(
         .limit(1)
     )
     result = process_delivery(db, pending.id) if pending else {"status": "idle"}
-    return heartbeat(db, 1, result, result["status"] == "processed")
+    return heartbeat(
+        db, 1, result,
+        completed=result["status"] == "processed",
+        failed=result["status"] in ("failed", "exhausted"),
+    )
 
 
 class Inquiry(BaseModel):
@@ -913,7 +970,8 @@ def triage_next(
         db,
         2,
         {"case_id": case.id, "status": case.status},
-        case.status == "needs_review",
+        completed=case.status == "needs_review",
+        failed=case.status in ("failed", "exhausted"),
     )
 
 
@@ -1071,8 +1129,11 @@ def scan_delayed(
         .limit(20)
         .with_for_update(skip_locked=True)
     ).all()
+    action_outcomes = {"succeeded": 0, "retryable": 0, "exhausted": 0, "ambiguous": 0}
     for approval in pending:
         execute_approved(db, approval)
+        if approval.execution_status in action_outcomes:
+            action_outcomes[approval.execution_status] += 1
     db.commit()
     return heartbeat(
         db,
@@ -1081,8 +1142,10 @@ def scan_delayed(
             "open_delayed_orders": len(created),
             "new_exceptions": new_exceptions,
             "actions_processed": len(pending),
+            "action_outcomes": action_outcomes,
         },
-        bool(pending or new_exceptions),
+        completed=bool(new_exceptions or action_outcomes["succeeded"]),
+        failed=bool(action_outcomes["retryable"] or action_outcomes["exhausted"] or action_outcomes["ambiguous"]),
     )
 
 

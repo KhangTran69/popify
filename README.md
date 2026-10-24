@@ -98,6 +98,7 @@ Then wait for the order workflow or trigger it manually. A configured real Shopi
 
 ![Operator overview](docs/screenshots/overview.png)
 ![Approval record and audited timeline](docs/screenshots/approval.png)
+![Completed guided demonstration](docs/screenshots/guided-demo.png)
 
 The console includes overview metrics, order/support/approval/delivery queues, an action failure queue, search, status filters, 12-record pagination, linked detail pages, and event timelines. An order timeline includes linked support and approval events. Failed support cases and deliveries offer their own retry controls; action failures distinguish retryable, exhausted, and ambiguous outcomes. Browser mutations require authenticated sessions and CSRF tokens.
 
@@ -111,6 +112,9 @@ Queued records offer a refresh control. POST buttons display a working state and
 - **Recovery count:** currently retryable, exhausted, or ambiguous action records plus failed/exhausted deliveries and support cases.
 - **Receipt to persistence:** mean duration across processed deliveries, with sample count. This includes queue wait and is not pure API latency.
 - **Automation activity:** actual authenticated worker calls. Older than three minutes is shown as no recent activity; this is not a claim that the n8n process is down. Last completed work is shown separately from idle polls.
+- **Worker failures:** a failed business attempt is recorded separately from idle polls and completed business work. A guided trigger request alone does not count as a worker call.
+- **Oldest intake queue age:** age in whole minutes of the oldest received delivery or queued support case. Approved actions are excluded because their original record creation time predates approval.
+- **Due retries/exhausted:** retryable delivery, support, and action records whose deadline has passed; and records whose retry budget is exhausted. These are current counts, not lifetime totals.
 
 No manual-time-saved or business-impact estimate is reported.
 
@@ -163,6 +167,8 @@ The behavior suite uses isolated SQLite, resets state between tests, and tests a
 The PostgreSQL verifier creates its own randomly named temporary schema, runs six concurrent workers per scenario, and removes only that schema afterward. It exercises concurrent webhook retries, duplicate workers, concurrent first inserts/out-of-order updates, repeated approval, and repeated execution. It does not clear the application's tables.
 
 The demo exercises actual n8n HTTP triggers, PostgreSQL persistence, authenticated decisions, and mock execution. Importable JSON parsing is a separate check and is not claimed as workflow execution evidence. Current measured results are in [PORTFOLIO.md](PORTFOLIO.md).
+
+To check restart recovery without clearing data: stop only n8n (`docker compose stop n8n`), queue a synthetic order through the guided demo or an existing local fixture, restart the API (`docker compose restart api`), then start n8n (`docker compose start n8n`). The queued delivery should remain visible, and workflow 01 should process it after n8n resumes. The 24 October 2026 check used delivery `restart-b6c57714b2`: it remained queued across the API restart and was processed once after the n8n trigger, creating order 14.
 
 GitHub Actions runs the SQLite behavior suite, verifies that exactly three exported workflows contain schedule, webhook, and worker nodes with resolvable connections, and runs the six-worker concurrency verifier against PostgreSQL 16. No Shopify or LLM credentials are required. `requirements.lock` and `requirements-test.lock` pin the runtime and test dependency closures used by the container and CI.
 

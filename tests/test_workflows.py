@@ -902,3 +902,47 @@ def test_ambiguous_action_cannot_be_manually_requeued():
     assert response.status_code == 409
     with TestingSession() as db:
         assert db.get(Approval, aid).execution_status == "ambiguous"
+
+
+def test_dashboard_distinguishes_worker_failure_from_business_completion():
+    from app.models import Audit, Case
+
+    token = sign_in()
+    with TestingSession() as db:
+        db.add(Case(message="retry me", status="failed", attempts=1, next_attempt_at=utcnow() - timedelta(minutes=1)))
+        db.add(Delivery(webhook_id="waiting", topic="orders/create", shop_domain="demo.myshopify.com", payload={}, status="received", received_at=utcnow() - timedelta(minutes=7)))
+        db.commit()
+        main.audit(db, "workflow", 2, "guided_demo_triggered")
+        db.commit()
+        assert main.workflow_activity(db)[1]["last"] is None
+        main.heartbeat(db, 2, {"status": "failed"}, failed=True)
+        activity = main.workflow_activity(db)[1]
+        assert activity["last"].event == "work_failed"
+        assert activity["success"] is None
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "Retries eligible now" in page.text
+    assert "1</strong><span>Retries eligible now" in page.text
+    assert "Oldest intake queue age" in page.text
+    assert "Last worker failure" in page.text
+
+
+def test_guided_demo_does_not_present_failed_triage_as_complete():
+    from app.models import Case
+
+    token = sign_in()
+    started = client.post("/demo/start", data={"csrf_token": token}, follow_redirects=False)
+    delivery_id = int(started.headers["location"].rsplit("/", 1)[1])
+    with TestingSession() as db:
+        delivery = db.get(Delivery, delivery_id)
+        delivery.status = "processed"
+        order = Order(shop_domain="demo.myshopify.com", external_id=delivery.payload["id"], order_number=delivery.payload["name"], email=delivery.payload["email"], payload=delivery.payload)
+        db.add(order)
+        db.flush()
+        create_approval(db, "exception", "order", order.id, "review_delayed_order", {})
+        db.add(Case(message="Where is my order?", status="failed", request_key=f"guided-support:{delivery_id}", failure_detail="SimulatedFailure"))
+        db.commit()
+    page = client.get(f"/demo/{delivery_id}")
+    assert page.status_code == 200
+    assert "Triage did not complete" in page.text
+    assert "inspect the failure" in page.text
