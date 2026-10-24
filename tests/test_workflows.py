@@ -702,6 +702,43 @@ def test_search_filter_pagination_and_unknown_page():
     assert client.get("/queues/unknown").status_code == 404
 
 
+def test_queue_context_survives_detail_navigation_and_approval_facts_are_grouped():
+    sign_in()
+    with TestingSession() as db:
+        order = Order(
+            external_id="context-1", order_number="#CONTEXT-1", payload={}
+        )
+        db.add(order)
+        db.flush()
+        approval = create_approval(
+            db,
+            "support",
+            "order",
+            order.id,
+            "send_reply",
+            {
+                "order_number": order.order_number,
+                "category": "order_status",
+                "confidence": 80,
+                "draft": "A grounded draft.",
+                "missing_info": "Verified order reference",
+            },
+        )
+        db.commit()
+        order_id, approval_id = order.id, approval.id
+
+    queue = client.get("/queues/orders?q=CONTEXT&status=unfulfilled&page=1")
+    assert f"/orders/{order_id}?from_queue=orders&amp;q=CONTEXT&amp;status=unfulfilled&amp;page=1" in queue.text
+    detail = client.get(
+        f"/approvals/{approval_id}?from_queue=approvals&q=send_reply&status=pending&page=2"
+    )
+    assert 'href="/queues/approvals?q=send_reply&amp;status=pending&amp;page=2"' in detail.text
+    assert "Verified order context" in detail.text
+    assert "Triage assessment" in detail.text
+    assert "Draft response" in detail.text and "A grounded draft." in detail.text
+    assert "Information gaps" in detail.text
+
+
 def test_retry_after_lower_bound_and_cap():
     from app.services import retry_delay
 
