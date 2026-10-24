@@ -96,11 +96,14 @@ Then wait for the order workflow or trigger it manually. A configured real Shopi
 
 ## Operator interface
 
-![Operator overview](docs/screenshots/overview.png)
-![Approval record and audited timeline](docs/screenshots/approval.png)
-![Completed guided demonstration](docs/screenshots/guided-demo.png)
+The preview images below come from an isolated synthetic database. They show the current interface, not a live n8n execution. The earlier verified walkthrough images remain as `overview.png`, `approval.png`, and `guided-demo.png` in the same folder.
 
-The console includes overview metrics, order/support/approval/delivery queues, an action failure queue, search, status filters, 12-record pagination, linked detail pages, and event timelines. Queue search, status, and page context is preserved when opening a record and returning to its queue. An order timeline includes linked support and approval events. Approval records group verified order context, triage assessment, draft response, and missing information so the operator can review each separately. Failed support cases and deliveries offer their own retry controls; action failures distinguish retryable, exhausted, and ambiguous outcomes, and show the preserved retry deadline. Browser mutations require authenticated sessions and CSRF tokens.
+![Operator overview with recovery priority](docs/screenshots/overview-preview.jpg)
+![Approval request, policy, order facts, and mock decision](docs/screenshots/approval-preview.jpg)
+![Guided demonstration entry](docs/screenshots/guided-demo-preview.jpg)
+![Mobile delayed-order approval](docs/screenshots/mobile-approval-preview.jpg)
+
+The console includes overview metrics, order/support/approval/delivery queues, an action failure queue, search, status filters, 12-record pagination, linked detail pages, and event timelines. Queue search, status, and page context is preserved when opening a record and returning to its queue. An order timeline includes linked support and approval events. Approval records distinguish the customer request, policy, order state captured at approval creation, current order state, proposed action, draft, and information gaps. Delay review records retain the threshold and order timing evidence. Older records explicitly identify facts that were not captured. Decision and retry redirects preserve validated local queue or guided-run context. Failed support cases and deliveries offer their own retry controls; action failures distinguish retryable, exhausted, and ambiguous outcomes, and show whether a retry is eligible now, waiting for backoff, or needs manual recovery. Browser mutations require authenticated sessions and CSRF tokens.
 
 Queued records offer a refresh control. POST buttons display a working state and disable duplicate submissions; server constraints and transactions provide the actual safety. Missing records, authentication failures, validation problems, and empty search results have readable states. No external font or image dependency is required.
 
