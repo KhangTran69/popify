@@ -1,0 +1,105 @@
+{
+  "name": "CommerceOps 02 - Customer support triage",
+  "nodes": [
+    {
+      "id": "92a49167-ada3-4fdf-9a9d-4cfa869e0efd",
+      "name": "Poll queued inquiries",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        200
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "128f8e98-9739-4e4f-8229-9125dee043a7",
+      "name": "Run queued work now",
+      "webhookId": "074bda6d-b61d-47ee-9daf-1de53088695c",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        400
+      ],
+      "parameters": {
+        "path": "commerceops/support/triage",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "3d71cd34-8a51-4240-a1d2-03ec7cbbc87f",
+      "name": "Draft next queued inquiry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        250
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/n8n/triage-next",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{$env.N8N_WEBHOOK_SECRET}}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Poll queued inquiries": {
+      "main": [
+        [
+          {
+            "node": "Draft next queued inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run queued work now": {
+      "main": [
+        [
+          {
+            "node": "Draft next queued inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "all",
+    "timezone": "UTC"
+  },
+  "versionId": "0c19d5b8-877b-4c7a-a191-4cfe6bde51b8",
+  "meta": {
+    "description": "Every minute, process a durable support inquiry submitted through the operator form or authenticated API. The manual local trigger also drains one queued inquiry. It does not accept customer payloads. Replies always require human approval."
+  },
+  "tags": [],
+  "id": "KUEMGUb4u6em38fm"
+}

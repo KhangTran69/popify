@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: commerceops
+      POSTGRES_USER: commerceops
+      POSTGRES_PASSWORD: commerceops
+    volumes: ["commerceops_pg:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U commerceops -d commerceops"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://commerceops:commerceops@db:5432/commerceops
+    ports: ["127.0.0.1:8001:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  n8n:
+    image: n8nio/n8n:2.44.6
+    ports: ["127.0.0.1:5678:5678"]
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_WEBHOOK_SECRET: ${N8N_WEBHOOK_SECRET}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      GENERIC_TIMEZONE: UTC
+    entrypoint: ["/bin/sh", "/commerceops-scripts/n8n-entrypoint.sh"]
+    volumes: ["n8n_data:/home/node/.n8n", "./workflows:/workflows:ro", "./scripts:/commerceops-scripts:ro"]
+    depends_on: [api]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch(\"http://127.0.0.1:5678/healthz\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+volumes:
+  commerceops_pg:
+  n8n_data:

@@ -1,0 +1,11 @@
+ALTER TABLE deliveries ADD COLUMN next_attempt_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE support_cases ADD COLUMN request_key VARCHAR(150) UNIQUE;
+ALTER TABLE support_cases ADD COLUMN order_ref VARCHAR(100);
+ALTER TABLE support_cases ADD COLUMN correlation_id VARCHAR(150);
+ALTER TABLE support_cases ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE support_cases ADD COLUMN failure_detail TEXT;
+ALTER TABLE support_cases ADD COLUMN next_attempt_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE approvals ADD COLUMN next_attempt_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE audit_events ALTER COLUMN correlation_id TYPE VARCHAR(150);
+CREATE INDEX ix_delivery_due ON deliveries (status, next_attempt_at);
+CREATE INDEX ix_case_due ON support_cases (status, next_attempt_at);

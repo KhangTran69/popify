@@ -1,0 +1,58 @@
+name: CommerceOps checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-workflow-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-test.lock
+      - run: python -m pip install -r requirements-test.lock
+      - run: python -m pip install --no-deps -e .
+      - run: python -m pytest -q
+      - run: python -m scripts.validate_workflows
+
+  postgres-concurrency:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: commerceops
+          POSTGRES_USER: commerceops
+          POSTGRES_PASSWORD: commerceops
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U commerceops -d commerceops"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://commerceops:commerceops@localhost:5432/commerceops
+      APP_SECRET: ci-only-secret
+      OPERATOR_USERNAME: operator
+      OPERATOR_PASSWORD: ci-only-password
+      N8N_WEBHOOK_SECRET: ci-only-webhook-secret
+      LLM_MODE: mock
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-test.lock
+      - run: python -m pip install -r requirements-test.lock
+      - run: python -m pip install --no-deps -e .
+      - run: python -m scripts.migrate
+      - run: python -m scripts.verify_postgres

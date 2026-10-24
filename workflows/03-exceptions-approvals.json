@@ -1,0 +1,105 @@
+{
+  "name": "CommerceOps 03 - Delayed order exception scan",
+  "nodes": [
+    {
+      "id": "f73732e7-5472-4540-8bd7-021ad3c54442",
+      "name": "Scan and execute due work",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        200
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b82a75dc-6079-4a9c-9de7-66090cb5f443",
+      "name": "Run queued work now",
+      "webhookId": "0889f526-fcbf-4c59-82c8-113fba8a11c7",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        400
+      ],
+      "parameters": {
+        "path": "commerceops/exceptions/scan",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "1a865cbd-dae6-4243-9819-9547acaefb5b",
+      "name": "Detect exceptions and execute approved actions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        250
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/n8n/delayed-exceptions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{$env.N8N_WEBHOOK_SECRET}}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Scan and execute due work": {
+      "main": [
+        [
+          {
+            "node": "Detect exceptions and execute approved actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run queued work now": {
+      "main": [
+        [
+          {
+            "node": "Detect exceptions and execute approved actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "all",
+    "timezone": "UTC"
+  },
+  "versionId": "419cd0b3-9578-402c-a2d1-ca3687cb527d",
+  "meta": {
+    "description": "Every minute, detect delayed orders and execute only due, explicitly approved mock actions. Retry scheduling is persisted, ambiguous outcomes are blocked, exhausted attempts require manual requeue."
+  },
+  "tags": [],
+  "id": "408QWxclfo7d76fY"
+}

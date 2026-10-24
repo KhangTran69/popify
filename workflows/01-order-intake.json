@@ -1,0 +1,108 @@
+{
+  "name": "CommerceOps 01 - Shopify order intake",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "42e978af-0816-4276-9881-5efde777918c",
+      "name": "Poll durable Shopify deliveries",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/n8n/process-next",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{$env.N8N_WEBHOOK_SECRET}}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "496a3909-14a9-4a1c-86eb-d6cd0b3dbb8e",
+      "name": "Process next durable event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "2aa7b3da-74fd-4aff-b126-92e1711f72b8",
+      "name": "Run queued work now",
+      "webhookId": "c3fc57a0-555d-4a02-8d71-96ef0dbfd582",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        480
+      ],
+      "parameters": {
+        "path": "commerceops/orders/process",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Poll durable Shopify deliveries": {
+      "main": [
+        [
+          {
+            "node": "Process next durable event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run queued work now": {
+      "main": [
+        [
+          {
+            "node": "Process next durable event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "all",
+    "timezone": "UTC"
+  },
+  "versionId": "9f40a587-137f-4ba3-a727-f0b9e30a6f8b",
+  "meta": {
+    "description": "Shopify must POST directly to FastAPI /webhooks/shopify/orders so FastAPI can verify the exact raw body HMAC and persist the delivery before acknowledging. n8n polls the durable queue every minute and processes one delivery per execution. Failed poll executions can be retried from n8n Executions."
+  },
+  "tags": [],
+  "id": "mf9vs7gTVY8xDqi0"
+}
