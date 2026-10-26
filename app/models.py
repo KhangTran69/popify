@@ -38,6 +38,7 @@ class Order(Base):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     __table_args__ = (
         UniqueConstraint("shop_domain", "external_id", name="uq_order_external"),
+        Index("ix_orders_delay_scan", "fulfillment_status", "created_at", "id"),
     )
 
 
@@ -97,6 +98,10 @@ class Approval(Base):
     subject_type: Mapped[str] = mapped_column(String(40))
     subject_id: Mapped[int] = mapped_column(Integer)
     proposed_action: Mapped[str] = mapped_column(String(80))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    replacement_approval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("approvals.id"), nullable=True
+    )
     supporting_facts: Mapped[dict] = mapped_column(JSON, default=dict)
     evidence_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="pending")
@@ -119,7 +124,8 @@ class Approval(Base):
             "subject_type",
             "subject_id",
             "proposed_action",
-            name="uq_approval_action",
+            "revision",
+            name="uq_approval_revision",
         ),
     )
 

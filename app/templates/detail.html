@@ -29,7 +29,7 @@
         <h3>Draft response</h3><div class="draft">{{ entity.draft or 'Queued for triage. Refresh after the next n8n run.' }}</div>
         <p class="field-help">Draft only. Any completed response is a mock action.</p>
         {% if entity.missing_info %}<div class="notice warn"><strong>Review needed</strong><p>{{ entity.missing_info }}</p></div>{% endif %}
-        {% if entity.failure_detail %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
+        {% if entity.failure_detail and entity.execution_status not in ['evidence_changed', 'invalid_action'] %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
         {% if entity.status in ['failed', 'exhausted'] %}
           <div class="notice warn"><strong>{{ 'Recovery required' if entity.status == 'exhausted' else 'Triage failed' }}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
           <form method="post" action="/cases/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue triage retry</button></form>
@@ -54,17 +54,26 @@
         {% set facts = entity.supporting_facts or {} %}
         <dl class="facts">
           <dt>Subject</dt><dd><a href="/{{ 'orders' if entity.subject_type == 'order' else 'cases' }}/{{ entity.subject_id }}{{ detail_query }}">{{ entity.subject_type.title() }} #{{ entity.subject_id }} ↗</a></dd>
-          <dt>Decision</dt><dd><span class="pill {{ 'warn' if entity.status == 'pending' else 'good' if entity.status == 'approved' else '' }}">{{ entity.status }}</span></dd>
+          <dt>Decision</dt><dd><span class="pill {{ 'warn' if entity.status == 'pending' else 'good' if entity.status == 'approved' else 'bad' if entity.status == 'superseded' else '' }}">{{ entity.status }}</span>{% if entity.revision > 1 %}<small>Revision {{ entity.revision }}</small>{% endif %}</dd>
           <dt>Decided by</dt><dd>{{ entity.actor or 'Awaiting operator' }}</dd>
           <dt>Decision time</dt><dd>{{ entity.decision_at|utc }}</dd>
           <dt>Execution</dt><dd><span class="pill {{ 'good' if entity.execution_status == 'succeeded' else 'bad' if entity.execution_status in ['ambiguous', 'exhausted', 'evidence_changed', 'invalid_action'] else 'warn' }}">{{ entity.execution_status.replace('_', ' ') }}</span></dd>
           <dt>Attempts</dt><dd>{{ entity.attempts }}</dd>
           <dt>Next attempt</dt><dd>{{ entity.next_attempt_at|utc }}</dd>
         </dl>
+        {% if freshness_differences %}
+          <div class="notice error evidence-status"><strong>{{ 'This approval is historical' if entity.execution_status == 'succeeded' else 'Current facts differ from the reviewed snapshot' }}</strong><ul>{% for difference in freshness_differences %}<li>{{ difference }}</li>{% endfor %}</ul></div>
+          {% if refresh_supported and (entity.status == 'pending' or entity.execution_status == 'evidence_changed') and not entity.replacement_approval_id %}
+            <form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh approval from current facts</button></form>
+          {% endif %}
+        {% elif entity.status == 'superseded' %}
+          <div class="notice">This pending revision was superseded before a decision was recorded.</div>
+        {% endif %}
+        {% if entity.replacement_approval_id %}<div class="notice">A replacement approval is available: <a href="/approvals/{{ entity.replacement_approval_id }}{{ detail_query }}">Open replacement approval ↗</a></div>{% endif %}
         <div class="review-section">
           <h3>Proposed action</h3>
           <p><strong>{{ entity.proposed_action.replace('_', ' ').capitalize() }}</strong> · Mock action only</p>
-          <p class="field-help">{% if entity.proposed_action == 'send_reply' %}Approval queues a simulated reply for the next n8n action run. No message is sent.{% else %}Approval queues a simulated review outcome for the next n8n action run. No store or customer action is performed.{% endif %}</p>
+          <p class="field-help">{% if preview_mode %}This isolated preview records a local mock decision only; it does not call n8n or any external service.{% elif entity.proposed_action == 'send_reply' %}Approval queues a simulated reply for the next n8n action run. No message is sent.{% else %}Approval queues a simulated review outcome for the next n8n action run. No store or customer action is performed.{% endif %}</p>
         </div>
         {% if entity.subject_type == 'case' or 'customer_message' in facts %}
           <div class="review-section"><h3>Customer request</h3>
@@ -76,7 +85,11 @@
         <div class="review-section"><h3>Verified order context at approval request</h3>
           <dl class="facts compact-facts">
             <dt>Order reference</dt><dd>{{ facts.get('order_number') or 'No matched order recorded' }}</dd>
+            {% if 'customer_email' in facts %}<dt>Customer email</dt><dd>{{ facts.customer_email or 'Not provided' }}</dd>{% endif %}
+            {% if 'order_email' in facts %}<dt>Matched order email</dt><dd>{{ facts.order_email or 'No matched order' }}</dd>{% endif %}
+            {% if 'case_order_ref' in facts %}<dt>Reference supplied</dt><dd>{{ facts.case_order_ref or 'Not provided' }}</dd>{% endif %}
             {% if facts.get('order_fulfillment_status') %}<dt>Fulfillment</dt><dd>{{ facts.order_fulfillment_status }}</dd>{% endif %}
+            {% if facts.get('order_financial_status') %}<dt>Payment state</dt><dd>{{ facts.order_financial_status }}</dd>{% endif %}
             {% if facts.get('order_total') %}<dt>Total</dt><dd>{{ facts.order_total }}</dd>{% endif %}
             {% if facts.get('order_source_updated_at') %}<dt>Source updated</dt><dd>{{ facts.order_source_updated_at|snapshot_utc }}</dd>{% endif %}
             {% if entity.subject_type == 'order' %}
@@ -95,16 +108,18 @@
         {% else %}
           <div class="review-section"><h3>Applicable delay rule</h3><p>{{ 'Order has remained unfulfilled past the recorded ' ~ facts.hours_threshold ~ ' hour threshold.' if facts.get('hours_threshold') is not none else 'Delay threshold was not captured for this older approval.' }}</p></div>
         {% endif %}
-        {% set known = ['order_number', 'order_fulfillment_status', 'order_total', 'order_source_updated_at', 'correlation_id'] %}
+        {% set known = ['order_number', 'order_id', 'order_fulfillment_status', 'order_financial_status', 'order_total', 'order_source_updated_at', 'customer_email', 'case_order_ref', 'order_email', 'correlation_id', 'case_status'] %}
         {% if entity.subject_type == 'case' or 'customer_message' in facts %}{% set known = known + ['customer_message'] %}{% endif %}
         {% if entity.kind == 'support' or entity.subject_type == 'case' %}{% set known = known + ['policy', 'category', 'confidence', 'draft', 'missing_info'] %}{% endif %}
         {% if entity.subject_type == 'order' %}{% set known = known + ['created_at', 'hours_threshold'] %}{% endif %}
         {% for key, value in facts.items() if key not in known %}<div class="fact"><strong>{{ key.replace('_', ' ').capitalize() }}</strong><div>{{ value }}</div></div>{% endfor %}
         {% if entity.failure_detail %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
         {% if entity.status == 'pending' %}
-          <div class="decision"><p>Approving queues this mock action for n8n. Rejecting closes this request without executing it.</p>
-            <form method="post" action="/approvals/{{ entity.id }}/decision{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button name="decision" value="approved">Approve mock action</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
+          <div class="decision"><p>{% if preview_mode %}Approving or rejecting updates only this disposable synthetic record. Workflow execution is disabled in preview.{% else %}Approving queues this mock action for n8n. Rejecting closes this request without executing it.{% endif %}</p>
+            <form method="post" action="/approvals/{{ entity.id }}/decision{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}">{% if refresh_supported and not freshness_differences %}<button name="decision" value="approved">Approve mock action</button>{% else %}<span class="field-help">Approval is disabled until the evidence and action can be verified.</span>{% endif %} <button class="secondary" name="decision" value="rejected">Reject</button></form>
           </div>
+        {% elif entity.status == 'superseded' %}
+          <div class="notice">No decision was recorded for this revision. Use the linked replacement to review current facts.</div>
         {% elif entity.status == 'rejected' %}
           <div class="notice">Rejected by {{ entity.actor or 'operator' }}. No mock action will run for this approval.</div>
         {% elif entity.status == 'approved' and entity.execution_status in ['failed', 'retryable', 'exhausted'] %}
@@ -113,21 +128,22 @@
         {% elif entity.execution_status == 'ambiguous' %}
           <div class="notice warn">Outcome uncertain. Automatic retry is blocked. Reconcile the recorded mock result using approval:{{ entity.id }} before taking further action.</div>
         {% elif entity.execution_status == 'evidence_changed' %}
-          <div class="notice error"><strong>Execution blocked.</strong><p>The action or supporting evidence changed after approval. Reject this record and create a fresh approval from current facts before proceeding.</p></div>
+          <div class="notice error"><strong>Execution blocked.</strong><p>{% if refresh_blocked_by_execution %}The prior execution may have completed or has an uncertain outcome. Reconcile its persisted result before any replacement or retry.{% elif freshness_differences %}Review the current facts above and create a fresh pending approval before any further mock execution.{% else %}The stored execution contract does not match the reviewed action. A maintainer must reconcile the persisted execution before any replacement or retry.{% endif %}</p></div>
         {% elif entity.execution_status == 'invalid_action' %}
-          <div class="notice error"><strong>Execution blocked.</strong><p>This action has no registered mock adapter. Review the approval contract before creating a replacement.</p></div>
+          <div class="notice error"><strong>Execution blocked.</strong><p>This action has no registered mock adapter. No retry or replacement can be created here; a maintainer must correct the action contract before the source item is reprocessed.</p></div>
         {% elif entity.execution_status == 'succeeded' %}
           <div class="notice">Mock action completed. The timeline records the decision and execution.</div>
         {% elif entity.status == 'approved' %}
-          <div class="notice">Approved and waiting for n8n to run the queued mock action.</div>
+          <div class="notice">{% if preview_mode %}Decision recorded in the disposable preview. No workflow ran.{% else %}Approved and waiting for n8n to run the queued mock action.{% endif %}</div>
         {% endif %}
       {% endif %}
       {% if kind == 'approval' and entity.supporting_facts.get('correlation_id', '').startswith('guided-support:') %}
         <div class="related"><a href="/demo/{{ entity.supporting_facts.get('correlation_id').split(':')[-1] }}">← Back to guided run</a></div>
       {% endif %}
+      {% if approval_history %}<div class="related"><h3>Earlier approval revisions</h3>{% for a in approval_history %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · revision {{ a.revision }} <span>{{ a.status }} · {{ a.execution_status }} →</span></a>{% endfor %}</div>{% endif %}
       {% if related %}<div class="related"><h3>Related approvals</h3>{% for a in related %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · {{ a.proposed_action.replace('_', ' ') }} <span>{{ a.status }} →</span></a>{% endfor %}</div>{% endif %}
     </section>
-    <section class="box"><div class="panelhead timeline-heading"><h2>Event timeline</h2><span class="count">{{ timeline|length }}</span></div>
+    <section class="box"><div class="panelhead timeline-heading"><h2>Event timeline</h2><span class="count">{{ timeline|length }}</span></div>{% if timeline_limited or related_cases_limited %}<p class="field-help">Showing at most the latest 100 related events{% if related_cases_limited %} across the 100 most recent related support cases{% endif %}.</p>{% endif %}
       <div class="timeline">{% for e in timeline %}<article class="event"><strong>{{ e.event.replace('_', ' ').capitalize() }}</strong><small>{{ e.created_at|utc }} · {{ e.actor }}</small><small>{{ e.entity_type }} #{{ e.entity_id }}</small>{% if e.details %}<details><summary>Event details</summary><pre>{{ e.details|tojson(indent=2) }}</pre></details>{% endif %}<small class="mono">{{ e.correlation_id }}</small></article>{% else %}<div class="empty">No events recorded yet.</div>{% endfor %}</div>
     </section>
   </div>

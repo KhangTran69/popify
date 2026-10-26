@@ -1,5 +1,39 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title or 'Welcome' }} · PoPify</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script></head>
-<body class="{{ 'authenticated' if actor else 'guest' }}"><a class="skip" href="#main">Skip to content</a>
-{% if actor %}<aside class="sidebar"><a class="brand" href="/"><span class="brand-icon">p.</span>po<span>pify</span></a><div class="workspace"><span class="store-icon">N</span><div>Northline Supply<small>Local demonstration store</small></div></div><div class="nav-label">WORKSPACE</div><nav aria-label="Main navigation">{% for href,label,icon in [('/','Overview','◫'),('/demo','Guided demo','▶'),('/queues/orders','Orders','▣'),('/queues/cases','Support cases','◷'),('/queues/approvals','Approvals','✓'),('/queues/failures','Action failures','!'),('/queues/deliveries','Deliveries','↳')] %}<a href="{{ href }}" class="{{ 'active' if request.url.path==href or (href=='/demo' and request.url.path.startswith('/demo')) }}"><span>{{ icon }}</span>{{ label }}</a>{% endfor %}</nav><div class="sidebar-bottom"><span class="mode"><i></i> Mock actions only</span><p>Every customer action requires human approval.</p><form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="logout">{{ actor }} <span>Sign out ↗</span></button></form></div></aside><div class="shell"><header class="top"><span>Workspace <span class="muted">/ {{ title or 'Record detail' }}</span></span><div class="top-actions"><a class="button secondary small" href="/demo">Guided demo</a><a class="button small" href="/support">＋ New inquiry</a></div></header>{% else %}<header class="guest-top"><a class="brand" href="/login"><span class="brand-icon">p.</span>po<span>pify</span></a><span class="mode">Local demo · Mock actions</span></header>{% endif %}
-{% block content %}{% endblock %}{% if actor %}<footer class="footer">PoPify · Human decisions. Traceable outcomes.<span>All timestamps UTC</span></footer></div>{% endif %}</body></html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>{{ title or 'Welcome' }} · PoPify</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body class="{{ 'authenticated' if actor else 'guest' }}">
+    <a class="skip" href="#main">Skip to content</a>
+    {% if preview_mode %}
+      <div class="preview-banner" role="status">Isolated preview · Synthetic records · n8n and paid integrations disabled</div>
+    {% endif %}
+    {% if actor %}
+      <aside class="sidebar">
+        <a class="brand" href="/"><span class="brand-icon">p.</span>po<span>pify</span></a>
+        <div class="workspace"><span class="store-icon">N</span><div>Northline Supply<small>Local demonstration store</small></div></div>
+        <div class="nav-label">WORKSPACE</div>
+        <nav aria-label="Main navigation">
+          {% for href,label,icon in [('/','Overview','◫'),('/demo','Guided demo','▶'),('/queues/orders','Orders','▣'),('/queues/cases','Support cases','◷'),('/queues/approvals','Approvals','✓'),('/queues/failures','Action failures','!'),('/queues/deliveries','Deliveries','↳')] %}
+            <a href="{{ href }}" class="{{ 'active' if request.url.path==href or (href=='/demo' and request.url.path.startswith('/demo')) }}"><span>{{ icon }}</span>{{ label }}</a>
+          {% endfor %}
+        </nav>
+        <div class="sidebar-bottom">
+          <span class="mode"><i></i> Mock actions only</span>
+          <p>Every customer action requires human approval.</p>
+          <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="logout">{{ actor }} <span>Sign out ↗</span></button></form>
+        </div>
+      </aside>
+      <div class="shell">
+        <header class="top"><span>Workspace <span class="muted">/ {{ title or 'Record detail' }}</span></span><div class="top-actions"><a class="button secondary small" href="/demo">Guided demo</a><a class="button small" href="/support">＋ New inquiry</a></div></header>
+    {% else %}
+      <header class="guest-top"><a class="brand" href="/login"><span class="brand-icon">p.</span>po<span>pify</span></a><span class="mode">{{ 'Isolated preview' if preview_mode else 'Local demo · Mock actions' }}</span></header>
+    {% endif %}
+    {% block content %}{% endblock %}
+    {% if actor %}<footer class="footer">PoPify · Human decisions. Traceable outcomes.<span>All timestamps UTC</span></footer></div>{% endif %}
+  </body>
+</html>
