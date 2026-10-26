@@ -73,7 +73,7 @@
         <div class="review-section">
           <h3>Proposed action</h3>
           <p><strong>{{ entity.proposed_action.replace('_', ' ').capitalize() }}</strong> · Mock action only</p>
-          <p class="field-help">{% if preview_mode %}This isolated preview records a local mock decision only; it does not call n8n or any external service.{% elif entity.proposed_action == 'send_reply' %}Approval queues a simulated reply for the next n8n action run. No message is sent.{% else %}Approval queues a simulated review outcome for the next n8n action run. No store or customer action is performed.{% endif %}</p>
+          <p class="field-help">{% if preview_mode %}Approval runs the registered mock adapter against this disposable record and stores its result locally. It does not call n8n or any external service.{% elif entity.proposed_action == 'send_reply' %}Approval queues a simulated reply for the next n8n action run. No message is sent.{% else %}Approval queues a simulated review outcome for the next n8n action run. No store or customer action is performed.{% endif %}</p>
         </div>
         {% if entity.subject_type == 'case' or 'customer_message' in facts %}
           <div class="review-section"><h3>Customer request</h3>
@@ -115,7 +115,7 @@
         {% for key, value in facts.items() if key not in known %}<div class="fact"><strong>{{ key.replace('_', ' ').capitalize() }}</strong><div>{{ value }}</div></div>{% endfor %}
         {% if entity.failure_detail %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
         {% if entity.status == 'pending' %}
-          <div class="decision"><p>{% if preview_mode %}Approving or rejecting updates only this disposable synthetic record. Workflow execution is disabled in preview.{% else %}Approving queues this mock action for n8n. Rejecting closes this request without executing it.{% endif %}</p>
+          <div class="decision"><p>{% if preview_mode %}Approve to run the local mock adapter and save its result in the disposable database. Reject to close this request without running it. Workflow execution is disabled in preview.{% else %}Approving queues this mock action for n8n. Rejecting closes this request without executing it.{% endif %}</p>
             <form method="post" action="/approvals/{{ entity.id }}/decision{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}">{% if refresh_supported and not freshness_differences %}<button name="decision" value="approved">Approve mock action</button>{% else %}<span class="field-help">Approval is disabled until the evidence and action can be verified.</span>{% endif %} <button class="secondary" name="decision" value="rejected">Reject</button></form>
           </div>
         {% elif entity.status == 'superseded' %}
@@ -140,7 +140,8 @@
       {% if kind == 'approval' and entity.supporting_facts.get('correlation_id', '').startswith('guided-support:') %}
         <div class="related"><a href="/demo/{{ entity.supporting_facts.get('correlation_id').split(':')[-1] }}">← Back to guided run</a></div>
       {% endif %}
-      {% if approval_history %}<div class="related"><h3>Earlier approval revisions</h3>{% for a in approval_history %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · revision {{ a.revision }} <span>{{ a.status }} · {{ a.execution_status }} →</span></a>{% endfor %}</div>{% endif %}
+      {% if prior_approval %}<div class="notice">Revision {{ entity.revision }} replaces <a href="/approvals/{{ prior_approval.id }}{{ detail_query }}">approval #{{ prior_approval.id }} · revision {{ prior_approval.revision }} ↗</a>. Its decision and attempts remain in the audit history.</div>{% endif %}
+      {% if approval_history %}<div class="related"><h3>Related approval history</h3>{% for a in approval_history %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · revision {{ a.revision }} · {{ a.proposed_action.replace('_', ' ') }} <span>{{ a.status }} · {{ a.execution_status }}{% if a.replacement_approval_id %} → #{{ a.replacement_approval_id }}{% endif %}</span></a>{% endfor %}</div>{% endif %}
       {% if related %}<div class="related"><h3>Related approvals</h3>{% for a in related %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · {{ a.proposed_action.replace('_', ' ') }} <span>{{ a.status }} →</span></a>{% endfor %}</div>{% endif %}
     </section>
     <section class="box"><div class="panelhead timeline-heading"><h2>Event timeline</h2><span class="count">{{ timeline|length }}</span></div>{% if timeline_limited or related_cases_limited %}<p class="field-help">Showing at most the latest 100 related events{% if related_cases_limited %} across the 100 most recent related support cases{% endif %}.</p>{% endif %}

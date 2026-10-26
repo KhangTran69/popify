@@ -594,6 +594,26 @@ def test_stale_pending_approval_can_be_replaced_without_rewriting_history():
         assert refresh_approval(db, original.id, "operator").id == replacement.id
 
 
+def test_replacement_revision_increments_when_reviewed_action_changes():
+    with TestingSession() as db:
+        original = create_approval(
+            db,
+            "exception",
+            "case",
+            469,
+            "review_refund_request",
+            {"category": "refund", "policy": settings.store_policies["refund"]},
+        )
+        case = db.get(Case, 469)
+        case.category = "cancellation"
+        case.draft = "Updated cancellation response"
+        db.flush()
+        replacement = refresh_approval(db, original.id, "operator")
+        assert replacement.proposed_action == "review_cancellation_request"
+        assert replacement.revision == 2
+        assert original.replacement_approval_id == replacement.id
+
+
 def test_approved_stale_evidence_is_blocked_and_preserves_attempt_history(monkeypatch):
     monkeypatch.setattr(settings, "mock_action_failures", 1)
     with TestingSession() as db:
@@ -648,6 +668,107 @@ def test_legacy_approval_can_be_replaced_without_rewriting_its_decision():
         assert legacy.status == "approved" and legacy.actor == "legacy-operator"
         assert as_utc(legacy.decision_at) == as_utc(previous_decision_at)
         assert legacy.attempts == 2 and legacy.supporting_facts == previous_facts
+
+
+def test_approval_freshness_detects_subsecond_source_timestamp_change():
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 466, "send_reply", {"draft": "Reviewed"}
+        )
+        case = db.get(Case, 466)
+        order = db.get(Order, case.order_id)
+        order.source_updated_at = order.source_updated_at + timedelta(microseconds=1)
+        db.flush()
+        assert any(
+            "Order source updated at changed" in item
+            for item in approval_freshness_differences(db, approval)
+        )
+
+
+def test_replaced_stale_revision_leaves_actionable_recovery_queue_and_counts():
+    sign_in()
+    with TestingSession() as db:
+        original = create_approval(
+            db, "support", "case", 467, "send_reply", {"draft": "Old draft"}
+        )
+        original.status = "approved"
+        original.execution_status = "evidence_changed"
+        db.get(Case, 467).draft = "Updated grounded draft"
+        db.flush()
+        replacement = refresh_approval(db, original.id, "operator")
+        original_id = original.id
+        replacement_id = replacement.id
+    stale_queue = client.get("/queues/failures?status=stale")
+    dashboard = client.get("/")
+    assert stale_queue.status_code == 200
+    assert f"#{original_id}" not in stale_queue.text
+    assert f"#{replacement_id}" not in stale_queue.text
+    assert "Stale evidence 0" in dashboard.text
+    record = client.get(f"/approvals/{replacement_id}")
+    assert f"approval #{original_id}" in record.text
+    assert "Related approval history" in record.text
+
+
+def test_action_recovery_filters_separate_scheduled_stale_and_uncertain_states():
+    sign_in()
+    ids = {}
+    with TestingSession() as db:
+        for offset, state in enumerate(("retryable", "evidence_changed", "ambiguous", "exhausted")):
+            approval = create_approval(
+                db,
+                "exception",
+                "order",
+                480 + offset,
+                "review_delayed_order",
+                {},
+            )
+            approval.status = "approved"
+            approval.execution_status = state
+            approval.next_attempt_at = (
+                utcnow() + timedelta(minutes=4) if state == "retryable" else None
+            )
+            ids[state] = approval.id
+        db.commit()
+    for filter_name, expected in (
+        ("scheduled", "retryable"),
+        ("stale", "evidence_changed"),
+        ("uncertain", "ambiguous"),
+        ("exhausted", "exhausted"),
+    ):
+        response = client.get(f"/queues/failures?status={filter_name}")
+        assert response.status_code == 200
+        assert f"#{ids[expected]} · exception" in response.text
+        assert all(f"#{record_id} · exception" not in response.text for state, record_id in ids.items() if state != expected)
+
+
+def test_preview_approval_persists_local_mock_result_without_workflow(monkeypatch):
+    token = sign_in()
+    monkeypatch.setattr(settings, "preview_mode", True)
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 468, "send_reply", {"draft": "Preview draft"}
+        )
+        approval_id = approval.id
+        db.commit()
+    response = client.post(
+        f"/approvals/{approval_id}/decision",
+        data={"csrf_token": token, "decision": "approved"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with TestingSession() as db:
+        approval = db.get(Approval, approval_id)
+        execution = db.scalar(
+            select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{approval_id}"
+            )
+        )
+        assert approval.status == "approved"
+        assert approval.execution_status == "succeeded"
+        assert execution and execution.state == "succeeded" and execution.attempts == 1
+    detail = client.get(response.headers["location"])
+    assert "Mock action completed" in detail.text
+    monkeypatch.setattr(settings, "preview_mode", False)
 
 
 def test_unregistered_action_contract_is_blocked():
@@ -1466,8 +1587,8 @@ def test_dashboard_recovery_counts_link_to_the_complete_matching_queues():
     dashboard = client.get("/")
     cases = client.get("/queues/cases?status=recovery")
     deliveries = client.get("/queues/deliveries?status=recovery")
-    assert 'href="/queues/cases?status=recovery">Support 2</a>' in dashboard.text
-    assert 'href="/queues/deliveries?status=recovery">Deliveries 2</a>' in dashboard.text
+    assert 'href="/queues/cases?status=recovery">Support recovery 2</a>' in dashboard.text
+    assert 'href="/queues/deliveries?status=recovery">Delivery recovery 2</a>' in dashboard.text
     assert f"Case #{failed_case_id}" in cases.text
     assert f"Case #{exhausted_case_id}" in cases.text
     assert "retry-delivery" in deliveries.text and "exhausted-delivery" in deliveries.text
