@@ -18,6 +18,8 @@ from app.db import Base, engine, get_db
 from app.config import settings
 from app.models import Order, Delivery, Case, Approval, Audit, ActionExecution, utcnow
 from app.presentation import record_navigation, retry_guidance, snapshot_utc
+from app.recovery import RECOVERY_CATEGORIES, recovery_counts, recovery_page
+from app.preview_scenarios import SCENARIOS, create_preview_scenario
 from app.services import (
     verify_shopify,
     process_delivery,
@@ -222,6 +224,8 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         )
         or 0
     )
+    now = utcnow()
+    recovery = recovery_counts(db, now)
     counts = {
         "orders": count(Order),
         "duplicates": count(Audit, Audit.event == "duplicate_delivery_ignored"),
@@ -230,20 +234,11 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         ),
         "approvals": count(Approval, Approval.status == "pending"),
         "success": count(ActionExecution, ActionExecution.state == "succeeded"),
-        "failures": count(
-            Approval,
-            Approval.replacement_approval_id.is_(None),
-            Approval.execution_status.in_(
-                ["failed", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
-            ),
-        )
-        + count(Delivery, Delivery.status.in_(["failed", "exhausted"]))
-        + count(Case, Case.status.in_(["failed", "exhausted"])),
+        "failures": recovery["total"] - recovery["pending"],
         "queued": count(Delivery, Delivery.status == "received")
         + count(Case, Case.status == "queued")
         + count(Approval, Approval.execution_status == "queued"),
     }
-    now = utcnow()
     counts["due_retries"] = (
         count(
             Delivery,
@@ -295,27 +290,12 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
     counts["delivery_recovery"] = count(
         Delivery, Delivery.status.in_(["failed", "exhausted"])
     )
-    counts["pending_decisions"] = count(Approval, Approval.status == "pending")
-    counts["scheduled_actions"] = count(
-        Approval,
-        Approval.replacement_approval_id.is_(None),
-        Approval.execution_status.in_(["retryable", "queued"]),
-        Approval.next_attempt_at > now,
-    )
-    counts["eligible_actions"] = count(
-        Approval,
-        Approval.replacement_approval_id.is_(None),
-        Approval.execution_status.in_(["retryable", "queued"]),
-        or_(Approval.next_attempt_at.is_(None), Approval.next_attempt_at <= now),
-    )
-    counts["stale_actions"] = count(
-        Approval, Approval.replacement_approval_id.is_(None),
-        Approval.execution_status == "evidence_changed",
-    )
-    counts["uncertain_actions"] = count(
-        Approval, Approval.replacement_approval_id.is_(None),
-        Approval.execution_status == "ambiguous",
-    )
+    counts["pending_decisions"] = recovery["pending"]
+    counts["scheduled_actions"] = recovery["waiting"]
+    counts["eligible_actions"] = recovery["eligible"]
+    counts["stale_actions"] = recovery["stale"]
+    counts["uncertain_actions"] = recovery["uncertain"]
+    counts["recovery"] = recovery
     oldest = min(
         (
             as_utc(value)
@@ -367,6 +347,43 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
     )
 
 
+@app.get("/recovery", response_class=HTMLResponse)
+def recovery_workspace(
+    request: Request,
+    category: str = Query("", max_length=30),
+    q: str = Query("", max_length=150),
+    page: int = Query(1, ge=1),
+    actor=Depends(operator),
+    db: Session = Depends(get_db),
+):
+    if category and category not in RECOVERY_CATEGORIES:
+        raise HTTPException(422, "Unknown recovery category")
+    rows, total, page, pages = recovery_page(db, category, q, page)
+    counts = recovery_counts(db)
+    params = {"category": category, "q": q}
+    return templates.TemplateResponse(
+        request,
+        "recovery.html",
+        {
+            "request": request,
+            "actor": actor,
+            "csrf": csrf(request),
+            "title": "Recovery workspace",
+            "rows": rows,
+            "counts": counts,
+            "categories": RECOVERY_CATEGORIES,
+            "category": category,
+            "q": q,
+            "page": page,
+            "pages": pages,
+            "total": total,
+            "previous": "?" + urlencode({**params, "page": page - 1}),
+            "next": "?" + urlencode({**params, "page": page + 1}),
+            "record_query": urlencode({"from_queue": "recovery", "q": q, "status": category, "page": page}),
+        },
+    )
+
+
 @app.get("/demo", response_class=HTMLResponse)
 def guided_demo_home(
     request: Request, actor=Depends(operator), db: Session = Depends(get_db)
@@ -387,8 +404,27 @@ def guided_demo_home(
             "delivery": None,
             "delay_hours": settings.order_delay_hours,
             "preview_examples": preview_examples,
+            "preview_scenarios": SCENARIOS,
         },
     )
+
+
+@app.post("/demo/preview/scenarios")
+def preview_scenario_create(
+    request: Request,
+    scenario: str = Form(...),
+    csrf_token: str = Form(...),
+    actor=Depends(operator),
+    db: Session = Depends(get_db),
+):
+    verify_csrf(request, csrf_token)
+    if not settings.preview_mode:
+        raise HTTPException(404)
+    try:
+        approval = create_preview_scenario(db, scenario, actor)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return RedirectResponse(f"/approvals/{approval.id}", status_code=303)
 
 
 @app.post("/demo/start")
@@ -852,6 +888,10 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "back_url": back_url,
             "detail_query": detail_query,
             "retry_guidance": retry_guidance,
+            "now": utcnow(),
+            "preview_run_due": kind == "approval"
+            and entity.execution_status in ("queued", "retryable")
+            and (not entity.next_attempt_at or as_utc(entity.next_attempt_at) <= utcnow()),
             "subject": subject,
             "current_order": current_order,
             "freshness_differences": freshness_differences,
@@ -1013,6 +1053,31 @@ def retry(
     if approval.next_attempt_at is None:
         approval.next_attempt_at = utcnow()
     audit(db, "approval", approval.id, "manual_retry_queued", actor)
+    db.commit()
+    suffix, _ = record_navigation(request.query_params, "approval")
+    return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
+
+
+@app.post("/approvals/{approval_id}/preview-run")
+def preview_run(
+    approval_id: int,
+    request: Request,
+    csrf_token: str = Form(...),
+    actor=Depends(operator),
+    db: Session = Depends(get_db),
+):
+    verify_csrf(request, csrf_token)
+    if not settings.preview_mode:
+        raise HTTPException(404)
+    approval = db.get(Approval, approval_id)
+    if not approval:
+        raise HTTPException(404)
+    if approval.status != "approved" or approval.execution_status not in ("queued", "retryable"):
+        raise HTTPException(409, "This preview action is not ready for a local mock attempt")
+    if approval.next_attempt_at and as_utc(approval.next_attempt_at) > utcnow():
+        raise HTTPException(409, "The recorded backoff deadline has not arrived")
+    execute_approved(db, approval)
+    audit(db, "approval", approval.id, "preview_mock_attempt_requested", actor)
     db.commit()
     suffix, _ = record_navigation(request.query_params, "approval")
     return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)

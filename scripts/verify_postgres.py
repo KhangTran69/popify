@@ -183,6 +183,45 @@ def run():
         with sessions() as db:
             assert db.scalar(select(func.count(ActionExecution.id))) == 0
 
+        # Conflicting operator clicks serialize on the subject lifecycle; only
+        # the first committed decision is authoritative.
+        with sessions() as db:
+            conflict_order = Order(
+                shop_domain="demo.myshopify.com", external_id="decision-conflict",
+                order_number="#DECISION-RACE", email="race@example.test",
+                currency="USD", total="20.00", fulfillment_status="unfulfilled",
+                financial_status="paid",
+                created_at=utcnow() - timedelta(hours=settings.order_delay_hours + 2),
+                source_updated_at=utcnow(), payload={},
+            )
+            db.add(conflict_order)
+            db.flush()
+            conflict = create_approval(
+                db, "exception", "order", conflict_order.id, "review_delayed_order",
+                {
+                    "order_number": conflict_order.order_number, "order_id": conflict_order.id,
+                    "hours_threshold": settings.order_delay_hours,
+                    "created_at": conflict_order.created_at.isoformat(),
+                    "order_fulfillment_status": conflict_order.fulfillment_status,
+                    "order_financial_status": conflict_order.financial_status,
+                    "order_total": "USD 20.00",
+                    "order_source_updated_at": conflict_order.source_updated_at.isoformat(),
+                },
+            )
+            db.commit()
+            conflict_id = conflict.id
+
+        def conflicting_decision(decision):
+            with sessions() as db:
+                return decide_approval(db, conflict_id, decision, decision).status
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            decision_results = list(pool.map(conflicting_decision, ["approved", "rejected"]))
+        assert len(set(decision_results)) == 1, decision_results
+        with sessions() as db:
+            decided = db.get(Approval, conflict_id)
+            assert decided.status in ("approved", "rejected") and decided.actor == decided.status
+
         # Hold the execution transaction immediately after it reads its locked
         # evidence. A concurrent order update must wait until the mock action
         # commits, then the next attempt must see that update as stale.
@@ -300,7 +339,7 @@ def run():
             assert db.scalar(select(func.count(ActionExecution.id))) == 1
             assert db.scalar(select(ActionExecution.attempts)) == 1
         print(
-            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated approval, source freshness locking, concurrent replacement requests, and repeated execution (6 workers per scenario)."
+            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, concurrent replacement requests, and repeated execution (6 workers per repeated scenario)."
         )
     finally:
         settings.shopify_webhook_secret = old_secret

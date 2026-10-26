@@ -1549,7 +1549,7 @@ def test_dashboard_distinguishes_worker_failure_from_business_completion():
     assert "1</strong><span>Retries eligible now" in page.text
     assert "Oldest intake queue age" in page.text
     assert "Last worker failure" in page.text
-    assert "retrying or failed items to monitor" in page.text
+    assert "items need recovery or monitoring" in page.text
 
 
 def test_dashboard_recovery_counts_link_to_the_complete_matching_queues():
@@ -1585,13 +1585,56 @@ def test_dashboard_recovery_counts_link_to_the_complete_matching_queues():
         failed_case_id = failed_case.id
         exhausted_case_id = exhausted_case.id
     dashboard = client.get("/")
-    cases = client.get("/queues/cases?status=recovery")
-    deliveries = client.get("/queues/deliveries?status=recovery")
-    assert 'href="/queues/cases?status=recovery">Support recovery 2</a>' in dashboard.text
-    assert 'href="/queues/deliveries?status=recovery">Delivery recovery 2</a>' in dashboard.text
-    assert f"Case #{failed_case_id}" in cases.text
-    assert f"Case #{exhausted_case_id}" in cases.text
-    assert "retry-delivery" in deliveries.text and "exhausted-delivery" in deliveries.text
+    recovery = client.get("/recovery")
+    assert 'href="/recovery?category=eligible">Eligible 2</a>' in dashboard.text
+    assert 'href="/recovery?category=exhausted">Exhausted 2</a>' in dashboard.text
+    assert f"Support case #{failed_case_id}" in recovery.text
+    assert f"Support case #{exhausted_case_id}" in recovery.text
+    assert "retry-delivery" in recovery.text and "exhausted-delivery" in recovery.text
+
+
+def test_recovery_workspace_preserves_category_search_and_page_context():
+    sign_in()
+    with TestingSession() as db:
+        db.add(Case(message="find me", status="failed", attempts=1,
+                    failure_detail="Distinct recovery reason"))
+        db.commit()
+        case_id = db.scalar(select(Case.id))
+    response = client.get("/recovery?category=eligible&q=Distinct&page=1")
+    assert response.status_code == 200
+    assert f"/cases/{case_id}?from_queue=recovery" in response.text
+    detail = client.get(f"/cases/{case_id}?from_queue=recovery&q=Distinct&status=eligible&page=1")
+    assert 'href="/recovery?q=Distinct&amp;page=1&amp;category=eligible"' in detail.text
+
+
+def test_preview_scenario_uses_request_scoped_outcome_without_mutating_settings(monkeypatch):
+    from app.preview_scenarios import create_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    before = (settings.mock_action_failures, settings.mock_action_ambiguous, settings.max_action_attempts)
+    with TestingSession() as db:
+        approval = create_preview_scenario(db, "ambiguous")
+        assert approval.execution_status == "ambiguous"
+    assert before == (settings.mock_action_failures, settings.mock_action_ambiguous, settings.max_action_attempts)
+
+
+def test_terminal_execution_on_prior_revision_blocks_new_revision():
+    with TestingSession() as db:
+        original = create_approval(db, "support", "case", 990, "send_reply", {"draft": "first"})
+        decide_approval(db, original.id, "approved", "operator")
+        execute_approved(db, original, mock_outcome="ambiguous")
+        db.commit()
+        replacement = service_create_approval(
+            db, original.kind, original.subject_type, original.subject_id,
+            original.proposed_action, dict(original.supporting_facts), revision=2,
+        )
+        decide_approval(db, replacement.id, "approved", "operator")
+        execute_approved(db, replacement)
+        db.commit()
+        assert replacement.execution_status == "blocked_prior_outcome"
+        assert db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{replacement.id}"
+        )) is None
 
 
 def test_guided_demo_does_not_present_failed_triage_as_complete():

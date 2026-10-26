@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>{{ title or 'Welcome' }} · PoPify</title>
     <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/recovery.css">
     <script src="/static/app.js" defer></script>
   </head>
   <body class="{{ 'authenticated' if actor else 'guest' }}">
@@ -18,7 +19,7 @@
         <div class="workspace"><span class="store-icon">N</span><div>Northline Supply<small>Local demonstration store</small></div></div>
         <div class="nav-label">WORKSPACE</div>
         <nav aria-label="Main navigation">
-          {% for href,label,icon in [('/','Overview','◫'),('/demo','Guided demo','▶'),('/queues/orders','Orders','▣'),('/queues/cases','Support cases','◷'),('/queues/approvals','Approvals','✓'),('/queues/failures','Action failures','!'),('/queues/deliveries','Deliveries','↳')] %}
+          {% for href,label,icon in [('/','Overview','◫'),('/demo','Guided demo','▶'),('/recovery','Recovery','!'),('/queues/orders','Orders','▣'),('/queues/cases','Support cases','◷'),('/queues/approvals','Approvals','✓'),('/queues/deliveries','Deliveries','↳')] %}
             <a href="{{ href }}" class="{{ 'active' if request.url.path==href or (href=='/demo' and request.url.path.startswith('/demo')) }}"><span>{{ icon }}</span>{{ label }}</a>
           {% endfor %}
         </nav>

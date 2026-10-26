@@ -30,15 +30,18 @@ Store operations combine repeatable work with decisions that need human judgment
 - Excluded replaced revisions from active recovery counts and added dashboard filters for pending decisions, scheduled or eligible retries, exhausted attempts, stale evidence, and uncertain outcomes. Revision pages link to prior and replacement approvals.
 - Made preview approvals interactive end to end: approve runs only the local mock adapter and persists its result, while rejection and blocked/retry states retain coherent audit records in the disposable SQLite database.
 - Extended the PostgreSQL verifier with source-update contention during execution and duplicate refresh requests against a single stale approval.
+- Unified approval, support, and delivery recovery into one searchable, paginated workspace whose dashboard counts use the same query and whose record links preserve their originating context.
+- Added subject-level approval lifecycle locking with stable revision ordering and blocked a new revision when another revision has a started, successful, or ambiguous execution.
+- Made the isolated preview scenario-driven: reviewers can create fresh outcomes and run a due local retry without mutating global failure, ambiguity, or retry settings.
 
 ## Current verification — 26 October 2026, Manila time
 
-- **Behavior suite:** `python -m pytest -q` passed: **58 tests**. New coverage includes subsecond freshness changes, action-changing replacement lineage, replacement-aware recovery counts, separate scheduled/stale/uncertain/exhausted filters, and a preview decision that persists one local mock execution.
+- **Behavior suite:** `python -m pytest -q` passed: **61 tests**. New coverage includes unified recovery navigation, request-scoped preview outcomes, and cross-revision terminal-outcome blocking.
 - **Workflow exports:** all three JSON workflow files passed `python -m scripts.validate_workflows`.
 - **Schema upgrade:** no migration was required. Fresh-schema and upgrade checks were not run because no PostgreSQL server was reachable.
-- **PostgreSQL concurrency:** the extended verifier could not run: the local server refused connections on `127.0.0.1:5432`, and Docker Desktop had no active daemon/socket. Its added source-lock and duplicate-refresh scenarios remain unverified here.
-- **Synthetic preview:** started twice from `python -m scripts.preview`; temporary data was recreated and removed on shutdown. The browser showed pending, success, rejection, retryable, exhausted, stale, ambiguous, and blocked states. I approved the pending example in-browser and verified `approved / succeeded`, one persisted attempt, and correlated approval/execution timeline entries. Preview mode remained distinct from n8n and integrations.
-- **Visual inspection:** inspected the guided scenario page at 1440 × 900 and approval evidence at 390 × 844. Mobile content wrapped without horizontal overflow, and the keyboard skip link had a visible focus ring. Fresh browser captures were made during this run; the checked-in `docs/screenshots/*-preview.jpg` files remain historical captures.
+- **PostgreSQL concurrency:** could not run because Docker Desktop had no daemon/socket. The lifecycle advisory-lock path therefore has SQLite regression coverage but no fresh PostgreSQL race result in this change.
+- **Synthetic preview:** started from `python -m scripts.preview`; the browser created a fresh retryable scenario, showed its reviewed evidence and due recovery control, ran the explicit local mock attempt, and persisted `succeeded` with attempt 2 and correlated audit events. Preview remained visibly isolated from n8n and integrations.
+- **Visual inspection:** inspected overview, unified recovery, interactive demo, approval evidence, retry recovery, long recovery content, and keyboard skip-link focus in the available 491 px in-app browser viewport. Current PNG captures are checked in. A separate desktop-width capture was unavailable in this environment and is not claimed.
 - **Live n8n:** not run because Docker's daemon was unavailable. Workflow-export validation is not n8n execution evidence.
 
 ## Historical verification — 24 October 2026, Manila time

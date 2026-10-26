@@ -1,0 +1,11 @@
+{% extends 'base.html' %}
+{% block content %}
+<main id="main" class="wrap">
+  <div class="headline"><div><div class="eyebrow">OPERATIONS / RECOVERY</div><h1>Recovery workspace</h1><p class="sub">One prioritized view of decisions, retries, blocked work, and uncertain outcomes.</p></div></div>
+  <nav class="recovery-tabs" aria-label="Recovery categories"><a href="/recovery" class="{{ 'active' if not category }}">All <b>{{ counts.total }}</b></a>{% for name in categories %}<a href="/recovery?category={{ name }}" class="{{ 'active' if category==name }}">{{ name|capitalize }} <b>{{ counts[name] }}</b></a>{% endfor %}</nav>
+  <section class="panel"><form class="filters" method="get"><div><label for="search">Search recovery work</label><input id="search" type="search" name="q" value="{{ q }}" maxlength="150" placeholder="Approval, delivery, reason, or status…"></div><input type="hidden" name="category" value="{{ category }}"><button>Search</button><a class="button secondary" href="/recovery">Reset</a></form>
+    <div>{% for item in rows %}<article class="recovery-card"><div><span class="pill {{ 'bad' if item.category in ['exhausted','uncertain','blocked'] else 'warn' if item.category in ['waiting','stale'] else '' }}">{{ item.category }}</span><small>{{ item.source }} · {{ item.occurred_at|utc }}</small></div><div class="recovery-main"><h2><a href="{{ item.url }}?{{ record_query }}">{{ item.label.replace('_',' ') }} ↗</a></h2><p>{{ item.reason }}</p><dl><dt>Current state</dt><dd>{{ item.raw_state.replace('_',' ') }}</dd><dt>Attempts</dt><dd>{{ item.attempts }}</dd><dt>Retry deadline</dt><dd>{{ item.next_attempt_at|utc }}</dd></dl></div><div class="recovery-action"><strong>Next action</strong><p>{{ item.next_action }}</p><a class="button secondary small" href="{{ item.url }}?{{ record_query }}">Open record</a></div></article>{% else %}<div class="empty"><strong>No matching recovery work</strong><small>Change the category or search term.</small></div>{% endfor %}</div>
+    <div class="pagination"><span>{{ total }} records · Page {{ page }} of {{ pages }}</span><div>{% if page>1 %}<a class="button secondary" href="{{ previous }}">← Previous</a>{% endif %}{% if page<pages %}<a class="button secondary" href="{{ next }}">Next →</a>{% endif %}</div></div>
+  </section>
+</main>
+{% endblock %}

@@ -111,24 +111,15 @@ def run():
 
             retryable = scenario_approval("retryable")
             decide_approval(db, retryable.id, "approved", "preview")
-            settings.mock_action_failures = 1
-            execute_approved(db, retryable)
-            settings.mock_action_failures = 0
+            execute_approved(db, retryable, mock_outcome="retryable")
 
             ambiguous = scenario_approval("ambiguous")
             decide_approval(db, ambiguous.id, "approved", "preview")
-            settings.mock_action_ambiguous = True
-            execute_approved(db, ambiguous)
-            settings.mock_action_ambiguous = False
+            execute_approved(db, ambiguous, mock_outcome="ambiguous")
 
             exhausted = scenario_approval("exhausted")
             decide_approval(db, exhausted.id, "approved", "preview")
-            old_max = settings.max_action_attempts
-            settings.max_action_attempts = 1
-            settings.mock_action_failures = 1
-            execute_approved(db, exhausted)
-            settings.mock_action_failures = 0
-            settings.max_action_attempts = old_max
+            execute_approved(db, exhausted, mock_outcome="exhausted")
 
             db.add(Delivery(
                 webhook_id="preview-exhausted-delivery", topic="orders/create",
