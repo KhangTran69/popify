@@ -98,6 +98,7 @@ class Approval(Base):
     subject_id: Mapped[int] = mapped_column(Integer)
     proposed_action: Mapped[str] = mapped_column(String(80))
     supporting_facts: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="pending")
     actor: Mapped[str | None] = mapped_column(String(120), nullable=True)
     decision_at: Mapped[datetime | None] = mapped_column(
@@ -141,6 +142,8 @@ class ActionExecution(Base):
     __tablename__ = "action_executions"
     id: Mapped[int] = mapped_column(primary_key=True)
     idempotency_key: Mapped[str] = mapped_column(String(160), unique=True)
+    proposed_action: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     state: Mapped[str] = mapped_column(String(30), default="started")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)

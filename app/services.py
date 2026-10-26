@@ -15,6 +15,39 @@ class SupportRequestKeyConflict(ValueError):
     """A caller reused an idempotency key for different inquiry content."""
 
 
+ACTION_CONTRACTS = {
+    ("support", "case", "send_reply"),
+    ("exception", "case", "review_refund_request"),
+    ("exception", "case", "review_cancellation_request"),
+    ("exception", "order", "review_delayed_order"),
+}
+
+
+def approval_evidence_hash(kind, subject_type, subject_id, action, facts):
+    """Hash exactly what the operator is asked to approve."""
+    evidence = {
+        "kind": kind,
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "proposed_action": action,
+        "supporting_facts": facts or {},
+    }
+    encoded = json.dumps(
+        evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def current_approval_evidence_hash(approval):
+    return approval_evidence_hash(
+        approval.kind,
+        approval.subject_type,
+        approval.subject_id,
+        approval.proposed_action,
+        approval.supporting_facts,
+    )
+
+
 def parse_dt(value):
     if not value:
         return utcnow()
@@ -307,7 +340,10 @@ def create_approval(db, kind, subject_type, subject_id, action, facts):
         subject_type=subject_type,
         subject_id=subject_id,
         proposed_action=action,
-        supporting_facts=facts,
+        supporting_facts=dict(facts),
+        evidence_hash=approval_evidence_hash(
+            kind, subject_type, subject_id, action, facts
+        ),
     )
     try:
         with db.begin_nested():
@@ -346,6 +382,20 @@ def decide_approval(db, approval_id, decision, actor):
         raise LookupError("approval not found")
     if approval.status != "pending":
         return approval
+    current_hash = current_approval_evidence_hash(approval)
+    if approval.evidence_hash and approval.evidence_hash != current_hash:
+        raise ValueError("approval evidence changed; reload or recreate the approval")
+    if not approval.evidence_hash:
+        approval.evidence_hash = current_hash
+        audit(
+            db,
+            "approval",
+            approval.id,
+            "legacy_evidence_sealed",
+            actor,
+            details={"evidence_hash": current_hash},
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
     approval.status = decision
     approval.actor = actor
     approval.decision_at = utcnow()
@@ -390,14 +440,81 @@ def execute_approved(db, approval):
     if execution and execution.state in ("succeeded", "ambiguous"):
         approval.execution_status = execution.state
         return
+    contract = (approval.kind, approval.subject_type, approval.proposed_action)
+    current_hash = current_approval_evidence_hash(approval)
+    if contract not in ACTION_CONTRACTS:
+        approval.execution_status = "invalid_action"
+        approval.failure_detail = "Execution blocked: the approved action has no registered mock adapter."
+        audit(
+            db,
+            "approval",
+            approval.id,
+            "action_execution_invalid_action",
+            details={"action": approval.proposed_action},
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
+        db.flush()
+        return
+    if approval.evidence_hash and approval.evidence_hash != current_hash:
+        approval.execution_status = "evidence_changed"
+        approval.failure_detail = "Execution blocked: approval evidence changed after the operator decision."
+        audit(
+            db,
+            "approval",
+            approval.id,
+            "action_execution_evidence_changed",
+            details={
+                "approved_evidence_hash": approval.evidence_hash,
+                "current_evidence_hash": current_hash,
+                "action": approval.proposed_action,
+            },
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
+        db.flush()
+        return
+    if not approval.evidence_hash:
+        approval.evidence_hash = current_hash
+        audit(
+            db,
+            "approval",
+            approval.id,
+            "legacy_evidence_sealed_at_execution",
+            details={"evidence_hash": current_hash},
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
     if approval.execution_status not in ("queued", "retryable"):
         return
     if approval.next_attempt_at and as_utc(approval.next_attempt_at) > utcnow():
         return
     if not execution:
-        execution = ActionExecution(idempotency_key=key, state="started", attempts=0)
+        execution = ActionExecution(
+            idempotency_key=key,
+            proposed_action=approval.proposed_action,
+            evidence_hash=approval.evidence_hash,
+            state="started",
+            attempts=0,
+        )
         db.add(execution)
         db.flush()
+    elif (
+        execution.proposed_action not in (None, approval.proposed_action)
+        or execution.evidence_hash not in (None, approval.evidence_hash)
+    ):
+        approval.execution_status = "evidence_changed"
+        approval.failure_detail = "Execution blocked: the persisted execution does not match the reviewed action and evidence."
+        audit(
+            db,
+            "approval",
+            approval.id,
+            "action_execution_contract_mismatch",
+            details={"action": approval.proposed_action},
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
+        db.flush()
+        return
+    else:
+        execution.proposed_action = approval.proposed_action
+        execution.evidence_hash = approval.evidence_hash
     execution.attempts += 1
     approval.attempts = execution.attempts
     if settings.mock_action_ambiguous:
@@ -431,7 +548,11 @@ def execute_approved(db, approval):
         "approval",
         approval.id,
         "action_execution_" + execution.state,
-        details={"attempt": execution.attempts},
+        details={
+            "attempt": execution.attempts,
+            "action": approval.proposed_action,
+            "evidence_hash": approval.evidence_hash,
+        },
         correlation_id=approval.supporting_facts.get("correlation_id"),
     )
     if (

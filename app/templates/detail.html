@@ -57,7 +57,7 @@
           <dt>Decision</dt><dd><span class="pill {{ 'warn' if entity.status == 'pending' else 'good' if entity.status == 'approved' else '' }}">{{ entity.status }}</span></dd>
           <dt>Decided by</dt><dd>{{ entity.actor or 'Awaiting operator' }}</dd>
           <dt>Decision time</dt><dd>{{ entity.decision_at|utc }}</dd>
-          <dt>Execution</dt><dd><span class="pill {{ 'good' if entity.execution_status == 'succeeded' else 'bad' if entity.execution_status in ['ambiguous', 'exhausted'] else 'warn' }}">{{ entity.execution_status.replace('_', ' ') }}</span></dd>
+          <dt>Execution</dt><dd><span class="pill {{ 'good' if entity.execution_status == 'succeeded' else 'bad' if entity.execution_status in ['ambiguous', 'exhausted', 'evidence_changed', 'invalid_action'] else 'warn' }}">{{ entity.execution_status.replace('_', ' ') }}</span></dd>
           <dt>Attempts</dt><dd>{{ entity.attempts }}</dd>
           <dt>Next attempt</dt><dd>{{ entity.next_attempt_at|utc }}</dd>
         </dl>
@@ -112,6 +112,10 @@
           <form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue action retry</button></form>
         {% elif entity.execution_status == 'ambiguous' %}
           <div class="notice warn">Outcome uncertain. Automatic retry is blocked. Reconcile the recorded mock result using approval:{{ entity.id }} before taking further action.</div>
+        {% elif entity.execution_status == 'evidence_changed' %}
+          <div class="notice error"><strong>Execution blocked.</strong><p>The action or supporting evidence changed after approval. Reject this record and create a fresh approval from current facts before proceeding.</p></div>
+        {% elif entity.execution_status == 'invalid_action' %}
+          <div class="notice error"><strong>Execution blocked.</strong><p>This action has no registered mock adapter. Review the approval contract before creating a replacement.</p></div>
         {% elif entity.execution_status == 'succeeded' %}
           <div class="notice">Mock action completed. The timeline records the decision and execution.</div>
         {% elif entity.status == 'approved' %}

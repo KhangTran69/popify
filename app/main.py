@@ -13,7 +13,7 @@ from sqlalchemy import select, func, or_, cast, String
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, Field
 import httpx
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from app.db import Base, engine, get_db
 from app.config import settings
 from app.models import Order, Delivery, Case, Approval, Audit, ActionExecution, utcnow
@@ -214,7 +214,9 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         "success": count(ActionExecution, ActionExecution.state == "succeeded"),
         "failures": count(
             Approval,
-            Approval.execution_status.in_(["retryable", "exhausted", "ambiguous"]),
+            Approval.execution_status.in_(
+                ["retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
+            ),
         )
         + count(Delivery, Delivery.status.in_(["failed", "exhausted"]))
         + count(Case, Case.status.in_(["failed", "exhausted"])),
@@ -249,9 +251,24 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         + count(Approval, Approval.execution_status == "exhausted")
     )
     counts["needs_operator"] = (
-        count(Approval, Approval.execution_status.in_(["exhausted", "ambiguous"]))
+        count(
+            Approval,
+            Approval.execution_status.in_(
+                ["exhausted", "ambiguous", "evidence_changed", "invalid_action"]
+            ),
+        )
         + count(Delivery, Delivery.status == "exhausted")
         + count(Case, Case.status == "exhausted")
+    )
+    counts["approval_recovery"] = count(
+        Approval,
+        Approval.execution_status.in_(
+            ["retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
+        ),
+    )
+    counts["case_recovery"] = count(Case, Case.status.in_(["failed", "exhausted"]))
+    counts["delivery_recovery"] = count(
+        Delivery, Delivery.status.in_(["failed", "exhausted"])
     )
     oldest = min(
         (
@@ -266,9 +283,10 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
     )
     counts["oldest_queue_minutes"] = max(0, int((now - oldest).total_seconds() // 60)) if oldest else None
     done = db.execute(
-        select(Delivery.received_at, Delivery.processed_at).where(
-            Delivery.processed_at.is_not(None)
-        )
+        select(Delivery.received_at, Delivery.processed_at)
+        .where(Delivery.processed_at.is_not(None))
+        .order_by(Delivery.id.desc())
+        .limit(500)
     ).all()
     counts["avg_seconds"] = (
         round(
@@ -552,7 +570,7 @@ def queue_page(
             Case,
             Case.status,
             [cast(Case.id, String), Case.customer_email, Case.category, Case.order_ref],
-            ["queued", "needs_review", "resolved_mock", "failed", "exhausted"],
+            ["queued", "needs_review", "resolved_mock", "failed", "exhausted", "recovery"],
         ),
         "approvals": (
             Approval,
@@ -568,13 +586,19 @@ def queue_page(
                 Approval.proposed_action,
                 Approval.failure_detail,
             ],
-            ["retryable", "exhausted", "ambiguous"],
+            [
+                "retryable",
+                "exhausted",
+                "ambiguous",
+                "evidence_changed",
+                "invalid_action",
+            ],
         ),
         "deliveries": (
             Delivery,
             Delivery.status,
             [Delivery.webhook_id, Delivery.error],
-            ["received", "processed", "failed", "exhausted"],
+            ["received", "processed", "failed", "exhausted", "recovery"],
         ),
     }
     if section not in configs:
@@ -599,13 +623,18 @@ def queue_page(
                 ]
             )
         )
-    if status:
+    if status == "recovery" and section in ("cases", "deliveries"):
+        conditions.append(state.in_(["failed", "exhausted"]))
+    elif status:
         conditions.append(state == status)
     total = db.scalar(select(func.count()).select_from(model).where(*conditions)) or 0
     pages = max(1, ceil(total / 12))
     page = min(page, pages)
+    query = select(model)
+    if section == "cases":
+        query = query.options(selectinload(Case.order))
     rows = db.scalars(
-        select(model)
+        query
         .where(*conditions)
         .order_by(model.id.desc())
         .offset((page - 1) * 12)
@@ -794,6 +823,8 @@ def approval_decision(
         decide_approval(db, approval_id, decision, actor)
     except LookupError:
         raise HTTPException(404)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
     suffix, _ = record_navigation(request.query_params, "approval")
     return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 
@@ -1161,7 +1192,14 @@ def scan_delayed(
         .limit(20)
         .with_for_update(skip_locked=True)
     ).all()
-    action_outcomes = {"succeeded": 0, "retryable": 0, "exhausted": 0, "ambiguous": 0}
+    action_outcomes = {
+        "succeeded": 0,
+        "retryable": 0,
+        "exhausted": 0,
+        "ambiguous": 0,
+        "evidence_changed": 0,
+        "invalid_action": 0,
+    }
     for approval in pending:
         execute_approved(db, approval)
         if approval.execution_status in action_outcomes:
@@ -1177,7 +1215,16 @@ def scan_delayed(
             "action_outcomes": action_outcomes,
         },
         completed=bool(new_exceptions or action_outcomes["succeeded"]),
-        failed=bool(action_outcomes["retryable"] or action_outcomes["exhausted"] or action_outcomes["ambiguous"]),
+        failed=any(
+            action_outcomes[state]
+            for state in (
+                "retryable",
+                "exhausted",
+                "ambiguous",
+                "evidence_changed",
+                "invalid_action",
+            )
+        ),
     )
 
 

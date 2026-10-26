@@ -26,6 +26,16 @@ No Shopify or LLM credentials are needed for mock mode. Named volumes preserve P
 
 On startup, SQL migrations apply transactionally. n8n imports and publishes the three versioned workflow exports when their content changes, retaining their stable IDs. Before an update, it exports existing workflows to `/home/node/.n8n/commerceops-before-update.json` inside its volume. An unrelated or inactive workflow is not deleted. Edits to these three workflows in the n8n editor should be exported back into the repository before changing the bundled files.
 
+### Isolated interface preview without Docker
+
+After installing the project dependencies, run:
+
+```sh
+python -m scripts.preview --port 8002
+```
+
+Open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. This creates a disposable SQLite database in a temporary directory and seeds only synthetic records for pending, completed, rejected, retryable, exhausted, and ambiguous outcomes. The database is deleted when the process stops. This preview is for interface and recovery-state review; it does **not** execute PostgreSQL concurrency checks or any n8n workflow.
+
 ## Architecture
 
 ```mermaid
@@ -78,6 +88,8 @@ The five stages shown in the walkthrough are:
 
 Each row links directly to its order, case, or approval. “Queued”, “processing”, “awaiting review”, “completed”, and failure states reflect persisted application records; worker success by itself does not mark the business action successful.
 
+For repeatable recovery-state review when Docker is unavailable, use the isolated preview above. Its Action failures queue contains retryable, exhausted, and ambiguous mock executions; the Approvals queue contains completed and rejected decisions; and the overview links to the matching support and delivery recovery queues. These are synthetic persisted examples, not evidence of n8n execution.
+
 For a command-line interview walkthrough:
 
 1. **0:00–1:00:** Open the overview. Explain mock mode, pending decisions, and event-derived workflow activity.
@@ -112,8 +124,8 @@ Queued records offer a refresh control. POST buttons display a working state and
 - **Orders processed:** count of persisted order records, including historical synthetic fixtures.
 - **Pending approvals/open exceptions:** current pending tasks, not lifetime incident totals.
 - **Mock actions completed:** unique successful execution records.
-- **Recovery count:** currently retryable, exhausted, or ambiguous action records plus failed/exhausted deliveries and support cases.
-- **Receipt to persistence:** mean duration across processed deliveries, with sample count. This includes queue wait and is not pure API latency.
+- **Recovery count:** currently retryable, exhausted, ambiguous, evidence-changed, or unsupported action records plus failed/exhausted deliveries and support cases. Each overview count links to the queue containing those records.
+- **Receipt to persistence:** mean duration across the latest 500 processed deliveries, with sample count. This includes queue wait and is not pure API latency.
 - **Automation activity:** actual authenticated worker calls. Older than three minutes is shown as no recent activity; this is not a claim that the n8n process is down. Last completed work is shown separately from idle polls.
 - **Worker failures:** a failed business attempt is recorded separately from idle polls and completed business work. A guided trigger request alone does not count as a worker call.
 - **Oldest intake queue age:** age in whole minutes of the oldest received delivery or queued support case. Approved actions are excluded because their original record creation time predates approval.
@@ -127,7 +139,7 @@ No manual-time-saved or business-impact estimate is reported.
 - PostgreSQL row locks serialize duplicate workers. Transaction-scoped advisory locks serialize all deliveries for the same store/order, including concurrent first inserts. Only a strictly newer source timestamp updates an existing order.
 - Support order association requires both reference and email within the configured store. This is a matching check, not proof of customer identity: intake is restricted to authenticated operators or the internal integration secret, and no public order lookup is exposed.
 - Support request keys deduplicate exact repeated intake; reusing a key with different message, order reference, or email returns HTTP 409. Triage creates pending reply and, when appropriate, refund/cancellation review tasks. Required missing-information flags are appended after the LLM response and cannot be removed by it.
-- Operator decisions only queue actions. The execution service independently requires a persisted approved record. Approval locks and unique idempotency keys serialize concurrent execution. Success and ambiguous results are terminal for automatic retries.
+- Operator decisions only queue actions. Every new approval stores a canonical hash of the action and evidence shown for review; the execution record stores the same action/hash pair. A changed snapshot or unregistered action contract is blocked before the mock adapter runs. Older approvals are sealed with their current persisted snapshot when first decided or executed. Approval locks and unique idempotency keys serialize concurrent execution. Success and ambiguous results are terminal for automatic retries.
 - Each worker performs one attempt per item. Retryable failures persist `next_attempt_at`, using exponential delay from `RETRY_BASE_SECONDS`, capped at one hour. The mock `MOCK_RETRY_AFTER_SECONDS` is a lower bound simulating a provider's Retry-After delay. There is no live outbound action provider and no claim of tested live rate-limit handling.
 - Manual requeue preserves any existing retry deadline; repeated clicks cannot shorten backoff or enqueue duplicate work.
 - Exhausted items require operator requeue. Requeue retains attempt history; an exhausted action gets one additional recovery attempt. An ambiguous action has **no retry button**.
@@ -161,11 +173,12 @@ For authenticated integration intake, POST a JSON inquiry to `/api/support` with
 python -m pip install -r requirements-test.lock && python -m pip install --no-deps -e .
 python -m pytest -q
 python -m scripts.validate_workflows
+python -m scripts.preview --port 8002
 docker compose exec -T api python -m scripts.verify_postgres
 docker compose exec -T api python -m scripts.demo
 ```
 
-The behavior suite uses isolated SQLite, resets state between tests, and tests approval gating, signature validation, stale events, grounding, missing flags, CSRF, authentication, pagination, bounded retries, delayed eligibility, exhaustion, ambiguous outcomes, and deduplication.
+The behavior suite uses isolated SQLite, resets state between tests, and tests approval gating, reviewed-action/evidence binding, signature validation, stale events, grounding, missing flags, CSRF, authentication, pagination, exact recovery links, bounded retries, delayed eligibility, exhaustion, ambiguous outcomes, and deduplication.
 
 The PostgreSQL verifier creates its own randomly named temporary schema, runs six concurrent workers per scenario, and removes only that schema afterward. It exercises concurrent webhook retries, duplicate workers, concurrent first inserts/out-of-order updates, repeated approval, and repeated execution. It does not clear the application's tables.
 
