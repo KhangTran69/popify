@@ -3,6 +3,7 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Event
 import hashlib
 import hmac
 import json
@@ -23,7 +24,9 @@ from app.services import (
     approval_freshness_differences,
     queue_support,
     SupportRequestKeyConflict,
+    refresh_approval,
 )
+import app.services as services
 
 
 def run():
@@ -180,6 +183,112 @@ def run():
         with sessions() as db:
             assert db.scalar(select(func.count(ActionExecution.id))) == 0
 
+        # Hold the execution transaction immediately after it reads its locked
+        # evidence. A concurrent order update must wait until the mock action
+        # commits, then the next attempt must see that update as stale.
+        freshness_checked = Event()
+        release_execution = Event()
+        source_update_started = Event()
+        source_update_finished = Event()
+        original_freshness = services.approval_freshness_differences
+
+        def pause_after_freshness(db, approval):
+            result = original_freshness(db, approval)
+            if approval.id == aid:
+                freshness_checked.set()
+                if not release_execution.wait(10):
+                    raise TimeoutError("concurrency verifier timed out waiting to release execution")
+            return result
+
+        services.approval_freshness_differences = pause_after_freshness
+
+        def execute_once():
+            with sessions() as db:
+                execute_approved(db, db.get(Approval, aid))
+                db.commit()
+
+        def update_order():
+            source_update_started.set()
+            with sessions() as db:
+                locked_order = db.scalar(
+                    select(Order).where(Order.id == row.id).with_for_update()
+                )
+                locked_order.fulfillment_status = "fulfilled"
+                locked_order.source_updated_at = utcnow() + timedelta(seconds=20)
+                db.commit()
+            source_update_finished.set()
+
+        execution_thread = ThreadPoolExecutor(max_workers=2)
+        execution_future = execution_thread.submit(execute_once)
+        try:
+            assert freshness_checked.wait(5), "execution did not reach freshness validation"
+            update_future = execution_thread.submit(update_order)
+            assert source_update_started.wait(2)
+            assert not source_update_finished.wait(0.2), "source update bypassed the evidence lock"
+            release_execution.set()
+            execution_future.result(timeout=5)
+            update_future.result(timeout=5)
+        finally:
+            release_execution.set()
+            services.approval_freshness_differences = original_freshness
+            execution_thread.shutdown(wait=True)
+        assert source_update_finished.is_set()
+
+        # Competing refresh clicks on one stale approval return one revision.
+        with sessions() as db:
+            case = Case(
+                message="Where is my order?", category="order_status", confidence=80,
+                draft="Old snapshot draft", status="needs_review",
+                correlation_id="concurrent-refresh",
+            )
+            db.add(case)
+            db.flush()
+            refresh_source = case
+            refresh_approval_row = create_approval(
+                db,
+                "support",
+                "case",
+                case.id,
+                "send_reply",
+                {
+                    "customer_message": case.message,
+                    "customer_email": None,
+                    "case_order_ref": None,
+                    "order_number": None,
+                    "order_id": None,
+                    "order_email": None,
+                    "policy": settings.store_policies[case.category],
+                    "order_fulfillment_status": None,
+                    "order_financial_status": None,
+                    "order_total": None,
+                    "order_source_updated_at": None,
+                    "category": case.category,
+                    "confidence": case.confidence,
+                    "draft": case.draft,
+                    "missing_info": "Verified order reference",
+                    "case_status": case.status,
+                    "correlation_id": case.correlation_id,
+                },
+            )
+            case.draft = "Current response draft"
+            db.commit()
+            refresh_id = refresh_approval_row.id
+
+        def refresh_once(_):
+            with sessions() as db:
+                return refresh_approval(db, refresh_id, "test-operator").id
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            replacement_ids = list(pool.map(refresh_once, range(6)))
+        assert len(set(replacement_ids)) == 1, replacement_ids
+        with sessions() as db:
+            assert db.scalar(
+                select(func.count(Approval.id)).where(
+                    Approval.subject_id == refresh_source.id,
+                    Approval.subject_type == "case",
+                )
+            ) == 2
+
         def execute(_):
             with sessions() as db:
                 execute_approved(db, db.get(Approval, aid))
@@ -191,7 +300,7 @@ def run():
             assert db.scalar(select(func.count(ActionExecution.id))) == 1
             assert db.scalar(select(ActionExecution.attempts)) == 1
         print(
-            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated approval, repeated execution (6 workers per scenario)."
+            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated approval, source freshness locking, concurrent replacement requests, and repeated execution (6 workers per scenario)."
         )
     finally:
         settings.shopify_webhook_secret = old_secret

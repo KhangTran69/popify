@@ -26,16 +26,20 @@ Store operations combine repeatable work with decisions that need human judgment
 - Made preview settings independent of `.env` integration configuration, disabled n8n/webhook routes in preview, and expanded synthetic states to include evidence-changed and unsupported actions. Preview decisions affect only the disposable SQLite data.
 - Added a scan index for delayed orders, bounded scans to 100 eligible orders per worker call without starving later orders, bounded related approval/timeline reads, and surfaced whether delayed orders remain.
 - Moved execution-contract mismatch detection before terminal success/ambiguity short-circuiting so a persisted action/hash mismatch is never reported as a successful repeat.
+- Locked the order and support-case rows used by approval decisions and mock execution until commit, closing the PostgreSQL read-check-act window. Freshness comparisons now retain microsecond timestamp precision.
+- Excluded replaced revisions from active recovery counts and added dashboard filters for pending decisions, scheduled or eligible retries, exhausted attempts, stale evidence, and uncertain outcomes. Revision pages link to prior and replacement approvals.
+- Made preview approvals interactive end to end: approve runs only the local mock adapter and persists its result, while rejection and blocked/retry states retain coherent audit records in the disposable SQLite database.
+- Extended the PostgreSQL verifier with source-update contention during execution and duplicate refresh requests against a single stale approval.
 
 ## Current verification — 26 October 2026, Manila time
 
-- **Behavior suite:** `pytest -q` passed: **53 tests**. Coverage includes source-freshness blocking, legacy approval preservation, numbered replacement approvals, terminal execution-contract mismatch, preview isolation, and paginated delayed-order scans.
+- **Behavior suite:** `python -m pytest -q` passed: **58 tests**. New coverage includes subsecond freshness changes, action-changing replacement lineage, replacement-aware recovery counts, separate scheduled/stale/uncertain/exhausted filters, and a preview decision that persists one local mock execution.
 - **Workflow exports:** all three JSON workflow files passed `python -m scripts.validate_workflows`.
-- **Schema upgrade:** a disposable PostgreSQL instance applied migrations 0001–0004, loaded a legacy approved record, then applied 0005–0006. Its revision, evidence, decision, actor, and timestamps remained intact; the delayed-order index was present afterward.
-- **PostgreSQL concurrency:** `python -m scripts.verify_postgres` passed against the disposable local PostgreSQL instance, including concurrent webhook deliveries, duplicate workers, out-of-order first inserts, support request-key conflicts, repeated approvals, and repeated execution. The verifier used an isolated schema and removed it afterward.
-- **Synthetic preview:** started from `python -m scripts.preview`, signed into the temporary SQLite application, and inspected the overview and approval record. It clearly identified preview mode and displayed pending evidence; its integration routes reject workflow/webhook calls. The preview is not n8n execution evidence.
-- **Visual inspection:** inspected the dashboard and approval detail at a 390 × 844 mobile viewport and a 1440 × 900 desktop viewport; approval evidence sections, action copy, recovery links, mock labeling, and mobile wrapping were readable. The checked-in screenshots were not replaced; they remain earlier synthetic preview captures.
-- **Not run:** Docker is installed but its daemon is unavailable, so the real local n8n demonstration and n8n workflow execution were not possible in this change. Earlier n8n results below are historical.
+- **Schema upgrade:** no migration was required. Fresh-schema and upgrade checks were not run because no PostgreSQL server was reachable.
+- **PostgreSQL concurrency:** the extended verifier could not run: the local server refused connections on `127.0.0.1:5432`, and Docker Desktop had no active daemon/socket. Its added source-lock and duplicate-refresh scenarios remain unverified here.
+- **Synthetic preview:** started twice from `python -m scripts.preview`; temporary data was recreated and removed on shutdown. The browser showed pending, success, rejection, retryable, exhausted, stale, ambiguous, and blocked states. I approved the pending example in-browser and verified `approved / succeeded`, one persisted attempt, and correlated approval/execution timeline entries. Preview mode remained distinct from n8n and integrations.
+- **Visual inspection:** inspected the guided scenario page at 1440 × 900 and approval evidence at 390 × 844. Mobile content wrapped without horizontal overflow, and the keyboard skip link had a visible focus ring. Fresh browser captures were made during this run; the checked-in `docs/screenshots/*-preview.jpg` files remain historical captures.
+- **Live n8n:** not run because Docker's daemon was unavailable. Workflow-export validation is not n8n execution evidence.
 
 ## Historical verification — 24 October 2026, Manila time
 

@@ -435,6 +435,29 @@ def current_approval_facts(db, approval):
     return None
 
 
+def lock_approval_sources(db, approval):
+    """Lock the facts an approval depends on until its decision/execution commits.
+
+    Order ingestion and support triage use the same row locks when updating these
+    records. This closes the read-check-act gap in PostgreSQL transactions.
+    """
+    if approval.subject_type == "case":
+        case = db.scalar(
+            select(Case).where(Case.id == approval.subject_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )
+        if case and case.order_id:
+            db.scalar(
+                select(Order).where(Order.id == case.order_id)
+                .with_for_update().execution_options(populate_existing=True)
+            )
+    elif approval.subject_type == "order":
+        db.scalar(
+            select(Order).where(Order.id == approval.subject_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )
+
+
 def approval_freshness_differences(db, approval):
     """Compare the reviewed snapshot with both its hash and current source state."""
     snapshot = approval.supporting_facts or {}
@@ -485,7 +508,7 @@ def approval_freshness_differences(db, approval):
             same_timestamp = False
             if field.endswith(("_at", "created_at")):
                 try:
-                    same_timestamp = as_utc(datetime.fromisoformat(snapshot[field])).replace(microsecond=0) == as_utc(datetime.fromisoformat(current[field])).replace(microsecond=0)
+                    same_timestamp = as_utc(datetime.fromisoformat(snapshot[field])) == as_utc(datetime.fromisoformat(current[field]))
                 except (TypeError, ValueError):
                     pass
             if not same_timestamp:
@@ -588,6 +611,7 @@ def refresh_approval(db, approval_id, actor):
     )
     if not eligible:
         raise ValueError("Only a pending or evidence-changed approval can be refreshed.")
+    lock_approval_sources(db, approval)
     prior_execution = db.scalar(
         select(ActionExecution).where(
             ActionExecution.idempotency_key == f"approval:{approval.id}"
@@ -608,7 +632,6 @@ def refresh_approval(db, approval_id, actor):
             Approval.kind == approval.kind,
             Approval.subject_type == approval.subject_type,
             Approval.subject_id == approval.subject_id,
-            Approval.proposed_action == action,
         )
     ) or 0
     replacement = create_approval(
@@ -658,6 +681,7 @@ def decide_approval(db, approval_id, decision, actor):
         raise LookupError("approval not found")
     if approval.status != "pending":
         return approval
+    lock_approval_sources(db, approval)
     contract = (approval.kind, approval.subject_type, approval.proposed_action)
     differences = approval_freshness_differences(db, approval)
     if differences and decision == "approved":
@@ -719,6 +743,7 @@ def execute_approved(db, approval):
     )
     if approval.status != "approved":
         raise PermissionError("operator approval is required")
+    lock_approval_sources(db, approval)
     key = f"approval:{approval.id}"
     execution = db.scalar(
         select(ActionExecution)

@@ -6,6 +6,7 @@
   .preview-example>a{font-weight:650}
   .preview-example dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;margin:10px 0 0;font-size:11px}
   .preview-example dt{color:var(--muted)}.preview-example dd{margin:0;overflow-wrap:anywhere}
+  .preview-example p{font-size:13px;line-height:1.5}.preview-step{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--brand)}
   @media(max-width:620px){.preview-example-grid{grid-template-columns:1fr;padding:12px}}
 </style>
 <main id="main" class="wrap">
@@ -20,23 +21,26 @@
   <section class="demo-intro">
     <div>
       <span class="demo-mark">LOCAL · TEMPORARY</span>
-      <h2>Work through an approval</h2>
-      <p>Review the pending support approval, compare its recorded facts with current order context, then approve or reject it. Those decisions change only this disposable SQLite database. n8n, Shopify, OpenAI, and external actions are disabled.</p>
+      <h2>Follow a persisted decision</h2>
+      <p>Start with the pending request, review the captured customer and order facts, then approve or reject it. Approval runs the mock adapter locally and saves the result, attempt, and audit event. Rejection records the operator decision without an execution. This disposable SQLite preview cannot reach n8n, Shopify, OpenAI, or external actions.</p>
       <a class="button" href="/queues/approvals">Open pending and completed decisions →</a>
     </div>
     <div class="demo-preview">
-      <div><b>01</b><span>Pending decision</span><i>→</i></div>
-      <div><b>02</b><span>Mock completion or rejection</span><i>→</i></div>
-      <div><b>03</b><span>Audited recovery examples</span></div>
+      <div><b>01</b><span>Trigger · synthetic inquiry and saved order</span><i>→</i></div>
+      <div><b>02</b><span>Automation · triage draft and evidence snapshot</span><i>→</i></div>
+      <div><b>03</b><span>Human decision · approve or reject</span><i>→</i></div>
+      <div><b>04</b><span>Persisted result · local mock and audit timeline</span></div>
     </div>
   </section>
   <section class="panel">
-    <div class="panelhead"><div><h2>Persisted synthetic examples</h2><p>Each status comes from a seeded local record.</p></div></div>
+    <div class="panelhead"><div><h2>Scenario workspace</h2><p>Each state below is backed by a seeded synthetic approval and timeline. Open a record to inspect its evidence and supported next step.</p></div></div>
     <div class="preview-example-grid">
       {% for approval in preview_examples %}
       <article class="preview-example">
-        <a href="/approvals/{{ approval.id }}">{{ approval.proposed_action.replace('_', ' ')|capitalize }} ↗</a>
-        <dl><dt>Decision</dt><dd>{{ approval.status }}</dd><dt>Execution</dt><dd>{{ approval.execution_status.replace('_', ' ') }}</dd><dt>Record</dt><dd>#{{ approval.id }} · revision {{ approval.revision }}</dd></dl>
+        <span class="preview-step">{% if approval.status == 'pending' %}Human decision{% elif approval.execution_status == 'succeeded' %}Persisted success{% elif approval.status == 'rejected' %}Decision closed{% elif approval.execution_status == 'retryable' %}Transient failure{% elif approval.execution_status == 'exhausted' %}Retry budget used{% elif approval.execution_status == 'ambiguous' %}Outcome uncertain{% elif approval.execution_status == 'evidence_changed' %}Evidence became stale{% else %}Blocked contract{% endif %}</span>
+        <h3><a href="/approvals/{{ approval.id }}">{{ approval.proposed_action.replace('_', ' ')|capitalize }} · #{{ approval.id }} ↗</a></h3>
+        <p>{% if approval.status == 'pending' %}Review the recorded request, order context, policy, and draft before choosing. A local mock result is saved only after approval.{% elif approval.execution_status == 'succeeded' %}The decision and successful mock result are persisted with the attempt and audit history.{% elif approval.status == 'rejected' %}The operator decision is saved; no mock execution was created.{% elif approval.execution_status == 'retryable' %}A retry is waiting for its recorded backoff deadline. Preview does not run background workers.{% elif approval.execution_status == 'exhausted' %}The automatic retry budget is used. Inspect the failure, then manually queue the supported recovery attempt.{% elif approval.execution_status == 'ambiguous' %}No retry is available. The outcome must be reconciled before any further action.{% elif approval.execution_status == 'evidence_changed' %}The original approval is preserved. Compare the reviewed snapshot with current facts before creating a replacement.{% else %}The action has no registered adapter. No retry or replacement is offered.{% endif %}</p>
+        <dl><dt>Decision</dt><dd>{{ approval.status }}{% if approval.actor %} · {{ approval.actor }}{% endif %}</dd><dt>Execution</dt><dd>{{ approval.execution_status.replace('_', ' ') }}</dd><dt>Attempt</dt><dd>{{ approval.attempts }}</dd><dt>Record</dt><dd>revision {{ approval.revision }}</dd></dl>
       </article>
       {% endfor %}
     </div>

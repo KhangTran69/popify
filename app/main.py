@@ -232,6 +232,7 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         "success": count(ActionExecution, ActionExecution.state == "succeeded"),
         "failures": count(
             Approval,
+            Approval.replacement_approval_id.is_(None),
             Approval.execution_status.in_(
                 ["failed", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
             ),
@@ -268,9 +269,14 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         + count(Case, Case.status == "exhausted")
         + count(Approval, Approval.execution_status == "exhausted")
     )
+    counts["exhausted_actions"] = count(
+        Approval, Approval.replacement_approval_id.is_(None),
+        Approval.execution_status == "exhausted",
+    )
     counts["needs_operator"] = (
         count(
             Approval,
+            Approval.replacement_approval_id.is_(None),
             Approval.execution_status.in_(
                 ["exhausted", "ambiguous", "evidence_changed", "invalid_action"]
             ),
@@ -280,6 +286,7 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
     )
     counts["approval_recovery"] = count(
         Approval,
+        Approval.replacement_approval_id.is_(None),
         Approval.execution_status.in_(
             ["failed", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
         ),
@@ -287,6 +294,27 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
     counts["case_recovery"] = count(Case, Case.status.in_(["failed", "exhausted"]))
     counts["delivery_recovery"] = count(
         Delivery, Delivery.status.in_(["failed", "exhausted"])
+    )
+    counts["pending_decisions"] = count(Approval, Approval.status == "pending")
+    counts["scheduled_actions"] = count(
+        Approval,
+        Approval.replacement_approval_id.is_(None),
+        Approval.execution_status.in_(["retryable", "queued"]),
+        Approval.next_attempt_at > now,
+    )
+    counts["eligible_actions"] = count(
+        Approval,
+        Approval.replacement_approval_id.is_(None),
+        Approval.execution_status.in_(["retryable", "queued"]),
+        or_(Approval.next_attempt_at.is_(None), Approval.next_attempt_at <= now),
+    )
+    counts["stale_actions"] = count(
+        Approval, Approval.replacement_approval_id.is_(None),
+        Approval.execution_status == "evidence_changed",
+    )
+    counts["uncertain_actions"] = count(
+        Approval, Approval.replacement_approval_id.is_(None),
+        Approval.execution_status == "ambiguous",
     )
     oldest = min(
         (
@@ -596,7 +624,7 @@ def queue_page(
             Case,
             Case.status,
             [cast(Case.id, String), Case.customer_email, Case.category, Case.order_ref],
-            ["queued", "needs_review", "resolved_mock", "failed", "exhausted", "recovery"],
+            ["queued", "needs_review", "resolved_mock", "failed", "exhausted", "recovery", "scheduled", "eligible"],
         ),
         "approvals": (
             Approval,
@@ -619,13 +647,17 @@ def queue_page(
                 "ambiguous",
                 "evidence_changed",
                 "invalid_action",
+                "scheduled",
+                "eligible",
+                "stale",
+                "uncertain",
             ],
         ),
         "deliveries": (
             Delivery,
             Delivery.status,
             [Delivery.webhook_id, Delivery.error],
-            ["received", "processed", "failed", "exhausted", "recovery"],
+            ["received", "processed", "failed", "exhausted", "recovery", "scheduled", "eligible"],
         ),
     }
     if section not in configs:
@@ -633,7 +665,10 @@ def queue_page(
     model, state, fields, options = configs[section]
     conditions = []
     if section == "failures":
-        conditions.append(state.in_(options))
+        conditions.extend([
+            state.in_("failed retryable exhausted ambiguous evidence_changed invalid_action".split()),
+            Approval.replacement_approval_id.is_(None),
+        ])
     if q:
         conditions.append(
             or_(
@@ -650,8 +685,24 @@ def queue_page(
                 ]
             )
         )
-    if status == "recovery" and section in ("cases", "deliveries"):
+    now = utcnow()
+    if section == "failures" and status:
+        if status == "scheduled":
+            conditions.extend([state.in_(["retryable", "queued"]), Approval.next_attempt_at > now])
+        elif status == "eligible":
+            conditions.extend([state.in_(["retryable", "queued"]), or_(Approval.next_attempt_at.is_(None), Approval.next_attempt_at <= now)])
+        elif status == "stale":
+            conditions.append(state == "evidence_changed")
+        elif status == "uncertain":
+            conditions.append(state == "ambiguous")
+        else:
+            conditions.append(state == status)
+    elif status == "recovery" and section in ("cases", "deliveries"):
         conditions.append(state.in_(["failed", "exhausted"]))
+    elif status == "scheduled" and section in ("cases", "deliveries"):
+        conditions.extend([state == "failed", model.next_attempt_at > now])
+    elif status == "eligible" and section in ("cases", "deliveries"):
+        conditions.extend([state.in_(["failed", "queued", "received"]), or_(model.next_attempt_at.is_(None), model.next_attempt_at <= now)])
     elif status:
         conditions.append(state == status)
     total = db.scalar(select(func.count()).select_from(model).where(*conditions)) or 0
@@ -677,7 +728,7 @@ def queue_page(
             "section": section,
             "title": {
                 "cases": "Support cases",
-                "failures": "Action failures",
+                "failures": "Action recovery",
                 "deliveries": "Delivery queue",
             }.get(section, section.title()),
             "rows": rows,
@@ -706,6 +757,10 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
     related = []
     related_cases_limited = False
     conditions = [(Audit.entity_type == kind) & (Audit.entity_id == record_id)]
+    if kind == "approval":
+        correlation_id = (entity.supporting_facts or {}).get("correlation_id")
+        if correlation_id:
+            conditions.append(Audit.correlation_id == correlation_id)
     if kind in ("order", "case"):
         subjects = [record_id]
         approval_condition = (Approval.subject_type == kind) & (
@@ -754,6 +809,7 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
     current_order = None
     freshness_differences = []
     approval_history = []
+    prior_approval = None
     refresh_blocked_by_execution = False
     if kind == "approval":
         subject = db.get(Order if entity.subject_type == "order" else Case, entity.subject_id)
@@ -773,12 +829,14 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
                 Approval.kind == entity.kind,
                 Approval.subject_type == entity.subject_type,
                 Approval.subject_id == entity.subject_id,
-                Approval.proposed_action == entity.proposed_action,
                 Approval.id != entity.id,
             )
-            .order_by(Approval.revision.desc())
+            .order_by(Approval.created_at.desc(), Approval.id.desc())
             .limit(20)
         ).all()
+        prior_approval = db.scalar(
+            select(Approval).where(Approval.replacement_approval_id == entity.id)
+        )
     return templates.TemplateResponse(
         request,
         "detail.html",
@@ -798,6 +856,7 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "current_order": current_order,
             "freshness_differences": freshness_differences,
             "approval_history": approval_history,
+            "prior_approval": prior_approval,
             "refresh_blocked_by_execution": refresh_blocked_by_execution,
             "refresh_supported": kind == "approval"
             and (entity.kind, entity.subject_type, entity.proposed_action) in ACTION_CONTRACTS
@@ -893,7 +952,12 @@ def approval_decision(
     if decision not in ("approved", "rejected"):
         raise HTTPException(422, "invalid decision")
     try:
-        decide_approval(db, approval_id, decision, actor)
+        approval = decide_approval(db, approval_id, decision, actor)
+        if settings.preview_mode and decision == "approved":
+            # The disposable preview has no workflow runner. Execute only its
+            # registered mock adapter so the scenario records a real local result.
+            execute_approved(db, approval)
+            db.commit()
     except LookupError:
         raise HTTPException(404)
     except ApprovalEvidenceStale:

@@ -24,7 +24,7 @@ def run():
         from app.main import app
         from app.config import settings
         from app.models import Case, Delivery, Order, utcnow
-        from app.services import create_approval, decide_approval, execute_approved
+        from app.services import audit, create_approval, decide_approval, execute_approved
 
         Base.metadata.create_all(engine)
         now = utcnow()
@@ -38,6 +38,15 @@ def run():
             )
             db.add(order)
             db.flush()
+            audit(
+                db,
+                "order",
+                order.id,
+                "synthetic_order_seeded",
+                actor="preview",
+                details={"synthetic": True, "age_hours": 72},
+                correlation_id="preview:order",
+            )
             def scenario_approval(label, action="send_reply"):
                 record = Case(
                     order_id=order.id, order_ref=order.order_number,
@@ -48,6 +57,23 @@ def run():
                 )
                 db.add(record)
                 db.flush()
+                audit(
+                    db,
+                    "case",
+                    record.id,
+                    "inquiry_queued",
+                    actor="preview",
+                    details={"synthetic": True},
+                    correlation_id=record.correlation_id,
+                )
+                audit(
+                    db,
+                    "case",
+                    record.id,
+                    "draft_created",
+                    details={"category": record.category, "confidence": record.confidence},
+                    correlation_id=record.correlation_id,
+                )
                 return create_approval(db, "support", "case", record.id, action, {
                     "order_number": order.order_number, "customer_message": record.message,
                     "order_id": order.id,
@@ -74,6 +100,7 @@ def run():
             blocked = scenario_approval("evidence-changed")
             decide_approval(db, blocked.id, "approved", "preview")
             db.get(Case, blocked.subject_id).message = "Synthetic request changed after approval."
+            db.flush()
             execute_approved(db, blocked)
             db.commit()
 
