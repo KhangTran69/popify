@@ -458,6 +458,54 @@ def lock_approval_sources(db, approval):
         )
 
 
+def lock_approval_lifecycle(db, approval_id):
+    """Lock every revision for one subject in a stable order.
+
+    PostgreSQL's transaction advisory lock serializes creation and execution even
+    when two callers begin with different approval rows. Flushing first prevents
+    a refresh from discarding pending ORM changes via ``populate_existing``.
+    """
+    db.flush()
+    candidate = db.get(Approval, approval_id)
+    if not candidate:
+        raise LookupError("approval not found")
+    identity = f"{candidate.kind}:{candidate.subject_type}:{candidate.subject_id}"
+    if db.bind.dialect.name == "postgresql":
+        lock_key = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big", signed=True)
+        db.execute(text("select pg_advisory_xact_lock(:key)"), {"key": lock_key})
+    revisions = db.scalars(
+        select(Approval)
+        .where(
+            Approval.kind == candidate.kind,
+            Approval.subject_type == candidate.subject_type,
+            Approval.subject_id == candidate.subject_id,
+        )
+        .order_by(Approval.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).all()
+    return next(item for item in revisions if item.id == approval_id)
+
+
+def prior_terminal_execution(db, approval):
+    revision_ids = db.scalars(
+        select(Approval.id).where(
+            Approval.kind == approval.kind,
+            Approval.subject_type == approval.subject_type,
+            Approval.subject_id == approval.subject_id,
+            Approval.id != approval.id,
+        )
+    ).all()
+    if not revision_ids:
+        return None
+    return db.scalar(
+        select(ActionExecution).where(
+            ActionExecution.idempotency_key.in_([f"approval:{item}" for item in revision_ids]),
+            ActionExecution.state.in_(["started", "succeeded", "ambiguous"]),
+        ).order_by(ActionExecution.id.desc())
+    )
+
+
 def approval_freshness_differences(db, approval):
     """Compare the reviewed snapshot with both its hash and current source state."""
     snapshot = approval.supporting_facts or {}
@@ -596,14 +644,7 @@ def replacement_approval_facts(db, approval, actor):
 
 def refresh_approval(db, approval_id, actor):
     """Create a new pending revision while preserving the original approval record."""
-    approval = db.scalar(
-        select(Approval)
-        .where(Approval.id == approval_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if not approval:
-        raise LookupError("approval not found")
+    approval = lock_approval_lifecycle(db, approval_id)
     if approval.replacement_approval_id:
         return db.get(Approval, approval.replacement_approval_id)
     eligible = approval.status == "pending" or (
@@ -612,7 +653,7 @@ def refresh_approval(db, approval_id, actor):
     if not eligible:
         raise ValueError("Only a pending or evidence-changed approval can be refreshed.")
     lock_approval_sources(db, approval)
-    prior_execution = db.scalar(
+    prior_execution = prior_terminal_execution(db, approval) or db.scalar(
         select(ActionExecution).where(
             ActionExecution.idempotency_key == f"approval:{approval.id}"
         )
@@ -669,16 +710,9 @@ def refresh_approval(db, approval_id, actor):
 
 
 def decide_approval(db, approval_id, decision, actor):
-    approval = db.scalar(
-        select(Approval)
-        .where(Approval.id == approval_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
     if decision not in ("approved", "rejected"):
         raise ValueError("invalid decision")
-    if not approval:
-        raise LookupError("approval not found")
+    approval = lock_approval_lifecycle(db, approval_id)
     if approval.status != "pending":
         return approval
     lock_approval_sources(db, approval)
@@ -734,13 +768,9 @@ def retry_delay(attempt, retry_after=None):
     )
 
 
-def execute_approved(db, approval):
-    approval = db.scalar(
-        select(Approval)
-        .where(Approval.id == approval.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
+def execute_approved(db, approval, mock_outcome=None):
+    """Run an approved mock action; ``mock_outcome`` is preview-only injection."""
+    approval = lock_approval_lifecycle(db, approval.id)
     if approval.status != "approved":
         raise PermissionError("operator approval is required")
     lock_approval_sources(db, approval)
@@ -768,6 +798,20 @@ def execute_approved(db, approval):
         return
     if execution and execution.state in ("succeeded", "ambiguous"):
         approval.execution_status = execution.state
+        return
+    prior_execution = prior_terminal_execution(db, approval)
+    if prior_execution:
+        approval.execution_status = "blocked_prior_outcome"
+        approval.failure_detail = (
+            "Execution blocked: another approval revision has a started, successful, "
+            "or ambiguous outcome that must be reconciled first."
+        )
+        audit(
+            db, "approval", approval.id, "action_execution_blocked_prior_outcome",
+            details={"prior_execution_id": prior_execution.id, "prior_state": prior_execution.state},
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
+        db.flush()
         return
     contract = (approval.kind, approval.subject_type, approval.proposed_action)
     current_hash = current_approval_evidence_hash(approval)
@@ -831,10 +875,13 @@ def execute_approved(db, approval):
         execution.evidence_hash = approval.evidence_hash
     execution.attempts += 1
     approval.attempts = execution.attempts
-    if settings.mock_action_ambiguous:
+    if mock_outcome == "ambiguous" or (mock_outcome is None and settings.mock_action_ambiguous):
         execution.state = "ambiguous"
         execution.detail = "Simulated timeout after submission. Confirm provider state before resolving; automatic retry is blocked."
-    elif execution.attempts <= settings.mock_action_failures:
+    elif mock_outcome in ("retryable", "exhausted"):
+        execution.state = mock_outcome
+        execution.detail = "Simulated transient failure; no external request was made."
+    elif mock_outcome is None and execution.attempts <= settings.mock_action_failures:
         execution.state = (
             "retryable"
             if execution.attempts < settings.max_action_attempts

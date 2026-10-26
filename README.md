@@ -34,7 +34,7 @@ After installing the project dependencies, run:
 python -m scripts.preview --port 8002
 ```
 
-Open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. This creates a disposable SQLite database in a temporary directory and seeds synthetic pending, completed, rejected, retryable, exhausted, ambiguous, evidence-changed, unsupported-action, support-recovery, and delivery-recovery records. Preview mode ignores `.env` integration settings, forces mock LLM behavior, clears Shopify/OpenAI credentials and the n8n endpoint, and blocks webhook/worker routes. The persistent preview banner identifies the isolated data; n8n, paid services, and external actions are unavailable. Approving a scenario runs only its registered local mock adapter and persists its result; no background worker runs. Stop the process with Ctrl+C; its temporary database is removed when it exits. This preview is for interface and recovery-state review; it does **not** verify PostgreSQL concurrency or execute any n8n workflow.
+Open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. This creates a disposable SQLite database in a temporary directory and seeds synthetic pending, completed, rejected, retryable, exhausted, ambiguous, evidence-changed, unsupported-action, support-recovery, and delivery-recovery records. The Guided demo page can create a fresh scenario for any supported outcome; a due retryable scenario can then run an explicit local mock recovery attempt. Outcomes are injected per request instead of changing process-wide settings. Preview mode ignores `.env` integration settings, forces mock LLM behavior, clears Shopify/OpenAI credentials and the n8n endpoint, and blocks webhook/worker routes. The persistent preview banner identifies the isolated data; n8n, paid services, and external actions are unavailable. Stop the process with Ctrl+C; its temporary database is removed when it exits. This preview is for interface and recovery-state review; it does **not** verify PostgreSQL concurrency or execute any n8n workflow.
 
 ## Architecture
 
@@ -108,14 +108,15 @@ Then wait for the order workflow or trigger it manually. A configured real Shopi
 
 ## Operator interface
 
-The checked-in preview images below are earlier captures from an isolated synthetic database; they do not show live n8n execution. During this change, the guided scenario page was captured at 1440 × 900 and approval evidence at 390 × 844 in the current isolated preview. The current captures are visible in the change review; the older checked-in images remain historical.
+The current PNG captures below come from the isolated synthetic database and do not show live n8n execution. Historical JPG captures remain in the same directory.
 
 ![Operator overview with recovery priority](docs/screenshots/overview-preview.jpg)
-![Approval request, policy, order facts, and mock decision](docs/screenshots/approval-preview.jpg)
-![Guided demonstration entry](docs/screenshots/guided-demo-preview.jpg)
-![Mobile delayed-order approval](docs/screenshots/mobile-approval-preview.jpg)
+![Approval request, policy, order facts, and persisted retry recovery](docs/screenshots/approval-preview.png)
+![Interactive guided scenario entry](docs/screenshots/guided-demo-preview.png)
+![Mobile recovery workspace with keyboard skip-link focus](docs/screenshots/mobile-recovery-focus-preview.png)
+![Unified recovery workspace](docs/screenshots/recovery-preview.png)
 
-The console includes overview metrics, order/support/approval/delivery queues, and an action recovery workspace split into pending decisions, scheduled or eligible retries, exhausted attempts, stale evidence, and uncertain outcomes. Each state has a direct filter link; replaced approval revisions remain in history but are excluded from active recovery totals. Search, filters, and pagination are preserved through record navigation and decisions. Approval pages show source facts, revision lineage, and an audit timeline correlated to the support case or order. Delay review records retain threshold and timing evidence. Failed support cases and deliveries offer recovery controls; action failures explain retry timing and block blind retry of ambiguous results. Browser mutations require authenticated sessions and CSRF tokens.
+The console includes overview metrics, order/support/approval/delivery queues, and one recovery workspace spanning pending decisions, waiting and eligible retries, exhausted attempts, stale evidence, uncertain outcomes, and blocked contracts. Dashboard totals and workspace rows share the same bounded query rules. Each state has a direct filter link; replaced approval revisions remain in history but are excluded from active recovery totals. Search, filters, and pagination are preserved through record navigation and decisions. Approval pages show source facts, revision lineage, and an audit timeline correlated to the support case or order. Delay review records retain threshold and timing evidence. Failed support cases and deliveries offer recovery controls; action failures explain retry timing and block blind retry of ambiguous results. Browser mutations require authenticated sessions and CSRF tokens.
 
 Queued records offer a refresh control. POST buttons display a working state and disable duplicate submissions; server constraints and transactions provide the actual safety. Missing records, authentication failures, validation problems, and empty search results have readable states. No external font or image dependency is required.
 

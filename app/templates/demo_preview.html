@@ -34,6 +34,12 @@
   </section>
   <section class="panel">
     <div class="panelhead"><div><h2>Scenario workspace</h2><p>Each state below is backed by a seeded synthetic approval and timeline. Open a record to inspect its evidence and supported next step.</p></div></div>
+    <form method="post" action="/demo/preview/scenarios" class="inline-actions">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <label for="scenario">Create a fresh isolated scenario</label>
+      <select id="scenario" name="scenario">{% for scenario in preview_scenarios %}<option value="{{ scenario }}">{{ scenario.replace('_', ' ')|capitalize }}</option>{% endfor %}</select>
+      <button>Create and inspect</button>
+    </form>
     <div class="preview-example-grid">
       {% for approval in preview_examples %}
       <article class="preview-example">
@@ -45,9 +51,7 @@
       {% endfor %}
     </div>
     <div class="inline-actions">
-      <a class="record-link" href="/queues/failures">Action failures and blocked outcomes ↗</a>
-      <a class="record-link" href="/queues/cases?status=recovery">Support recovery queue ↗</a>
-      <a class="record-link" href="/queues/deliveries?status=recovery">Delivery recovery queue ↗</a>
+      <a class="record-link" href="/recovery">Open the unified recovery workspace ↗</a>
     </div>
   </section>
   <p class="footer-note">The real guided demo and n8n workflow checks require the local Docker stack. This page is synthetic interface evidence only.</p>

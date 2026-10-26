@@ -124,13 +124,15 @@
           <div class="notice">Rejected by {{ entity.actor or 'operator' }}. No mock action will run for this approval.</div>
         {% elif entity.status == 'approved' and entity.execution_status in ['failed', 'retryable', 'exhausted'] %}
           <div class="notice warn"><strong>{{ 'Recovery required' if entity.execution_status == 'exhausted' else 'Action needs another attempt' }}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
-          <form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue action retry</button></form>
+          {% if preview_mode and preview_run_due %}<form method="post" action="/approvals/{{ entity.id }}/preview-run{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Run due local mock attempt</button></form>{% elif entity.execution_status in ['failed', 'exhausted'] %}<form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue action retry</button></form>{% endif %}
         {% elif entity.execution_status == 'ambiguous' %}
           <div class="notice warn">Outcome uncertain. Automatic retry is blocked. Reconcile the recorded mock result using approval:{{ entity.id }} before taking further action.</div>
         {% elif entity.execution_status == 'evidence_changed' %}
           <div class="notice error"><strong>Execution blocked.</strong><p>{% if refresh_blocked_by_execution %}The prior execution may have completed or has an uncertain outcome. Reconcile its persisted result before any replacement or retry.{% elif freshness_differences %}Review the current facts above and create a fresh pending approval before any further mock execution.{% else %}The stored execution contract does not match the reviewed action. A maintainer must reconcile the persisted execution before any replacement or retry.{% endif %}</p></div>
         {% elif entity.execution_status == 'invalid_action' %}
           <div class="notice error"><strong>Execution blocked.</strong><p>This action has no registered mock adapter. No retry or replacement can be created here; a maintainer must correct the action contract before the source item is reprocessed.</p></div>
+        {% elif entity.execution_status == 'blocked_prior_outcome' %}
+          <div class="notice error"><strong>Another revision may already have acted.</strong><p>Reconcile the prior started, successful, or ambiguous execution. This revision cannot execute or retry until that persisted outcome is resolved.</p></div>
         {% elif entity.execution_status == 'succeeded' %}
           <div class="notice">Mock action completed. The timeline records the decision and execution.</div>
         {% elif entity.status == 'approved' %}

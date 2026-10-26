@@ -24,6 +24,7 @@ QUEUE_STATES = {
         "uncertain",
     },
     "deliveries": {"received", "processed", "failed", "exhausted", "recovery", "scheduled", "eligible"},
+    "recovery": {"pending", "waiting", "eligible", "exhausted", "stale", "uncertain", "blocked"},
 }
 DEFAULT_QUEUE = {
     "order": "orders", "case": "cases", "approval": "approvals", "delivery": "deliveries"
@@ -51,8 +52,12 @@ def record_navigation(query, kind=None):
     if len(page) <= 7 and page.isascii() and page.isdecimal() and 0 < int(page) <= 1000000:
         params["page"] = str(int(page))
     suffix = "?" + urlencode(params)
-    return suffix, "/queues/" + section + (
-        "?" + urlencode({k: v for k, v in params.items() if k != "from_queue"})
+    base = "/recovery" if section == "recovery" else "/queues/" + section
+    back_params = {k: v for k, v in params.items() if k != "from_queue"}
+    if section == "recovery" and "status" in back_params:
+        back_params["category"] = back_params.pop("status")
+    return suffix, base + (
+        "?" + urlencode(back_params)
         if len(params) > 1 else ""
     )
 
