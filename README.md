@@ -34,7 +34,7 @@ After installing the project dependencies, run:
 python -m scripts.preview --port 8002
 ```
 
-Open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. This creates a disposable SQLite database in a temporary directory and seeds only synthetic records for pending, completed, rejected, retryable, exhausted, and ambiguous outcomes. The database is deleted when the process stops. This preview is for interface and recovery-state review; it does **not** execute PostgreSQL concurrency checks or any n8n workflow.
+Open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. This creates a disposable SQLite database in a temporary directory and seeds synthetic pending, completed, rejected, retryable, exhausted, ambiguous, evidence-changed, unsupported-action, support-recovery, and delivery-recovery records. Preview mode ignores `.env` integration settings, forces mock LLM behavior, clears Shopify/OpenAI credentials and the n8n endpoint, and blocks webhook/worker routes. The persistent preview banner identifies the isolated data; n8n, paid services, and external actions are unavailable. Stop the process with Ctrl+C; its temporary database is removed when it exits. This preview is for interface and recovery-state review; it does **not** verify PostgreSQL concurrency or execute any n8n workflow.
 
 ## Architecture
 
@@ -76,7 +76,7 @@ docker compose exec -T api python -m scripts.demo
 
 It adds a fresh synthetic order aged 72 hours, invokes all three **real local n8n workflows**, queues a matched support inquiry, signs into the operator API, approves only this run's mock tasks, and checks the outcome. It repeats a decision and worker call to verify one execution record. It prints record links and the measured receipt-to-persistence duration. Existing data is retained. It drains up to 50 queued deliveries/cases if earlier work is ahead of its records. Run with default mock failure settings for the success scenario.
 
-For an interview walkthrough, open [Guided demo](http://localhost:8001/demo), click **Start guided demo**, and follow the linked records from the same page. It refreshes while queued work is active. Each “run now” control calls the actual published n8n webhook; the scheduled workers remain the normal path. The demo inserts only synthetic records and never sends messages or performs real financial actions.
+For an interview walkthrough on the full local stack, open [Guided demo](http://localhost:8001/demo), click **Start guided demo**, and follow the linked records from the same page. It refreshes while queued work is active. Each “run now” control calls the actual published n8n webhook; the scheduled workers remain the normal path. The demo inserts only synthetic records and never sends messages or performs real financial actions. In the isolated preview, `/demo` instead lists persisted synthetic examples; it does not start the workflow walkthrough.
 
 The five stages shown in the walkthrough are:
 
@@ -88,7 +88,7 @@ The five stages shown in the walkthrough are:
 
 Each row links directly to its order, case, or approval. “Queued”, “processing”, “awaiting review”, “completed”, and failure states reflect persisted application records; worker success by itself does not mark the business action successful.
 
-For repeatable recovery-state review when Docker is unavailable, use the isolated preview above. Its Action failures queue contains retryable, exhausted, and ambiguous mock executions; the Approvals queue contains completed and rejected decisions; and the overview links to the matching support and delivery recovery queues. These are synthetic persisted examples, not evidence of n8n execution.
+For repeatable recovery-state review when Docker is unavailable, use the isolated preview above. Its queues include retryable, exhausted, ambiguous, evidence-changed, and unsupported-action outcomes; the Approvals queue contains pending, completed, rejected, and blocked decisions; and the overview links to the matching support and delivery recovery queues. These are coherent synthetic records and audit entries, not evidence of n8n execution. Approval controls in preview update only its temporary database; they never schedule a live workflow.
 
 For a command-line interview walkthrough:
 
@@ -108,7 +108,7 @@ Then wait for the order workflow or trigger it manually. A configured real Shopi
 
 ## Operator interface
 
-The preview images below come from an isolated synthetic database. They show the current interface, not a live n8n execution. The earlier verified walkthrough images remain as `overview.png`, `approval.png`, and `guided-demo.png` in the same folder.
+The checked-in preview images below are earlier captures from an isolated synthetic database; they are not fresh visual evidence for this change and do not show a live n8n execution. This change's desktop and mobile inspection used the current disposable preview, but the image files were left unchanged.
 
 ![Operator overview with recovery priority](docs/screenshots/overview-preview.jpg)
 ![Approval request, policy, order facts, and mock decision](docs/screenshots/approval-preview.jpg)
@@ -139,7 +139,9 @@ No manual-time-saved or business-impact estimate is reported.
 - PostgreSQL row locks serialize duplicate workers. Transaction-scoped advisory locks serialize all deliveries for the same store/order, including concurrent first inserts. Only a strictly newer source timestamp updates an existing order.
 - Support order association requires both reference and email within the configured store. This is a matching check, not proof of customer identity: intake is restricted to authenticated operators or the internal integration secret, and no public order lookup is exposed.
 - Support request keys deduplicate exact repeated intake; reusing a key with different message, order reference, or email returns HTTP 409. Triage creates pending reply and, when appropriate, refund/cancellation review tasks. Required missing-information flags are appended after the LLM response and cannot be removed by it.
-- Operator decisions only queue actions. Every new approval stores a canonical hash of the action and evidence shown for review; the execution record stores the same action/hash pair. A changed snapshot or unregistered action contract is blocked before the mock adapter runs. Older approvals are sealed with their current persisted snapshot when first decided or executed. Approval locks and unique idempotency keys serialize concurrent execution. Success and ambiguous results are terminal for automatic retries.
+- Operator decisions only queue actions. Every new approval stores a canonical hash of the action and evidence shown for review; the execution record stores the same action/hash pair. Before approval and again before execution, the service compares that snapshot to the current order, inquiry, matched customer/order email and reference, draft, and policy. A matching hash proves snapshot integrity only; it does not prove that current facts remain unchanged. Stale evidence and unsupported action contracts are blocked before the mock adapter runs. Legacy approvals keep their original facts, decision, actor, timestamps, and attempts; when their evidence is incomplete or stale they cannot be newly executed and can be replaced with a numbered approval revision when a safe action is supported. Replacements retain the original record and audit correlation. Approval locks and unique idempotency keys serialize concurrent execution. Success and ambiguous results are terminal for automatic retries; ambiguous outcomes require reconciliation.
+- Approval revisions are schema migration `0005_approval_revisions.sql`: the unique key includes a revision, and an optional replacement link records lineage. Existing approvals migrate as revision 1 without rewriting their snapshot or decision.
+- Delayed-order detection examines at most 100 eligible orders per call using the `0006_delayed_order_scan_index.sql` `(fulfillment_status, created_at, id)` index and reports whether more remain. Orders with any prior delay approval are skipped, so rejected or superseded tasks are not recreated automatically; operators can use the explicit fresh-approval path for stale eligible decisions. Record timelines show the latest 100 related audit entries, and related order cases/approvals are bounded.
 - Each worker performs one attempt per item. Retryable failures persist `next_attempt_at`, using exponential delay from `RETRY_BASE_SECONDS`, capped at one hour. The mock `MOCK_RETRY_AFTER_SECONDS` is a lower bound simulating a provider's Retry-After delay. There is no live outbound action provider and no claim of tested live rate-limit handling.
 - Manual requeue preserves any existing retry deadline; repeated clicks cannot shorten backoff or enqueue duplicate work.
 - Exhausted items require operator requeue. Requeue retains attempt history; an exhausted action gets one additional recovery attempt. An ambiguous action has **no retry button**.

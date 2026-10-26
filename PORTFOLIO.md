@@ -22,13 +22,20 @@ Store operations combine repeatable work with decisions that need human judgment
 - Bound each executable approval to a canonical hash of the action and evidence reviewed by the operator, persisted the same contract on the execution record, and blocked changed evidence or unsupported mock actions before execution.
 - Split the overview recovery total into exact action, support, and delivery queue links; bounded receipt-duration aggregation to the latest 500 processed deliveries and removed the support queue's repeated order lookup.
 - Added a one-command disposable preview with coherent pending, completed, rejected, retryable, exhausted, and ambiguous synthetic records. It uses a temporary SQLite database and is explicitly separate from live n8n evidence.
+- Added approval freshness checks against current order, inquiry, matched customer/order email and reference, draft, and policy; stale decisions cannot reach the mock adapter even when the stored snapshot hash still matches. Explicit revisions provide a fresh review path while preserving original approval, decision, actor, attempt, and audit history.
+- Made preview settings independent of `.env` integration configuration, disabled n8n/webhook routes in preview, and expanded synthetic states to include evidence-changed and unsupported actions. Preview decisions affect only the disposable SQLite data.
+- Added a scan index for delayed orders, bounded scans to 100 eligible orders per worker call without starving later orders, bounded related approval/timeline reads, and surfaced whether delayed orders remain.
+- Moved execution-contract mismatch detection before terminal success/ambiguity short-circuiting so a persisted action/hash mismatch is never reported as a successful repeat.
 
 ## Current verification — 26 October 2026, Manila time
 
-- **45 isolated behavior tests passed**, including reviewed action/evidence binding, changed-evidence worker reporting, unsupported-action blocking, exact mixed recovery queues, approval request snapshots, validated navigation, and ambiguous retry prevention. All three workflow exports validated.
-- **Disposable preview verified:** `python -m scripts.preview --port 8765` started with a temporary SQLite database; preview authentication and the pending, completed, rejected, retryable, exhausted, ambiguous, support-recovery, and delivery-recovery views returned successfully. This is synthetic interface evidence, not workflow execution evidence.
-- **Rendered inspection:** inspected the overview and support approval at 1280 × 900 and 390 × 844. Recovery links, evidence sections, mock-mode labels, decision controls, and mobile content remained readable. Existing screenshot files were left unchanged because this pass did not capture replacement artifacts.
-- Docker Desktop was unavailable because its local engine socket was absent, so PostgreSQL concurrency, live n8n execution, and the CLI end-to-end demo were not rerun for this change. Their results below remain historical.
+- **Behavior suite:** `pytest -q` passed: **53 tests**. Coverage includes source-freshness blocking, legacy approval preservation, numbered replacement approvals, terminal execution-contract mismatch, preview isolation, and paginated delayed-order scans.
+- **Workflow exports:** all three JSON workflow files passed `python -m scripts.validate_workflows`.
+- **Schema upgrade:** a disposable PostgreSQL instance applied migrations 0001–0004, loaded a legacy approved record, then applied 0005–0006. Its revision, evidence, decision, actor, and timestamps remained intact; the delayed-order index was present afterward.
+- **PostgreSQL concurrency:** `python -m scripts.verify_postgres` passed against the disposable local PostgreSQL instance, including concurrent webhook deliveries, duplicate workers, out-of-order first inserts, support request-key conflicts, repeated approvals, and repeated execution. The verifier used an isolated schema and removed it afterward.
+- **Synthetic preview:** started from `python -m scripts.preview`, signed into the temporary SQLite application, and inspected the overview and approval record. It clearly identified preview mode and displayed pending evidence; its integration routes reject workflow/webhook calls. The preview is not n8n execution evidence.
+- **Visual inspection:** inspected the dashboard and approval detail at a 390 × 844 mobile viewport and a 1440 × 900 desktop viewport; approval evidence sections, action copy, recovery links, mock labeling, and mobile wrapping were readable. The checked-in screenshots were not replaced; they remain earlier synthetic preview captures.
+- **Not run:** Docker is installed but its daemon is unavailable, so the real local n8n demonstration and n8n workflow execution were not possible in this change. Earlier n8n results below are historical.
 
 ## Historical verification — 24 October 2026, Manila time
 
@@ -44,10 +51,10 @@ Store operations combine repeatable work with decisions that need human judgment
 
 ## Limitations
 
-No live Shopify development store, real LLM request, customer message, cancellation, or refund was used. Shopify HMAC handling is exercised with synthetic signed payloads. The optional OpenAI adapter has mocked HTTP coverage. All action execution and provider failures are simulated. Retry-After behavior is represented by a configurable mock minimum delay, not a verified live provider response. The reference/email match is an operator lookup check, not customer identity verification. There is no live ambiguous-outcome reconciliation endpoint, production authentication system, or measured business impact. The current PostgreSQL migration and concurrency behavior still need confirmation on a running Docker stack.
+No live Shopify development store, real LLM request, customer message, cancellation, or refund was used. Shopify HMAC handling is exercised with synthetic signed payloads. The optional OpenAI adapter has mocked HTTP coverage. All action execution and provider failures are simulated. Retry-After behavior is represented by a configurable mock minimum delay, not a verified live provider response. The reference/email match is an operator lookup check, not customer identity verification. There is no live ambiguous-outcome reconciliation endpoint, production authentication system, or measured business impact. PostgreSQL migration upgrade and concurrency behavior passed against an isolated local PostgreSQL cluster; the full Docker stack and real n8n integration were unavailable for this change.
 
 ## Resume bullets
 
 - Built three n8n workflows coordinating durable order ingestion, support triage, delayed-order review, and approval-gated mock execution using FastAPI and PostgreSQL.
 - Designed an authenticated operator console with searchable queues, CSRF-protected decisions, correlated timelines, event-derived metrics, and failure recovery controls.
-- Verified behavior with 45 automated tests; historical PostgreSQL concurrency, restart-recovery, and local n8n demonstrations cover repeat-safe approvals and audited outcomes.
+- Verified behavior with the current automated suite; ran schema-upgrade and concurrency checks on disposable PostgreSQL. Historical restart-recovery and local n8n demonstrations cover repeat-safe approvals and audited outcomes.

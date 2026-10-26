@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
-from sqlalchemy import select, func, or_, cast, String
+from sqlalchemy import select, func, or_, cast, String, exists
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, Field
 import httpx
@@ -22,6 +22,10 @@ from app.services import (
     verify_shopify,
     process_delivery,
     decide_approval,
+    refresh_approval,
+    approval_freshness_differences,
+    ACTION_CONTRACTS,
+    ApprovalEvidenceStale,
     queue_support,
     process_support,
     execute_approved,
@@ -38,6 +42,7 @@ templates.env.filters["utc"] = lambda value: (
     as_utc(value).strftime("%d %b %Y · %H:%M UTC") if value else "Not recorded"
 )
 templates.env.filters["snapshot_utc"] = snapshot_utc
+templates.env.globals["preview_mode"] = settings.preview_mode
 
 
 @asynccontextmanager
@@ -51,6 +56,19 @@ app = FastAPI(title="CommerceOps", lifespan=lifespan)
 app.add_middleware(
     SessionMiddleware, secret_key=settings.app_secret, same_site="lax", https_only=False
 )
+
+
+@app.middleware("http")
+async def block_live_integrations_in_preview(request: Request, call_next):
+    if settings.preview_mode and (
+        request.url.path.startswith("/api/n8n/")
+        or request.url.path.startswith("/webhooks/")
+    ):
+        return JSONResponse(
+            {"detail": "Live integrations are disabled in the isolated preview."},
+            status_code=409,
+        )
+    return await call_next(request)
 
 
 def operator(request: Request):
@@ -81,7 +99,7 @@ def health(db: Session = Depends(get_db)):
         raise HTTPException(503, "database unavailable")
     return {
         "status": "ok",
-        "mode": "mock_actions",
+        "mode": "isolated_preview" if settings.preview_mode else "mock_actions",
         "llm": (
             "openai"
             if settings.llm_mode == "openai" and settings.openai_api_key
@@ -215,7 +233,7 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
         "failures": count(
             Approval,
             Approval.execution_status.in_(
-                ["retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
+                ["failed", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
             ),
         )
         + count(Delivery, Delivery.status.in_(["failed", "exhausted"]))
@@ -263,7 +281,7 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
     counts["approval_recovery"] = count(
         Approval,
         Approval.execution_status.in_(
-            ["retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
+            ["failed", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action"]
         ),
     )
     counts["case_recovery"] = count(Case, Case.status.in_(["failed", "exhausted"]))
@@ -323,11 +341,16 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
 
 @app.get("/demo", response_class=HTMLResponse)
 def guided_demo_home(
-    request: Request, actor=Depends(operator)
+    request: Request, actor=Depends(operator), db: Session = Depends(get_db)
 ):
+    preview_examples = (
+        db.scalars(select(Approval).order_by(Approval.id).limit(50)).all()
+        if settings.preview_mode
+        else []
+    )
     return templates.TemplateResponse(
         request,
-        "demo.html",
+        "demo_preview.html" if settings.preview_mode else "demo.html",
         {
             "request": request,
             "actor": actor,
@@ -335,6 +358,7 @@ def guided_demo_home(
             "title": "Guided demo",
             "delivery": None,
             "delay_hours": settings.order_delay_hours,
+            "preview_examples": preview_examples,
         },
     )
 
@@ -505,6 +529,8 @@ def guided_demo_run_workflow(
     db: Session=Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
+    if settings.preview_mode:
+        raise HTTPException(409, "n8n workflow execution is disabled in the isolated preview.")
     triggers = {
         "order": (1, "orders/process"),
         "support": (2, "support/triage"),
@@ -587,6 +613,7 @@ def queue_page(
                 Approval.failure_detail,
             ],
             [
+                "failed",
                 "retryable",
                 "exhausted",
                 "ambiguous",
@@ -669,7 +696,7 @@ def queue_page(
     )
 
 
-def detail_response(kind, record_id, request, actor, db):
+def detail_response(kind, record_id, request, actor, db, status_code=200):
     model = {"order": Order, "case": Case, "approval": Approval, "delivery": Delivery}[
         kind
     ]
@@ -677,6 +704,7 @@ def detail_response(kind, record_id, request, actor, db):
     if not entity:
         raise HTTPException(404, "Record not found")
     related = []
+    related_cases_limited = False
     conditions = [(Audit.entity_type == kind) & (Audit.entity_id == record_id)]
     if kind in ("order", "case"):
         subjects = [record_id]
@@ -684,9 +712,14 @@ def detail_response(kind, record_id, request, actor, db):
             Approval.subject_id == record_id
         )
         if kind == "order":
-            case_ids = list(
-                db.scalars(select(Case.id).where(Case.order_id == record_id))
-            )
+            case_ids = list(db.scalars(
+                select(Case.id)
+                .where(Case.order_id == record_id)
+                .order_by(Case.id.desc())
+                .limit(101)
+            ))
+            related_cases_limited = len(case_ids) > 100
+            case_ids = case_ids[:100]
             approval_condition = or_(
                 approval_condition,
                 (Approval.subject_type == "case") & Approval.subject_id.in_(case_ids),
@@ -695,15 +728,22 @@ def detail_response(kind, record_id, request, actor, db):
                 (Audit.entity_type == "case") & Audit.entity_id.in_(case_ids)
             )
         related = db.scalars(
-            select(Approval).where(approval_condition).order_by(Approval.id)
+            select(Approval).where(approval_condition).order_by(Approval.id.desc()).limit(50)
         ).all()
         conditions.append(
             (Audit.entity_type == "approval")
             & Audit.entity_id.in_([a.id for a in related])
         )
-    timeline = db.scalars(
-        select(Audit).where(or_(*conditions)).order_by(Audit.created_at, Audit.id)
-    ).all()
+    timeline = list(
+        reversed(
+            db.scalars(
+                select(Audit)
+                .where(or_(*conditions))
+                .order_by(Audit.created_at.desc(), Audit.id.desc())
+                .limit(100)
+            ).all()
+        )
+    )
     title = (
         f"Order {entity.order_number}"
         if kind == "order"
@@ -712,9 +752,33 @@ def detail_response(kind, record_id, request, actor, db):
     detail_query, back_url = record_navigation(request.query_params, kind)
     subject = None
     current_order = None
+    freshness_differences = []
+    approval_history = []
+    refresh_blocked_by_execution = False
     if kind == "approval":
         subject = db.get(Order if entity.subject_type == "order" else Case, entity.subject_id)
         current_order = subject if entity.subject_type == "order" else subject.order if subject else None
+        freshness_differences = approval_freshness_differences(db, entity)
+        prior_execution = db.scalar(
+            select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{entity.id}"
+            )
+        )
+        refresh_blocked_by_execution = bool(
+            prior_execution and prior_execution.state in ("started", "succeeded", "ambiguous")
+        )
+        approval_history = db.scalars(
+            select(Approval)
+            .where(
+                Approval.kind == entity.kind,
+                Approval.subject_type == entity.subject_type,
+                Approval.subject_id == entity.subject_id,
+                Approval.proposed_action == entity.proposed_action,
+                Approval.id != entity.id,
+            )
+            .order_by(Approval.revision.desc())
+            .limit(20)
+        ).all()
     return templates.TemplateResponse(
         request,
         "detail.html",
@@ -732,7 +796,16 @@ def detail_response(kind, record_id, request, actor, db):
             "retry_guidance": retry_guidance,
             "subject": subject,
             "current_order": current_order,
+            "freshness_differences": freshness_differences,
+            "approval_history": approval_history,
+            "refresh_blocked_by_execution": refresh_blocked_by_execution,
+            "refresh_supported": kind == "approval"
+            and (entity.kind, entity.subject_type, entity.proposed_action) in ACTION_CONTRACTS
+            and not refresh_blocked_by_execution,
+            "timeline_limited": len(timeline) == 100,
+            "related_cases_limited": related_cases_limited,
         },
+        status_code=status_code,
     )
 
 
@@ -823,10 +896,31 @@ def approval_decision(
         decide_approval(db, approval_id, decision, actor)
     except LookupError:
         raise HTTPException(404)
+    except ApprovalEvidenceStale:
+        return detail_response("approval", approval_id, request, actor, db, status_code=409)
     except ValueError as exc:
         raise HTTPException(409, str(exc))
     suffix, _ = record_navigation(request.query_params, "approval")
     return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
+
+
+@app.post("/approvals/{approval_id}/refresh")
+def refresh_approval_route(
+    approval_id: int,
+    request: Request,
+    csrf_token: str = Form(...),
+    actor=Depends(operator),
+    db: Session = Depends(get_db),
+):
+    verify_csrf(request, csrf_token)
+    try:
+        replacement = refresh_approval(db, approval_id, actor)
+    except LookupError:
+        raise HTTPException(404)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    suffix, _ = record_navigation(request.query_params, "approval")
+    return RedirectResponse(f"/approvals/{replacement.id}{suffix}", status_code=303)
 
 
 @app.post("/approvals/{approval_id}/retry")
@@ -1152,10 +1246,24 @@ def scan_delayed(
     if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
         raise HTTPException(401)
     cutoff = utcnow() - timedelta(hours=settings.order_delay_hours)
-    rows = db.scalars(
-        select(Order).where(
-            Order.fulfillment_status == "unfulfilled", Order.created_at < cutoff
+    already_approved = exists(
+        select(Approval.id).where(
+            Approval.kind == "exception",
+            Approval.subject_type == "order",
+            Approval.subject_id == Order.id,
+            Approval.proposed_action == "review_delayed_order",
         )
+    )
+    delayed_condition = (
+        (Order.fulfillment_status == "unfulfilled")
+        & (Order.created_at < cutoff)
+        & ~already_approved
+    )
+    rows = db.scalars(
+        select(Order)
+        .where(delayed_condition)
+        .order_by(Order.created_at, Order.id)
+        .limit(100)
     ).all()
     created = []
     before = db.scalar(select(func.count(Approval.id)))
@@ -1168,9 +1276,11 @@ def scan_delayed(
             "review_delayed_order",
             {
                 "order_number": o.order_number,
+                "order_id": o.id,
                 "hours_threshold": settings.order_delay_hours,
                 "created_at": o.created_at.isoformat(),
                 "order_fulfillment_status": o.fulfillment_status,
+                "order_financial_status": o.financial_status,
                 "order_total": f"{o.currency} {o.total}",
                 "order_source_updated_at": o.source_updated_at.isoformat(),
             },
@@ -1178,6 +1288,7 @@ def scan_delayed(
         created.append(a.id)
     db.commit()
     new_exceptions = (db.scalar(select(func.count(Approval.id))) or 0) - before
+    delayed_scan_has_more = bool(db.scalar(select(exists().where(delayed_condition))))
     # n8n schedules the action worker; browser decisions only enqueue work.
     pending = db.scalars(
         select(Approval)
@@ -1211,6 +1322,7 @@ def scan_delayed(
         {
             "open_delayed_orders": len(created),
             "new_exceptions": new_exceptions,
+            "delayed_scan_has_more": delayed_scan_has_more,
             "actions_processed": len(pending),
             "action_outcomes": action_outcomes,
         },

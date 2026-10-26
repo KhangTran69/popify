@@ -20,6 +20,7 @@ from app.services import (
     create_approval,
     decide_approval,
     execute_approved,
+    approval_freshness_differences,
     queue_support,
     SupportRequestKeyConflict,
 )
@@ -143,9 +144,30 @@ def run():
                     Case.request_key == "same-support-key"
                 )
             ) == 1
+            # Approval decisions validate current order state and delay eligibility.
+            delayed_order = db.get(Order, row.id)
+            delayed_order.created_at = utcnow() - timedelta(hours=settings.order_delay_hours + 1)
+            delayed_order.fulfillment_status = "unfulfilled"
+            db.flush()
             a = create_approval(
-                db, "exception", "order", row.id, "review_delayed_order", {}
+                db,
+                "exception",
+                "order",
+                delayed_order.id,
+                "review_delayed_order",
+                {
+                    "order_number": delayed_order.order_number,
+                    "order_id": delayed_order.id,
+                    "hours_threshold": settings.order_delay_hours,
+                    "created_at": delayed_order.created_at.isoformat(),
+                    "order_fulfillment_status": delayed_order.fulfillment_status,
+                    "order_financial_status": delayed_order.financial_status,
+                    "order_total": f"{delayed_order.currency} {delayed_order.total}",
+                    "order_source_updated_at": delayed_order.source_updated_at.isoformat(),
+                },
             )
+            differences = approval_freshness_differences(db, a)
+            assert not differences, f"PostgreSQL approval fixture is stale: {differences}"
             db.commit()
             aid = a.id
 

@@ -15,6 +15,12 @@ class SupportRequestKeyConflict(ValueError):
     """A caller reused an idempotency key for different inquiry content."""
 
 
+class ApprovalEvidenceStale(ValueError):
+    def __init__(self, differences):
+        self.differences = differences
+        super().__init__("approval evidence is stale; review the current facts")
+
+
 ACTION_CONTRACTS = {
     ("support", "case", "send_reply"),
     ("exception", "case", "review_refund_request"),
@@ -289,15 +295,21 @@ def create_support_case(
     )
     facts = {
         "order_number": order.order_number if order else None,
+        "order_id": order.id if order else None,
+        "customer_email": case.customer_email,
+        "case_order_ref": case.order_ref,
+        "order_email": order.email if order else None,
         "customer_message": message,
         "policy": policies[category],
         "order_fulfillment_status": order.fulfillment_status if order else None,
+        "order_financial_status": order.financial_status if order else None,
         "order_total": f"{order.currency} {order.total}" if order else None,
         "order_source_updated_at": order.source_updated_at.isoformat() if order and order.source_updated_at else None,
         "category": category,
         "confidence": confidence,
         "draft": draft,
         "missing_info": missing,
+        "case_status": case.status,
         "correlation_id": case.correlation_id or f"case:{case.id}",
     }
     create_approval(db, "support", "case", case.id, "send_reply", facts)
@@ -324,22 +336,24 @@ def classify(text):
     return "other", 45
 
 
-def create_approval(db, kind, subject_type, subject_id, action, facts):
-    existing = db.scalar(
-        select(Approval).where(
-            Approval.kind == kind,
-            Approval.subject_type == subject_type,
-            Approval.subject_id == subject_id,
-            Approval.proposed_action == action,
-        )
+def create_approval(db, kind, subject_type, subject_id, action, facts, revision=None):
+    existing_query = select(Approval).where(
+        Approval.kind == kind,
+        Approval.subject_type == subject_type,
+        Approval.subject_id == subject_id,
+        Approval.proposed_action == action,
     )
-    if existing:
-        return existing
+    if revision is None:
+        existing = db.scalar(existing_query.order_by(Approval.revision.desc()).limit(1))
+        if existing:
+            return existing
+        revision = 1
     approval = Approval(
         kind=kind,
         subject_type=subject_type,
         subject_id=subject_id,
         proposed_action=action,
+        revision=revision,
         supporting_facts=dict(facts),
         evidence_hash=approval_evidence_hash(
             kind, subject_type, subject_id, action, facts
@@ -350,23 +364,285 @@ def create_approval(db, kind, subject_type, subject_id, action, facts):
             db.add(approval)
             db.flush()
     except IntegrityError:
-        return db.scalar(
-            select(Approval).where(
-                Approval.kind == kind,
-                Approval.subject_type == subject_type,
-                Approval.subject_id == subject_id,
-                Approval.proposed_action == action,
-            )
+        existing = db.scalar(
+            existing_query.order_by(Approval.revision.desc()).limit(1)
         )
+        if existing:
+            return existing
+        raise
     audit(
         db,
         "approval",
         approval.id,
         "approval_requested",
-        details={"action": action},
+        details={"action": action, "revision": revision},
         correlation_id=facts.get("correlation_id"),
     )
     return approval
+
+
+def current_approval_facts(db, approval):
+    """Build the current source facts relevant to this approval's action."""
+    facts = approval.supporting_facts or {}
+    if approval.subject_type == "case":
+        case = db.get(Case, approval.subject_id)
+        if not case:
+            return None
+        order = db.get(Order, case.order_id) if case.order_id else None
+        category = case.category
+        policy = settings.store_policies.get(category)
+        if not policy:
+            return None
+        return {
+            "order_number": order.order_number if order else None,
+            "order_id": order.id if order else None,
+            "customer_email": case.customer_email,
+            "case_order_ref": case.order_ref,
+            "order_email": order.email if order else None,
+            "customer_message": case.message,
+            "policy": policy,
+            "order_fulfillment_status": order.fulfillment_status if order else None,
+            "order_financial_status": order.financial_status if order else None,
+            "order_total": f"{order.currency} {order.total}" if order else None,
+            "order_source_updated_at": order.source_updated_at.isoformat()
+            if order and order.source_updated_at
+            else None,
+            "category": category,
+            "confidence": case.confidence,
+            "draft": case.draft,
+            "missing_info": case.missing_info or "",
+            "case_status": case.status,
+            "correlation_id": case.correlation_id
+            or facts.get("correlation_id")
+            or f"case:{case.id}",
+        }
+    if approval.subject_type == "order" and approval.proposed_action == "review_delayed_order":
+        order = db.get(Order, approval.subject_id)
+        if not order:
+            return None
+        return {
+            "order_number": order.order_number,
+            "order_id": order.id,
+            "hours_threshold": settings.order_delay_hours,
+            "created_at": order.created_at.isoformat(),
+            "order_fulfillment_status": order.fulfillment_status,
+            "order_financial_status": order.financial_status,
+            "order_total": f"{order.currency} {order.total}",
+            "order_source_updated_at": order.source_updated_at.isoformat(),
+            "correlation_id": facts.get("correlation_id")
+            or f"order:{order.id}",
+        }
+    return None
+
+
+def approval_freshness_differences(db, approval):
+    """Compare the reviewed snapshot with both its hash and current source state."""
+    snapshot = approval.supporting_facts or {}
+    differences = []
+    current_hash = current_approval_evidence_hash(approval)
+    if approval.evidence_hash and approval.evidence_hash != current_hash:
+        differences.append("The persisted approval snapshot no longer matches its evidence hash.")
+
+    current = current_approval_facts(db, approval)
+    if current is None:
+        differences.append("The source order or support case is missing or no longer usable.")
+        return differences
+
+    if approval.subject_type == "case":
+        required = (
+            "order_number",
+            "order_id",
+            "customer_email",
+            "case_order_ref",
+            "order_email",
+            "customer_message",
+            "policy",
+            "order_fulfillment_status",
+            "order_financial_status",
+            "order_total",
+            "order_source_updated_at",
+            "category",
+            "confidence",
+            "draft",
+            "missing_info",
+            "case_status",
+        )
+    else:
+        required = (
+            "order_number",
+            "order_id",
+            "hours_threshold",
+            "created_at",
+            "order_fulfillment_status",
+            "order_financial_status",
+            "order_total",
+            "order_source_updated_at",
+        )
+    for field in required:
+        if field not in snapshot:
+            differences.append(f"The reviewed snapshot is missing {field.replace('_', ' ')}.")
+        elif snapshot.get(field) != current.get(field):
+            same_timestamp = False
+            if field.endswith(("_at", "created_at")):
+                try:
+                    same_timestamp = as_utc(datetime.fromisoformat(snapshot[field])).replace(microsecond=0) == as_utc(datetime.fromisoformat(current[field])).replace(microsecond=0)
+                except (TypeError, ValueError):
+                    pass
+            if not same_timestamp:
+                differences.append(f"{field.replace('_', ' ').capitalize()} changed since review.")
+
+    if approval.subject_type == "case" and approval.proposed_action.startswith("review_"):
+        expected_category = approval.proposed_action.removeprefix("review_").removesuffix("_request")
+        if current.get("category") != expected_category:
+            differences.append("The current inquiry no longer matches the approved exception type.")
+    if approval.proposed_action == "review_delayed_order":
+        order = db.get(Order, approval.subject_id)
+        if order and (
+            order.fulfillment_status != "unfulfilled"
+            or as_utc(order.created_at) > utcnow() - timedelta(hours=settings.order_delay_hours)
+        ):
+            differences.append("The order no longer meets the current delayed-order rule.")
+    if (
+        approval.subject_type == "case"
+        and approval.proposed_action == "send_reply"
+        and approval.execution_status == "succeeded"
+        and current.get("case_status") == "resolved_mock"
+    ):
+        differences = [difference for difference in differences if not difference.startswith("Case status changed")]
+    return list(dict.fromkeys(differences))
+
+
+def replacement_approval_facts(db, approval, actor):
+    current = current_approval_facts(db, approval)
+    if current is None:
+        raise ValueError("The source record is missing; a replacement approval cannot be created.")
+    facts = approval.supporting_facts or {}
+    if approval.subject_type == "case":
+        case = db.get(Case, approval.subject_id)
+        order = db.get(Order, case.order_id) if case.order_id else None
+        category = case.category
+        if approval.kind == "exception":
+            if category not in ("refund", "cancellation"):
+                raise ValueError("The current inquiry no longer supports a refund or cancellation review.")
+            action = f"review_{category}_request"
+        else:
+            action = "send_reply"
+        policy = settings.store_policies[category]
+        order_summary = (
+            f"Order {order.order_number} is {order.fulfillment_status}; total {order.currency} {order.total}."
+            if order
+            else "No matching order was found."
+        )
+        opener = "Thanks for contacting us."
+        draft = f"{opener} {order_summary} {policy}"
+        required = []
+        if not order:
+            required.append("Verified order reference")
+        if category == "damaged_item":
+            required.append("Photo or item details")
+        if case.confidence < 60:
+            required.append("Uncertain classification — operator review required")
+        missing = "; ".join(required)
+        case.draft = draft
+        case.missing_info = missing
+        case.status = "needs_review"
+        audit(
+            db,
+            "case",
+            case.id,
+            "support_draft_refreshed_for_approval",
+            actor,
+            details={"previous_approval_id": approval.id},
+            correlation_id=case.correlation_id or facts.get("correlation_id"),
+        )
+        current = current_approval_facts(db, approval)
+        current["draft"] = draft
+        current["missing_info"] = missing
+    else:
+        order = db.get(Order, approval.subject_id)
+        if (
+            approval.proposed_action != "review_delayed_order"
+            or order.fulfillment_status != "unfulfilled"
+            or as_utc(order.created_at) > utcnow() - timedelta(hours=settings.order_delay_hours)
+        ):
+            raise ValueError("The order no longer meets the delayed-order rule; no replacement was created.")
+        action = approval.proposed_action
+    current["correlation_id"] = facts.get("correlation_id") or current.get("correlation_id")
+    return action, current
+
+
+def refresh_approval(db, approval_id, actor):
+    """Create a new pending revision while preserving the original approval record."""
+    approval = db.scalar(
+        select(Approval)
+        .where(Approval.id == approval_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if not approval:
+        raise LookupError("approval not found")
+    if approval.replacement_approval_id:
+        return db.get(Approval, approval.replacement_approval_id)
+    eligible = approval.status == "pending" or (
+        approval.status == "approved" and approval.execution_status == "evidence_changed"
+    )
+    if not eligible:
+        raise ValueError("Only a pending or evidence-changed approval can be refreshed.")
+    prior_execution = db.scalar(
+        select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval.id}"
+        )
+    )
+    if prior_execution and prior_execution.state in ("started", "succeeded", "ambiguous"):
+        raise ValueError(
+            "The prior execution may have completed; reconcile its outcome before creating a replacement."
+        )
+    differences = approval_freshness_differences(db, approval)
+    if not differences:
+        raise ValueError("The approval evidence is current; refresh is not needed.")
+    action, facts = replacement_approval_facts(db, approval, actor)
+    if (approval.kind, approval.subject_type, action) not in ACTION_CONTRACTS:
+        raise ValueError("The current action has no registered mock adapter.")
+    latest_revision = db.scalar(
+        select(func.max(Approval.revision)).where(
+            Approval.kind == approval.kind,
+            Approval.subject_type == approval.subject_type,
+            Approval.subject_id == approval.subject_id,
+            Approval.proposed_action == action,
+        )
+    ) or 0
+    replacement = create_approval(
+        db,
+        approval.kind,
+        approval.subject_type,
+        approval.subject_id,
+        action,
+        facts,
+        revision=latest_revision + 1,
+    )
+    approval.replacement_approval_id = replacement.id
+    if approval.status == "pending":
+        approval.status = "superseded"
+    audit(
+        db,
+        "approval",
+        approval.id,
+        "approval_replaced_with_fresh_evidence",
+        actor,
+        details={"replacement_approval_id": replacement.id, "differences": differences},
+        correlation_id=facts.get("correlation_id"),
+    )
+    audit(
+        db,
+        "approval",
+        replacement.id,
+        "approval_refreshed_from_previous_revision",
+        actor,
+        details={"previous_approval_id": approval.id},
+        correlation_id=facts.get("correlation_id"),
+    )
+    db.commit()
+    return replacement
 
 
 def decide_approval(db, approval_id, decision, actor):
@@ -382,9 +658,21 @@ def decide_approval(db, approval_id, decision, actor):
         raise LookupError("approval not found")
     if approval.status != "pending":
         return approval
+    contract = (approval.kind, approval.subject_type, approval.proposed_action)
+    differences = approval_freshness_differences(db, approval)
+    if differences and decision == "approved":
+        audit(
+            db,
+            "approval",
+            approval.id,
+            "approval_decision_blocked_stale_evidence",
+            actor,
+            details={"differences": differences},
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
+        db.commit()
+        raise ApprovalEvidenceStale(differences)
     current_hash = current_approval_evidence_hash(approval)
-    if approval.evidence_hash and approval.evidence_hash != current_hash:
-        raise ValueError("approval evidence changed; reload or recreate the approval")
     if not approval.evidence_hash:
         approval.evidence_hash = current_hash
         audit(
@@ -437,6 +725,22 @@ def execute_approved(db, approval):
         .where(ActionExecution.idempotency_key == key)
         .with_for_update()
     )
+    if execution and (
+        execution.proposed_action not in (None, approval.proposed_action)
+        or execution.evidence_hash not in (None, approval.evidence_hash)
+    ):
+        approval.execution_status = "evidence_changed"
+        approval.failure_detail = "Execution blocked: the persisted execution does not match the reviewed action and evidence."
+        audit(
+            db,
+            "approval",
+            approval.id,
+            "action_execution_contract_mismatch",
+            details={"action": approval.proposed_action},
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
+        db.flush()
+        return
     if execution and execution.state in ("succeeded", "ambiguous"):
         approval.execution_status = execution.state
         return
@@ -455,18 +759,19 @@ def execute_approved(db, approval):
         )
         db.flush()
         return
-    if approval.evidence_hash and approval.evidence_hash != current_hash:
+    differences = approval_freshness_differences(db, approval)
+    if differences:
         approval.execution_status = "evidence_changed"
-        approval.failure_detail = "Execution blocked: approval evidence changed after the operator decision."
+        approval.failure_detail = "Execution blocked: evidence changed after the operator decision or source facts became stale. Create a fresh approval from current source facts."
         audit(
             db,
             "approval",
             approval.id,
             "action_execution_evidence_changed",
             details={
-                "approved_evidence_hash": approval.evidence_hash,
                 "current_evidence_hash": current_hash,
                 "action": approval.proposed_action,
+                "differences": differences,
             },
             correlation_id=approval.supporting_facts.get("correlation_id"),
         )
@@ -496,23 +801,7 @@ def execute_approved(db, approval):
         )
         db.add(execution)
         db.flush()
-    elif (
-        execution.proposed_action not in (None, approval.proposed_action)
-        or execution.evidence_hash not in (None, approval.evidence_hash)
-    ):
-        approval.execution_status = "evidence_changed"
-        approval.failure_detail = "Execution blocked: the persisted execution does not match the reviewed action and evidence."
-        audit(
-            db,
-            "approval",
-            approval.id,
-            "action_execution_contract_mismatch",
-            details={"action": approval.proposed_action},
-            correlation_id=approval.supporting_facts.get("correlation_id"),
-        )
-        db.flush()
-        return
-    else:
+    elif execution:
         execution.proposed_action = approval.proposed_action
         execution.evidence_hash = approval.evidence_hash
     execution.attempts += 1

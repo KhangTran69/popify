@@ -2,22 +2,25 @@ import pytest
 import base64, hashlib, hmac, json
 from datetime import timedelta
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, func
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from app import main
 from app.db import Base, get_db
 from app.config import settings
-from app.models import Order, Delivery, Approval, ActionExecution, utcnow
+from app.models import Order, Delivery, Approval, ActionExecution, Case, utcnow
 from app.services import (
     process_delivery,
-    create_approval,
+    create_approval as service_create_approval,
     decide_approval,
     verify_shopify,
     create_support_case,
     execute_approved,
     as_utc,
     SupportRequestKeyConflict,
+    refresh_approval,
+    ApprovalEvidenceStale,
+    approval_freshness_differences,
 )
 
 engine = create_engine(
@@ -25,6 +28,81 @@ engine = create_engine(
 )
 TestingSession = sessionmaker(bind=engine, expire_on_commit=False)
 Base.metadata.create_all(engine)
+
+
+def create_approval(db, kind, subject_type, subject_id, action, facts, revision=None):
+    """Give legacy service tests coherent source rows for freshness validation."""
+    if subject_type == "order" and action == "review_delayed_order" and not db.get(Order, subject_id):
+        order = Order(
+            id=subject_id, shop_domain="test.myshopify.com", external_id=f"test-{subject_id}",
+            order_number=f"#{subject_id}", email="test@example.test", currency="USD",
+            total="12.00", fulfillment_status="unfulfilled", financial_status="paid",
+            created_at=utcnow() - timedelta(hours=72), source_updated_at=utcnow(), payload={},
+        )
+        db.add(order)
+        db.flush()
+    if subject_type == "case" and not db.get(Case, subject_id):
+        order = Order(
+            shop_domain="test.myshopify.com", external_id=f"case-order-{subject_id}",
+            order_number=f"#CASE-{subject_id}", email="test@example.test", currency="USD",
+            total="12.00", fulfillment_status="unfulfilled", financial_status="paid",
+            created_at=utcnow() - timedelta(hours=72), source_updated_at=utcnow(), payload={},
+        )
+        db.add(order)
+        db.flush()
+        category = facts.get("category", "other")
+        db.add(Case(
+            id=subject_id, order_id=order.id, order_ref=order.order_number,
+            customer_email=order.email, message=facts.get("customer_message", "Synthetic inquiry"),
+            category=category, confidence=facts.get("confidence", 80),
+            draft=facts.get("draft", "Synthetic reviewed draft"), status="needs_review",
+            missing_info=facts.get("missing_info", ""),
+        ))
+        db.flush()
+    source_order = None
+    if subject_type == "order":
+        source_order = db.get(Order, subject_id)
+    elif subject_type == "case":
+        case = db.get(Case, subject_id)
+        source_order = db.get(Order, case.order_id) if case and case.order_id else None
+    if source_order:
+        source_order.shop_domain = source_order.shop_domain or "test.myshopify.com"
+        source_order.external_id = source_order.external_id or f"test-{source_order.id}"
+        source_order.order_number = source_order.order_number or f"#TEST-{source_order.id}"
+        source_order.email = source_order.email or "test@example.test"
+        source_order.currency = source_order.currency or "USD"
+        source_order.total = source_order.total or "12.00"
+        source_order.fulfillment_status = source_order.fulfillment_status or "unfulfilled"
+        source_order.financial_status = source_order.financial_status or "paid"
+        source_order.created_at = source_order.created_at or (utcnow() - timedelta(hours=72))
+        if action == "review_delayed_order" and source_order.created_at > utcnow() - timedelta(hours=settings.order_delay_hours + 1):
+            source_order.created_at = utcnow() - timedelta(hours=settings.order_delay_hours + 2)
+        source_order.source_updated_at = source_order.source_updated_at or utcnow()
+        source_order.payload = source_order.payload or {}
+        db.flush()
+        completed = dict(facts)
+        completed.setdefault("order_number", source_order.order_number)
+        completed.setdefault("order_id", source_order.id)
+        completed.setdefault("order_fulfillment_status", source_order.fulfillment_status)
+        completed.setdefault("order_financial_status", source_order.financial_status)
+        completed.setdefault("order_total", f"{source_order.currency} {source_order.total}")
+        completed.setdefault("order_source_updated_at", source_order.source_updated_at.isoformat())
+        completed.setdefault("created_at", source_order.created_at.isoformat())
+        completed.setdefault("hours_threshold", settings.order_delay_hours)
+        if subject_type == "case":
+            case = db.get(Case, subject_id)
+            completed.setdefault("customer_email", case.customer_email)
+            completed.setdefault("case_order_ref", case.order_ref)
+            completed.setdefault("order_email", source_order.email if case.order_id else None)
+            completed.setdefault("customer_message", case.message)
+            completed.setdefault("policy", settings.store_policies[case.category])
+            completed.setdefault("category", case.category)
+            completed.setdefault("confidence", case.confidence)
+            completed.setdefault("draft", case.draft)
+            completed.setdefault("missing_info", case.missing_info or "")
+            completed.setdefault("case_status", case.status)
+        facts = completed
+    return service_create_approval(db, kind, subject_type, subject_id, action, facts, revision)
 
 
 def override_db():
@@ -109,6 +187,54 @@ def test_signed_webhook_duplicate_and_bad_signature(monkeypatch):
         assert db.scalar(select(Order).where(Order.external_id == "1")) is not None
         assert len(db.scalars(select(Order).where(Order.external_id == "1")).all()) == 1
         assert verify_shopify(raw, sig(raw, "test-secret"))
+
+
+def test_isolated_preview_blocks_workflow_and_webhook_routes(monkeypatch):
+    monkeypatch.setattr(main.settings, "preview_mode", True)
+    for path in ("/api/n8n/order-intake", "/webhooks/shopify/orders"):
+        response = client.post(path)
+        assert response.status_code == 409
+        assert "disabled in the isolated preview" in response.json()["detail"]
+
+
+def test_delayed_order_scan_is_bounded_and_continues_without_starvation():
+    with TestingSession() as db:
+        for i in range(105):
+            db.add(Order(
+                shop_domain="scan.test", external_id=f"scan-{i}", order_number=f"#SCAN-{i}",
+                email="scan@example.test", currency="USD", total="1.00",
+                fulfillment_status="unfulfilled", financial_status="paid",
+                created_at=utcnow() - timedelta(days=3), source_updated_at=utcnow(), payload={},
+            ))
+        db.commit()
+    headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
+    first = client.post("/api/n8n/delayed-exceptions", headers=headers).json()
+    assert first["open_delayed_orders"] == 100 and first["delayed_scan_has_more"] is True
+    second = client.post("/api/n8n/delayed-exceptions", headers=headers).json()
+    assert second["open_delayed_orders"] == 5 and second["delayed_scan_has_more"] is False
+    with TestingSession() as db:
+        assert db.scalar(
+            select(func.count()).select_from(Approval).where(
+                Approval.proposed_action == "review_delayed_order"
+            )
+        ) == 105
+
+
+def test_preview_settings_ignore_dotenv_and_integration_environment(monkeypatch):
+    import os
+    from app.config import load_settings
+
+    monkeypatch.setenv("POPIFY_PREVIEW_MODE", "1")
+    monkeypatch.setenv("DATABASE_URL", "sqlite:////tmp/popify-isolated.db")
+    monkeypatch.setenv("LLM_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    monkeypatch.setenv("SHOPIFY_ADMIN_TOKEN", "must-not-be-used")
+    monkeypatch.setenv("N8N_BASE_URL", "http://127.0.0.1:5678")
+    preview = load_settings()
+    assert preview.preview_mode is True
+    assert preview.llm_mode == "mock" and preview.openai_api_key == ""
+    assert preview.shopify_admin_token == "" and preview.n8n_base_url == ""
+    assert preview.database_url == os.environ["DATABASE_URL"]
 
 
 def test_out_of_order_event_does_not_overwrite():
@@ -337,7 +463,7 @@ def test_execution_is_bound_to_reviewed_action_and_evidence():
             "case",
             44,
             "send_reply",
-            {"draft": "Reviewed draft", "policy": "Reviewed policy"},
+            {"draft": "Reviewed draft", "policy": settings.store_policies["other"]},
         )
         decide_approval(db, approval.id, "approved", "operator")
         reviewed_hash = approval.evidence_hash
@@ -346,6 +472,25 @@ def test_execution_is_bound_to_reviewed_action_and_evidence():
         assert execution.proposed_action == "send_reply"
         assert execution.evidence_hash == reviewed_hash
         assert approval.execution_status == "succeeded"
+
+
+def test_terminal_execution_contract_mismatch_is_not_reported_as_success():
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 441, "send_reply", {"draft": "Reviewed"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        run_due(db, approval)
+        execution = db.scalar(select(ActionExecution))
+        attempts = execution.attempts
+        execution.proposed_action = "different_action"
+        db.commit()
+        execute_approved(db, approval)
+        db.commit()
+        assert approval.execution_status == "evidence_changed"
+        assert execution.attempts == attempts
+        with pytest.raises(ValueError, match="reconcile its outcome"):
+            refresh_approval(db, approval.id, "operator")
 
 
 def test_changed_evidence_blocks_execution_before_mock_action():
@@ -407,6 +552,102 @@ def test_changed_pending_evidence_requires_fresh_approval():
         approval = db.get(Approval, approval_id)
         assert approval.status == "pending"
         assert approval.execution_status == "not_started"
+
+
+def test_order_financial_state_change_invalidates_support_approval():
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 462, "send_reply", {"draft": "Reviewed"}
+        )
+        case = db.get(Case, 462)
+        db.get(Order, case.order_id).financial_status = "refunded"
+        db.flush()
+        assert any(
+            "Order financial status changed" in message
+            for message in approval_freshness_differences(db, approval)
+        )
+        with pytest.raises(ApprovalEvidenceStale):
+            decide_approval(db, approval.id, "approved", "operator")
+
+
+def test_stale_pending_approval_can_be_replaced_without_rewriting_history():
+    with TestingSession() as db:
+        original = create_approval(
+            db, "support", "case", 460, "send_reply", {"draft": "Original reviewed draft"}
+        )
+        original_hash = original.evidence_hash
+        original_facts = dict(original.supporting_facts)
+        case = db.get(Case, 460)
+        case.draft = "Current grounded response"
+        db.flush()
+        assert original.evidence_hash == original_hash
+        assert original.evidence_hash == original_hash  # Hash is intact; source is stale.
+        assert "Draft changed since review." in approval_freshness_differences(db, original)
+        replacement = refresh_approval(db, original.id, "operator")
+        assert replacement.id != original.id
+        assert replacement.revision == 2 and replacement.status == "pending"
+        assert original.status == "superseded"
+        assert original.replacement_approval_id == replacement.id
+        assert original.supporting_facts == original_facts
+        assert original.evidence_hash == original_hash
+        assert replacement.supporting_facts["draft"] == case.draft
+        assert refresh_approval(db, original.id, "operator").id == replacement.id
+
+
+def test_approved_stale_evidence_is_blocked_and_preserves_attempt_history(monkeypatch):
+    monkeypatch.setattr(settings, "mock_action_failures", 1)
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 461, "send_reply", {"draft": "Reviewed"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        decision_at = approval.decision_at
+        actor = approval.actor
+        run_due(db, approval)
+        assert approval.execution_status == "retryable" and approval.attempts == 1
+        db.get(Case, 461).message = "A materially different current request"
+        db.commit()
+        run_due(db, approval)
+        assert approval.execution_status == "evidence_changed"
+        prior_execution = db.scalar(select(ActionExecution))
+        assert prior_execution and prior_execution.attempts == 1
+        replacement = refresh_approval(db, approval.id, "operator")
+        assert replacement.status == "pending" and replacement.revision == 2
+        assert approval.status == "approved" and as_utc(approval.decision_at) == as_utc(decision_at)
+        assert approval.actor == actor and approval.attempts == 1
+        assert db.get(ActionExecution, prior_execution.id).attempts == 1
+
+
+def test_legacy_approval_can_be_replaced_without_rewriting_its_decision():
+    with TestingSession() as db:
+        order = Order(
+            shop_domain="legacy.test", external_id="legacy-approval-order",
+            order_number="#LEGACY", email="legacy@example.test", currency="USD",
+            total="20.00", fulfillment_status="unfulfilled", financial_status="paid",
+            created_at=utcnow() - timedelta(days=2), source_updated_at=utcnow(), payload={},
+        )
+        db.add(order); db.flush()
+        case = Case(
+            order_id=order.id, order_ref=order.order_number, customer_email=order.email,
+            message="Legacy historical request", category="order_status", confidence=80,
+            draft="Legacy historical draft", status="needs_review",
+        )
+        db.add(case); db.flush()
+        legacy = Approval(
+            kind="support", subject_type="case", subject_id=case.id,
+            proposed_action="send_reply", supporting_facts={"draft":"Legacy historical draft"},
+            evidence_hash=None, status="approved", actor="legacy-operator",
+            decision_at=utcnow(), execution_status="evidence_changed", attempts=2,
+        )
+        db.add(legacy); db.flush()
+        previous_decision_at = legacy.decision_at
+        previous_facts = dict(legacy.supporting_facts)
+        replacement = refresh_approval(db, legacy.id, "operator")
+        assert replacement.revision == 2 and replacement.status == "pending"
+        assert replacement.evidence_hash
+        assert legacy.status == "approved" and legacy.actor == "legacy-operator"
+        assert as_utc(legacy.decision_at) == as_utc(previous_decision_at)
+        assert legacy.attempts == 2 and legacy.supporting_facts == previous_facts
 
 
 def test_unregistered_action_contract_is_blocked():

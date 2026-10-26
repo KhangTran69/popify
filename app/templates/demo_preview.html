@@ -1,0 +1,51 @@
+{% extends 'base.html' %}
+{% block content %}
+<style>
+  .preview-example-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:16px}
+  .preview-example{min-width:0;border:1px solid var(--line);border-radius:9px;background:#fff;padding:14px}
+  .preview-example>a{font-weight:650}
+  .preview-example dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;margin:10px 0 0;font-size:11px}
+  .preview-example dt{color:var(--muted)}.preview-example dd{margin:0;overflow-wrap:anywhere}
+  @media(max-width:620px){.preview-example-grid{grid-template-columns:1fr;padding:12px}}
+</style>
+<main id="main" class="wrap">
+  <div class="headline">
+    <div>
+      <div class="eyebrow">PORTFOLIO WALKTHROUGH · ISOLATED PREVIEW</div>
+      <h1>Explore the synthetic outcomes</h1>
+      <p class="sub">This preview demonstrates saved operator and recovery states without running the n8n walkthrough.</p>
+    </div>
+    <span class="mode"><i></i> Synthetic records · mock mode</span>
+  </div>
+  <section class="demo-intro">
+    <div>
+      <span class="demo-mark">LOCAL · TEMPORARY</span>
+      <h2>Work through an approval</h2>
+      <p>Review the pending support approval, compare its recorded facts with current order context, then approve or reject it. Those decisions change only this disposable SQLite database. n8n, Shopify, OpenAI, and external actions are disabled.</p>
+      <a class="button" href="/queues/approvals">Open pending and completed decisions →</a>
+    </div>
+    <div class="demo-preview">
+      <div><b>01</b><span>Pending decision</span><i>→</i></div>
+      <div><b>02</b><span>Mock completion or rejection</span><i>→</i></div>
+      <div><b>03</b><span>Audited recovery examples</span></div>
+    </div>
+  </section>
+  <section class="panel">
+    <div class="panelhead"><div><h2>Persisted synthetic examples</h2><p>Each status comes from a seeded local record.</p></div></div>
+    <div class="preview-example-grid">
+      {% for approval in preview_examples %}
+      <article class="preview-example">
+        <a href="/approvals/{{ approval.id }}">{{ approval.proposed_action.replace('_', ' ')|capitalize }} ↗</a>
+        <dl><dt>Decision</dt><dd>{{ approval.status }}</dd><dt>Execution</dt><dd>{{ approval.execution_status.replace('_', ' ') }}</dd><dt>Record</dt><dd>#{{ approval.id }} · revision {{ approval.revision }}</dd></dl>
+      </article>
+      {% endfor %}
+    </div>
+    <div class="inline-actions">
+      <a class="record-link" href="/queues/failures">Action failures and blocked outcomes ↗</a>
+      <a class="record-link" href="/queues/cases?status=recovery">Support recovery queue ↗</a>
+      <a class="record-link" href="/queues/deliveries?status=recovery">Delivery recovery queue ↗</a>
+    </div>
+  </section>
+  <p class="footer-note">The real guided demo and n8n workflow checks require the local Docker stack. This page is synthetic interface evidence only.</p>
+</main>
+{% endblock %}
