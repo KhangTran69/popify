@@ -11,6 +11,7 @@
 .compact-facts{margin:12px 0;gap:9px}
 .attention-urgent{background:#fff2ed;border-color:#edc8bd}
 .attention-urgent .attention-icon{background:#f7dcd3;color:var(--red)}
+.recovery-links{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}.recovery-links a{margin:0;border:1px solid #dfc8bf;background:#fff8f5;border-radius:999px;padding:3px 8px;font-size:10px}
 .demo-step.stopped .step-number{background:#fcece9;border-color:#efcbc4;color:var(--red)}
 .demo-step.stopped .step-body{border-color:#efcbc4}
 .decision form{display:flex;flex-wrap:wrap;gap:8px}

@@ -9,10 +9,16 @@ from app.models import utcnow
 
 QUEUE_STATES = {
     "orders": {"unfulfilled", "fulfilled", "partial"},
-    "cases": {"queued", "needs_review", "resolved_mock", "failed", "exhausted"},
+    "cases": {"queued", "needs_review", "resolved_mock", "failed", "exhausted", "recovery"},
     "approvals": {"pending", "approved", "rejected"},
-    "failures": {"retryable", "exhausted", "ambiguous"},
-    "deliveries": {"received", "processed", "failed", "exhausted"},
+    "failures": {
+        "retryable",
+        "exhausted",
+        "ambiguous",
+        "evidence_changed",
+        "invalid_action",
+    },
+    "deliveries": {"received", "processed", "failed", "exhausted", "recovery"},
 }
 DEFAULT_QUEUE = {
     "order": "orders", "case": "cases", "approval": "approvals", "delivery": "deliveries"

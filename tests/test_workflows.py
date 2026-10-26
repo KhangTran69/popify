@@ -329,6 +329,97 @@ def test_ambiguous_action_outcome_blocks_blind_retry(monkeypatch):
         assert approval.execution_status == "ambiguous" and approval.attempts == 1
 
 
+def test_execution_is_bound_to_reviewed_action_and_evidence():
+    with TestingSession() as db:
+        approval = create_approval(
+            db,
+            "support",
+            "case",
+            44,
+            "send_reply",
+            {"draft": "Reviewed draft", "policy": "Reviewed policy"},
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        reviewed_hash = approval.evidence_hash
+        run_due(db, approval)
+        execution = db.scalar(select(ActionExecution))
+        assert execution.proposed_action == "send_reply"
+        assert execution.evidence_hash == reviewed_hash
+        assert approval.execution_status == "succeeded"
+
+
+def test_changed_evidence_blocks_execution_before_mock_action():
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 45, "send_reply", {"draft": "Reviewed draft"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        approval.supporting_facts = {"draft": "Changed after approval"}
+        db.commit()
+        run_due(db, approval)
+        assert approval.execution_status == "evidence_changed"
+        assert "changed after the operator decision" in approval.failure_detail
+        assert db.scalar(select(ActionExecution)) is None
+
+
+def test_changed_evidence_is_reported_as_a_worker_failure():
+    from app.models import Audit
+
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 450, "send_reply", {"draft": "Reviewed draft"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        approval.supporting_facts = {"draft": "Changed after approval"}
+        db.commit()
+    response = client.post(
+        "/api/n8n/delayed-exceptions",
+        headers={"X-N8N-Secret": settings.n8n_webhook_secret},
+    )
+    assert response.status_code == 200
+    assert response.json()["action_outcomes"]["evidence_changed"] == 1
+    with TestingSession() as db:
+        assert db.scalar(
+            select(Audit).where(
+                Audit.entity_type == "workflow",
+                Audit.entity_id == 3,
+                Audit.event == "work_failed",
+            )
+        )
+
+
+def test_changed_pending_evidence_requires_fresh_approval():
+    token = sign_in()
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 46, "send_reply", {"draft": "Original"}
+        )
+        approval.supporting_facts = {"draft": "Changed"}
+        db.commit()
+        approval_id = approval.id
+    response = client.post(
+        f"/approvals/{approval_id}/decision",
+        data={"csrf_token": token, "decision": "approved"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 409
+    with TestingSession() as db:
+        approval = db.get(Approval, approval_id)
+        assert approval.status == "pending"
+        assert approval.execution_status == "not_started"
+
+
+def test_unregistered_action_contract_is_blocked():
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 47, "delete_order", {"reason": "invalid"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        run_due(db, approval)
+        assert approval.execution_status == "invalid_action"
+        assert db.scalar(select(ActionExecution)) is None
+
+
 def test_unauthorized_operator_cannot_approve():
     assert (
         client.post(
@@ -819,6 +910,9 @@ def test_navigation_survives_decision_retry_and_related_links():
         data={"csrf_token": token}, follow_redirects=False,
     )
     assert retried.headers["location"] == f"/approvals/{approval_id}{failure_context}"
+    changed_context = "?from_queue=failures&q=review&status=evidence_changed&page=1"
+    changed_page = client.get(f"/approvals/{approval_id}{changed_context}").text
+    assert 'href="/queues/failures?q=review&amp;status=evidence_changed&amp;page=1"' in changed_page
     invalid = client.get(f"/approvals/{approval_id}?from_queue=//evil.test&status=exhausted&page=-1").text
     assert 'href="/queues/approvals"' in invalid
 
@@ -1094,6 +1188,48 @@ def test_dashboard_distinguishes_worker_failure_from_business_completion():
     assert "Oldest intake queue age" in page.text
     assert "Last worker failure" in page.text
     assert "retrying or failed items to monitor" in page.text
+
+
+def test_dashboard_recovery_counts_link_to_the_complete_matching_queues():
+    from app.models import Case
+
+    sign_in()
+    with TestingSession() as db:
+        failed_case = Case(message="retry support", status="failed", attempts=1)
+        exhausted_case = Case(message="exhausted support", status="exhausted", attempts=3)
+        db.add_all(
+            [
+                failed_case,
+                exhausted_case,
+                Delivery(
+                    webhook_id="retry-delivery",
+                    topic="orders/create",
+                    shop_domain="demo.myshopify.com",
+                    payload={},
+                    status="failed",
+                    attempts=1,
+                ),
+                Delivery(
+                    webhook_id="exhausted-delivery",
+                    topic="orders/create",
+                    shop_domain="demo.myshopify.com",
+                    payload={},
+                    status="exhausted",
+                    attempts=3,
+                ),
+            ]
+        )
+        db.commit()
+        failed_case_id = failed_case.id
+        exhausted_case_id = exhausted_case.id
+    dashboard = client.get("/")
+    cases = client.get("/queues/cases?status=recovery")
+    deliveries = client.get("/queues/deliveries?status=recovery")
+    assert 'href="/queues/cases?status=recovery">Support 2</a>' in dashboard.text
+    assert 'href="/queues/deliveries?status=recovery">Deliveries 2</a>' in dashboard.text
+    assert f"Case #{failed_case_id}" in cases.text
+    assert f"Case #{exhausted_case_id}" in cases.text
+    assert "retry-delivery" in deliveries.text and "exhausted-delivery" in deliveries.text
 
 
 def test_guided_demo_does_not_present_failed_triage_as_complete():

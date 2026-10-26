@@ -19,12 +19,16 @@ Store operations combine repeatable work with decisions that need human judgment
 - Verified a queued synthetic delivery across API and n8n restarts without removing either volume; the resumed n8n order worker processed it once.
 - Preserved queue search, status, and pagination context across record navigation; grouped approval facts into verified context, triage assessment, draft, and information gaps; surfaced the retry deadline on manual recovery pages.
 - Captured customer requests, policy, order state, and delay evidence at approval creation; kept current order state separate; carried validated navigation context through related records and mutations; clarified recovery and rejected-demo states.
+- Bound each executable approval to a canonical hash of the action and evidence reviewed by the operator, persisted the same contract on the execution record, and blocked changed evidence or unsupported mock actions before execution.
+- Split the overview recovery total into exact action, support, and delivery queue links; bounded receipt-duration aggregation to the latest 500 processed deliveries and removed the support queue's repeated order lookup.
+- Added a one-command disposable preview with coherent pending, completed, rejected, retryable, exhausted, and ambiguous synthetic records. It uses a temporary SQLite database and is explicitly separate from live n8n evidence.
 
-## Current verification — 25 October 2026, Manila time
+## Current verification — 26 October 2026, Manila time
 
-- **39 isolated behavior tests passed**, including approval request and policy snapshots, delayed-order evidence, validated queue navigation through decisions and retries, and a rejected guided run. All three workflow exports validated.
-- Docker Desktop was unavailable, so PostgreSQL concurrency, live n8n execution, and the CLI end-to-end demo were not rerun for this change. Visual inspection is recorded separately below.
-- **Isolated visual preview:** inspected the overview, support approval, delay approval, and guided demo across 1280 px and 390 px viewports. The mobile delay approval had no horizontal overflow (390 px document width at a 390 px viewport). Current previews use `*-preview.jpg` filenames in `docs/screenshots/`; the original PNGs preserve the earlier live walkthrough evidence.
+- **45 isolated behavior tests passed**, including reviewed action/evidence binding, changed-evidence worker reporting, unsupported-action blocking, exact mixed recovery queues, approval request snapshots, validated navigation, and ambiguous retry prevention. All three workflow exports validated.
+- **Disposable preview verified:** `python -m scripts.preview --port 8765` started with a temporary SQLite database; preview authentication and the pending, completed, rejected, retryable, exhausted, ambiguous, support-recovery, and delivery-recovery views returned successfully. This is synthetic interface evidence, not workflow execution evidence.
+- **Rendered inspection:** inspected the overview and support approval at 1280 × 900 and 390 × 844. Recovery links, evidence sections, mock-mode labels, decision controls, and mobile content remained readable. Existing screenshot files were left unchanged because this pass did not capture replacement artifacts.
+- Docker Desktop was unavailable because its local engine socket was absent, so PostgreSQL concurrency, live n8n execution, and the CLI end-to-end demo were not rerun for this change. Their results below remain historical.
 
 ## Historical verification — 24 October 2026, Manila time
 
@@ -40,10 +44,10 @@ Store operations combine repeatable work with decisions that need human judgment
 
 ## Limitations
 
-No live Shopify development store, real LLM request, customer message, cancellation, or refund was used. Shopify HMAC handling is exercised with synthetic signed payloads. The optional OpenAI adapter has mocked HTTP coverage. All action execution and provider failures are simulated. Retry-After behavior is represented by a configurable mock minimum delay, not a verified live provider response. The reference/email match is an operator lookup check, not customer identity verification. There is no live ambiguous-outcome reconciliation endpoint, production authentication system, or measured business impact.
+No live Shopify development store, real LLM request, customer message, cancellation, or refund was used. Shopify HMAC handling is exercised with synthetic signed payloads. The optional OpenAI adapter has mocked HTTP coverage. All action execution and provider failures are simulated. Retry-After behavior is represented by a configurable mock minimum delay, not a verified live provider response. The reference/email match is an operator lookup check, not customer identity verification. There is no live ambiguous-outcome reconciliation endpoint, production authentication system, or measured business impact. The current PostgreSQL migration and concurrency behavior still need confirmation on a running Docker stack.
 
 ## Resume bullets
 
 - Built three n8n workflows coordinating durable order ingestion, support triage, delayed-order review, and approval-gated mock execution using FastAPI and PostgreSQL.
 - Designed an authenticated operator console with searchable queues, CSRF-protected decisions, correlated timelines, event-derived metrics, and failure recovery controls.
-- Verified behavior with 39 automated tests, PostgreSQL concurrency scenarios, restart recovery, and a complete local n8n demonstration covering repeat-safe approvals and audited outcomes.
+- Verified behavior with 45 automated tests; historical PostgreSQL concurrency, restart-recovery, and local n8n demonstrations cover repeat-safe approvals and audited outcomes.
