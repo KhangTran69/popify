@@ -282,6 +282,7 @@ def run():
             case = Case(
                 message="Please check my order", category="order_status", confidence=82,
                 draft="Retryable support draft", status="needs_review",
+                missing_info="Verified order reference",
                 correlation_id="retry-execute-race",
             )
             db.add(case)
@@ -333,7 +334,14 @@ def run():
             retry_execution = db.scalar(select(ActionExecution).where(
                 ActionExecution.idempotency_key == f"approval:{retry_id}"
             ))
-            assert retry_execution.state == "succeeded" and retry_execution.attempts == 2
+            assert retry_execution.state == "succeeded" and retry_execution.attempts == 2, {
+                "execution_state": retry_execution.state,
+                "execution_attempts": retry_execution.attempts,
+                "approval_state": db.get(Approval, retry_id).execution_status,
+                "approval_attempts": db.get(Approval, retry_id).attempts,
+                "retry_deadline": db.get(Approval, retry_id).next_attempt_at,
+                "freshness_differences": approval_freshness_differences(db, db.get(Approval, retry_id)),
+            }
 
         # Hold the execution transaction immediately after it reads its locked
         # evidence. A concurrent order update must wait until the mock action
@@ -449,8 +457,12 @@ def run():
         with ThreadPoolExecutor(max_workers=6) as pool:
             list(pool.map(execute, range(6)))
         with sessions() as db:
-            assert db.scalar(select(func.count(ActionExecution.id))) == 1
-            assert db.scalar(select(ActionExecution.attempts)) == 1
+            assert db.scalar(select(func.count(ActionExecution.id)).where(
+                ActionExecution.idempotency_key == f"approval:{aid}"
+            )) == 1
+            assert db.scalar(select(ActionExecution.attempts).where(
+                ActionExecution.idempotency_key == f"approval:{aid}"
+            )) == 1
         print(
             "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, and repeated execution (6 workers per repeated scenario)."
         )

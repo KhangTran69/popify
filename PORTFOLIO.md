@@ -42,10 +42,11 @@ Store operations combine repeatable work with decisions that need human judgment
 
 - **Behavior suite:** `python -m pytest -q` passed: **68 tests**. This run includes recovery priority, cross-kind terminal-outcome blocking, consistent exhausted preview history, retry backoff enforcement, and reviewed/current evidence comparison.
 - **Workflow exports:** all three JSON workflow files passed `python -m scripts.validate_workflows`.
-- **Schema upgrade and PostgreSQL concurrency:** could not run; the verifier's connection to localhost:5432 was refused. No migration was added. The PostgreSQL-only concurrency checks have no fresh result in this change.
+- **Schema upgrade:** no migration was added, so there was no schema upgrade to verify.
+- **PostgreSQL concurrency:** after the hosted check exposed a fixture failure, the corrected verifier passed four runs against a disposable local PostgreSQL 16.15 cluster and isolated schema. Coverage includes retry versus execution, refresh versus execution, duplicate replacement, source update locking, and the existing webhook/worker races. The user's configured database was not used. GitHub Actions will rerun these checks on this update.
 - **Synthetic preview:** restarted with `python -m scripts.preview --port 8002` and inspected isolated records. Confirmed the exhausted approval and delivery counts match their configured attempt budgets, the recovery queue shows all eight records in priority order, and stale approval detail separates reviewed from current customer-message evidence. Preview is temporary SQLite and does not exercise n8n.
 - **Visual inspection:** inspected the recovery workspace and stale-approval evidence page at 1440×900 and recovery at 390×844. The mobile screenshot shows a visible keyboard focus outline on the skip link and readable, wrapping queue controls. Current captures are checked in: desktop recovery, mobile recovery, and approval freshness comparison.
-- **Live n8n:** not run because the local PostgreSQL-backed Docker stack was unavailable. Workflow-export validation is not n8n execution evidence.
+- **Live n8n:** not run because Docker's daemon was unavailable. Workflow-export validation is not n8n execution evidence.
 
 ## Historical verification — 24 October 2026, Manila time
 
