@@ -25,6 +25,7 @@ from app.services import (
     queue_support,
     SupportRequestKeyConflict,
     refresh_approval,
+    queue_approval_retry,
 )
 import app.services as services
 
@@ -222,6 +223,126 @@ def run():
             decided = db.get(Approval, conflict_id)
             assert decided.status in ("approved", "rejected") and decided.actor == decided.status
 
+        # A stale approval can be refreshed while an already selected worker
+        # candidate runs. Both operations acquire the subject lock first.
+        with sessions() as db:
+            case = Case(
+                message="Please check my order", category="order_status", confidence=82,
+                draft="Reviewed support draft", status="needs_review",
+                correlation_id="refresh-execute-race",
+            )
+            db.add(case)
+            db.flush()
+            facts = {
+                "order_number": None, "order_id": None, "customer_email": None,
+                "case_order_ref": None, "order_email": None,
+                "customer_message": case.message,
+                "policy": settings.store_policies[case.category],
+                "order_fulfillment_status": None, "order_financial_status": None,
+                "order_total": None, "order_source_updated_at": None,
+                "category": case.category, "confidence": case.confidence,
+                "draft": case.draft, "missing_info": "Verified order reference",
+                "case_status": case.status, "correlation_id": case.correlation_id,
+            }
+            stale = create_approval(db, "support", "case", case.id, "send_reply", facts)
+            stale.status = "approved"
+            stale.execution_status = "evidence_changed"
+            case.draft = "Current source draft"
+            db.commit()
+            stale_id = stale.id
+
+        def refresh_stale(_):
+            with sessions() as db:
+                return refresh_approval(db, stale_id, "test-operator").id
+
+        def execute_stale(_):
+            with sessions() as db:
+                approval = db.get(Approval, stale_id)
+                execute_approved(db, approval)
+                db.commit()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            refresh_future = pool.submit(refresh_stale, 0)
+            execute_future = pool.submit(execute_stale, 0)
+            replacement_id = refresh_future.result(timeout=10)
+            execute_future.result(timeout=10)
+        with sessions() as db:
+            assert db.get(Approval, stale_id).replacement_approval_id == replacement_id
+            assert db.scalar(select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{stale_id}"
+            )) is None
+
+        # Competing manual requeue and worker execution must produce at most one
+        # additional persisted attempt, with the existing backoff still applied.
+        prior_failures = settings.mock_action_failures
+        prior_ambiguous = settings.mock_action_ambiguous
+        settings.mock_action_failures = 0
+        settings.mock_action_ambiguous = False
+        with sessions() as db:
+            case = Case(
+                message="Please check my order", category="order_status", confidence=82,
+                draft="Retryable support draft", status="needs_review",
+                missing_info="Verified order reference",
+                correlation_id="retry-execute-race",
+            )
+            db.add(case)
+            db.flush()
+            facts = {
+                "order_number": None, "order_id": None, "customer_email": None,
+                "case_order_ref": None, "order_email": None,
+                "customer_message": case.message,
+                "policy": settings.store_policies[case.category],
+                "order_fulfillment_status": None, "order_financial_status": None,
+                "order_total": None, "order_source_updated_at": None,
+                "category": case.category, "confidence": case.confidence,
+                "draft": case.draft, "missing_info": "Verified order reference",
+                "case_status": case.status, "correlation_id": case.correlation_id,
+            }
+            retryable = create_approval(db, "support", "case", case.id, "send_reply", facts)
+            retryable.status = "approved"
+            retryable.execution_status = "retryable"
+            retryable.attempts = 1
+            retryable.next_attempt_at = utcnow() - timedelta(seconds=1)
+            db.add(ActionExecution(
+                idempotency_key=f"approval:{retryable.id}",
+                proposed_action=retryable.proposed_action,
+                evidence_hash=retryable.evidence_hash,
+                state="retryable", attempts=1,
+            ))
+            db.commit()
+            retry_id = retryable.id
+
+        def requeue_and_run(_):
+            with sessions() as db:
+                try:
+                    queue_approval_retry(db, retry_id, "test-operator")
+                except ValueError:
+                    db.rollback()  # execution won the lifecycle lock
+
+        def execute_retry(_):
+            with sessions() as db:
+                execute_approved(db, db.get(Approval, retry_id))
+                db.commit()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(requeue_and_run, 0), pool.submit(execute_retry, 0)]
+            for future in futures:
+                future.result(timeout=10)
+        settings.mock_action_failures = prior_failures
+        settings.mock_action_ambiguous = prior_ambiguous
+        with sessions() as db:
+            retry_execution = db.scalar(select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{retry_id}"
+            ))
+            assert retry_execution.state == "succeeded" and retry_execution.attempts == 2, {
+                "execution_state": retry_execution.state,
+                "execution_attempts": retry_execution.attempts,
+                "approval_state": db.get(Approval, retry_id).execution_status,
+                "approval_attempts": db.get(Approval, retry_id).attempts,
+                "retry_deadline": db.get(Approval, retry_id).next_attempt_at,
+                "freshness_differences": approval_freshness_differences(db, db.get(Approval, retry_id)),
+            }
+
         # Hold the execution transaction immediately after it reads its locked
         # evidence. A concurrent order update must wait until the mock action
         # commits, then the next attempt must see that update as stale.
@@ -336,10 +457,14 @@ def run():
         with ThreadPoolExecutor(max_workers=6) as pool:
             list(pool.map(execute, range(6)))
         with sessions() as db:
-            assert db.scalar(select(func.count(ActionExecution.id))) == 1
-            assert db.scalar(select(ActionExecution.attempts)) == 1
+            assert db.scalar(select(func.count(ActionExecution.id)).where(
+                ActionExecution.idempotency_key == f"approval:{aid}"
+            )) == 1
+            assert db.scalar(select(ActionExecution.attempts).where(
+                ActionExecution.idempotency_key == f"approval:{aid}"
+            )) == 1
         print(
-            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, concurrent replacement requests, and repeated execution (6 workers per repeated scenario)."
+            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, and repeated execution (6 workers per repeated scenario)."
         )
     finally:
         settings.shopify_webhook_secret = old_secret

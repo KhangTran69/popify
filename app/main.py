@@ -26,6 +26,9 @@ from app.services import (
     decide_approval,
     refresh_approval,
     approval_freshness_differences,
+    approval_freshness_comparison,
+    prior_terminal_execution,
+    queue_approval_retry,
     ACTION_CONTRACTS,
     ApprovalEvidenceStale,
     queue_support,
@@ -389,7 +392,7 @@ def guided_demo_home(
     request: Request, actor=Depends(operator), db: Session = Depends(get_db)
 ):
     preview_examples = (
-        db.scalars(select(Approval).order_by(Approval.id).limit(50)).all()
+        db.scalars(select(Approval).order_by(Approval.id.desc()).limit(50)).all()
         if settings.preview_mode
         else []
     )
@@ -845,6 +848,7 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
     current_order = None
     freshness_differences = []
     approval_history = []
+    approval_revision_rows = []
     prior_approval = None
     refresh_blocked_by_execution = False
     if kind == "approval":
@@ -859,20 +863,45 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
         refresh_blocked_by_execution = bool(
             prior_execution and prior_execution.state in ("started", "succeeded", "ambiguous")
         )
+        refresh_blocked_by_execution = refresh_blocked_by_execution or bool(
+            prior_terminal_execution(db, entity)
+        )
         approval_history = db.scalars(
             select(Approval)
             .where(
-                Approval.kind == entity.kind,
                 Approval.subject_type == entity.subject_type,
                 Approval.subject_id == entity.subject_id,
                 Approval.id != entity.id,
             )
-            .order_by(Approval.created_at.desc(), Approval.id.desc())
+            .order_by(Approval.revision.desc(), Approval.id.desc())
             .limit(20)
         ).all()
         prior_approval = db.scalar(
             select(Approval).where(Approval.replacement_approval_id == entity.id)
         )
+        revisions = sorted([entity, *approval_history], key=lambda item: (item.revision, item.id))
+        replacement_events = db.scalars(
+            select(Audit).where(
+                Audit.entity_type == "approval",
+                Audit.entity_id.in_([item.id for item in revisions]),
+                Audit.event == "approval_replaced_with_fresh_evidence",
+            ).order_by(Audit.id.desc())
+        ).all()
+        events_by_approval = {}
+        for event in replacement_events:
+            events_by_approval.setdefault(event.entity_id, event)
+        prior_revisions = db.scalars(
+            select(Approval).where(Approval.replacement_approval_id.in_([item.id for item in revisions]))
+        ).all()
+        prior_by_new_revision = {item.replacement_approval_id: item.id for item in prior_revisions}
+        approval_revision_rows = [
+            {
+                "approval": revision,
+                "replacement_event": events_by_approval.get(revision.id),
+                "replaced_from": prior_by_new_revision.get(revision.id),
+            }
+            for revision in revisions
+        ]
     return templates.TemplateResponse(
         request,
         "detail.html",
@@ -895,7 +924,9 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "subject": subject,
             "current_order": current_order,
             "freshness_differences": freshness_differences,
+            "freshness_comparison": approval_freshness_comparison(db, entity) if kind == "approval" else [],
             "approval_history": approval_history,
+            "approval_revision_rows": approval_revision_rows,
             "prior_approval": prior_approval,
             "refresh_blocked_by_execution": refresh_blocked_by_execution,
             "refresh_supported": kind == "approval"
@@ -1036,24 +1067,12 @@ def retry(
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
-    approval = db.scalar(
-        select(Approval).where(Approval.id == approval_id).with_for_update()
-    )
-    if not approval:
+    try:
+        queue_approval_retry(db, approval_id, actor)
+    except LookupError:
         raise HTTPException(404)
-    if approval.status != "approved" or approval.execution_status not in (
-        "failed",
-        "retryable",
-        "exhausted",
-    ):
-        raise HTTPException(
-            409, "action is not retryable; ambiguous outcomes require reconciliation"
-        )
-    approval.execution_status = "queued"
-    if approval.next_attempt_at is None:
-        approval.next_attempt_at = utcnow()
-    audit(db, "approval", approval.id, "manual_retry_queued", actor)
-    db.commit()
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
     suffix, _ = record_navigation(request.query_params, "approval")
     return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 
@@ -1072,6 +1091,8 @@ def preview_run(
     approval = db.get(Approval, approval_id)
     if not approval:
         raise HTTPException(404)
+    if approval.replacement_approval_id:
+        raise HTTPException(409, "This approval was replaced and cannot run")
     if approval.status != "approved" or approval.execution_status not in ("queued", "retryable"):
         raise HTTPException(409, "This preview action is not ready for a local mock attempt")
     if approval.next_attempt_at and as_utc(approval.next_attempt_at) > utcnow():
@@ -1418,7 +1439,9 @@ def scan_delayed(
     db.commit()
     new_exceptions = (db.scalar(select(func.count(Approval.id))) or 0) - before
     delayed_scan_has_more = bool(db.scalar(select(exists().where(delayed_condition))))
-    # n8n schedules the action worker; browser decisions only enqueue work.
+    # Select candidates without row locks: execute_approved acquires the shared
+    # subject advisory lock before locking any revision, keeping the lock order
+    # consistent with decision, refresh, and manual retry requests.
     pending = db.scalars(
         select(Approval)
         .where(
@@ -1430,7 +1453,6 @@ def scan_delayed(
         )
         .order_by(Approval.id)
         .limit(20)
-        .with_for_update(skip_locked=True)
     ).all()
     action_outcomes = {
         "succeeded": 0,

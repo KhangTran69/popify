@@ -4,7 +4,7 @@ import uuid
 from datetime import timedelta
 
 from app.config import settings
-from app.models import Case, Order, utcnow
+from app.models import ActionExecution, Case, Order, utcnow
 from app.services import audit, create_approval, decide_approval, execute_approved
 
 
@@ -60,9 +60,30 @@ def create_preview_scenario(db, name, actor="preview"):
         record.message = "Synthetic request changed after the approval snapshot."
         db.flush()
         execute_approved(db, approval)
+    elif name == "exhausted":
+        # This is a persisted historical outcome: the recorded attempt count
+        # equals the configured automatic budget, with one audit event per try.
+        attempts = settings.max_action_attempts
+        failure = "Synthetic automatic retry budget exhausted; no external request was made."
+        execution = ActionExecution(
+            idempotency_key=f"approval:{approval.id}",
+            proposed_action=approval.proposed_action,
+            evidence_hash=approval.evidence_hash,
+            state="exhausted",
+            attempts=attempts,
+            detail=failure,
+        )
+        db.add(execution)
+        approval.attempts = attempts
+        approval.execution_status = "exhausted"
+        approval.failure_detail = failure
+        for attempt in range(1, attempts + 1):
+            audit(
+                db, "approval", approval.id, "action_execution_attempt_exhausted", actor,
+                details={"attempt": attempt, "automatic_attempt_budget": attempts, "synthetic": True},
+                correlation_id=record.correlation_id,
+            )
     else:
         execute_approved(db, approval, mock_outcome=None if name == "success" else name)
-        if name == "retryable":
-            approval.next_attempt_at = utcnow()  # reviewer can explicitly run recovery now
     db.commit()
     return approval

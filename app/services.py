@@ -469,14 +469,15 @@ def lock_approval_lifecycle(db, approval_id):
     candidate = db.get(Approval, approval_id)
     if not candidate:
         raise LookupError("approval not found")
-    identity = f"{candidate.kind}:{candidate.subject_type}:{candidate.subject_id}"
+    # One business subject owns the lifecycle even if an action is revised to a
+    # different kind (for example, a reply approval becoming an exception review).
+    identity = f"{candidate.subject_type}:{candidate.subject_id}"
     if db.bind.dialect.name == "postgresql":
         lock_key = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big", signed=True)
         db.execute(text("select pg_advisory_xact_lock(:key)"), {"key": lock_key})
     revisions = db.scalars(
         select(Approval)
         .where(
-            Approval.kind == candidate.kind,
             Approval.subject_type == candidate.subject_type,
             Approval.subject_id == candidate.subject_id,
         )
@@ -490,7 +491,6 @@ def lock_approval_lifecycle(db, approval_id):
 def prior_terminal_execution(db, approval):
     revision_ids = db.scalars(
         select(Approval.id).where(
-            Approval.kind == approval.kind,
             Approval.subject_type == approval.subject_type,
             Approval.subject_id == approval.subject_id,
             Approval.id != approval.id,
@@ -581,6 +581,54 @@ def approval_freshness_differences(db, approval):
     ):
         differences = [difference for difference in differences if not difference.startswith("Case status changed")]
     return list(dict.fromkeys(differences))
+
+
+def approval_freshness_comparison(db, approval):
+    """Return reviewable old/current values alongside the freshness reasons."""
+    snapshot = approval.supporting_facts or {}
+    current = current_approval_facts(db, approval) or {}
+    differences = approval_freshness_differences(db, approval)
+    comparisons = []
+    fields = (
+        (
+            "order_number", "order_id", "customer_email", "case_order_ref", "order_email",
+            "customer_message", "policy", "order_fulfillment_status", "order_financial_status",
+            "order_total", "order_source_updated_at", "category", "confidence", "draft",
+            "missing_info", "case_status",
+        )
+        if approval.subject_type == "case"
+        else ("order_number", "order_id", "hours_threshold", "created_at", "order_fulfillment_status", "order_financial_status", "order_total", "order_source_updated_at")
+    )
+    for field in fields:
+        old = snapshot.get(field)
+        new = current.get(field)
+        same = old == new
+        if same and field.endswith(("_at", "created_at")) and old:
+            try:
+                same = as_utc(datetime.fromisoformat(old)) == as_utc(datetime.fromisoformat(new))
+            except (TypeError, ValueError):
+                pass
+        if field not in snapshot or (current and not same):
+            title = field.replace("_", " ").capitalize()
+            reason = next((message for message in differences if message.lower().startswith(title.lower())), None)
+            comparisons.append({
+                "field": title,
+                "reviewed": old if field in snapshot else "Not captured",
+                "current": new if current else "Source unavailable",
+                "reason": reason or ("Missing from the reviewed snapshot" if field not in snapshot else "Changed since review"),
+            })
+    represented = {item["reason"] for item in comparisons}
+    for message in differences:
+        # Rule-level and snapshot-integrity changes are not ordinary source fields.
+        if message not in represented:
+            if message.startswith("The persisted approval snapshot"):
+                comparisons.append({"field": "Snapshot integrity", "reviewed": approval.evidence_hash or "No hash", "current": current_approval_evidence_hash(approval), "reason": message})
+            elif "delay" in message.lower() or "rule" in message.lower():
+                order = db.get(Order, approval.subject_id) if approval.subject_type == "order" else None
+                comparisons.append({"field": "Current delay eligibility", "reviewed": "Eligible when reviewed", "current": f"{order.fulfillment_status}; created {order.created_at.isoformat()}" if order else "Not eligible or source unavailable", "reason": message})
+            elif not comparisons:
+                comparisons.append({"field": "Source record", "reviewed": "Captured approval facts", "current": "Unavailable", "reason": message})
+    return comparisons
 
 
 def replacement_approval_facts(db, approval, actor):
@@ -768,11 +816,49 @@ def retry_delay(attempt, retry_after=None):
     )
 
 
+def queue_approval_retry(db, approval_id, actor):
+    """Queue one operator-authorized retry under the subject lifecycle lock."""
+    approval = lock_approval_lifecycle(db, approval_id)
+    if approval.replacement_approval_id:
+        raise ValueError("This approval was replaced and cannot be retried")
+    if approval.status != "approved" or approval.execution_status not in (
+        "failed", "retryable", "exhausted",
+    ):
+        raise ValueError("Action is not retryable; ambiguous outcomes require reconciliation")
+    current_execution = db.scalar(
+        select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval.id}"
+        )
+    )
+    if current_execution and current_execution.state in ("started", "succeeded", "ambiguous"):
+        raise ValueError("The recorded execution may have completed; reconcile it before retrying")
+    if prior_terminal_execution(db, approval):
+        raise ValueError("Another approval revision has a terminal or uncertain outcome; reconcile it before retrying")
+    approval.execution_status = "queued"
+    if approval.next_attempt_at is None:
+        approval.next_attempt_at = utcnow()
+    audit(db, "approval", approval.id, "manual_retry_queued", actor)
+    db.commit()
+    return approval
+
+
 def execute_approved(db, approval, mock_outcome=None):
     """Run an approved mock action; ``mock_outcome`` is preview-only injection."""
     approval = lock_approval_lifecycle(db, approval.id)
     if approval.status != "approved":
         raise PermissionError("operator approval is required")
+    if approval.replacement_approval_id:
+        if approval.execution_status in ("succeeded", "ambiguous"):
+            return
+        approval.execution_status = "superseded"
+        approval.failure_detail = "Execution blocked: this approval has been replaced by a newer revision."
+        audit(
+            db, "approval", approval.id, "action_execution_blocked_replaced_approval",
+            details={"replacement_approval_id": approval.replacement_approval_id},
+            correlation_id=approval.supporting_facts.get("correlation_id"),
+        )
+        db.flush()
+        return
     lock_approval_sources(db, approval)
     key = f"approval:{approval.id}"
     execution = db.scalar(

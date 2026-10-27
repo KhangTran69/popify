@@ -1,23 +1,33 @@
 """Shared recovery query and presentation rules for dashboard and workspace."""
 
-from dataclasses import dataclass
 from math import ceil
 
-from sqlalchemy import String, case, cast, func, literal, or_, select, union_all
+from sqlalchemy import String, case, cast, exists, func, literal, or_, select, union_all
+from sqlalchemy.orm import aliased
 
-from app.models import Approval, Case, Delivery, utcnow
+from app.models import ActionExecution, Approval, Case, Delivery, utcnow
 
 
 RECOVERY_CATEGORIES = ("pending", "waiting", "eligible", "exhausted", "stale", "uncertain", "blocked")
+RECOVERY_PRIORITY = {
+    "uncertain": 0,
+    "pending": 1,
+    "stale": 2,
+    "eligible": 3,
+    "exhausted": 4,
+    "blocked": 5,
+    "waiting": 6,
+}
 
 
-def _approval_category(now):
+def _approval_category(now, prior_terminal):
     return case(
+        (Approval.execution_status == "ambiguous", "uncertain"),
+        (Approval.execution_status.in_(["invalid_action", "blocked_prior_outcome", "superseded"]), "blocked"),
+        (prior_terminal, "blocked"),
         (Approval.status == "pending", "pending"),
         (Approval.execution_status == "exhausted", "exhausted"),
         (Approval.execution_status == "evidence_changed", "stale"),
-        (Approval.execution_status == "ambiguous", "uncertain"),
-        (Approval.execution_status.in_(["invalid_action", "blocked_prior_outcome"]), "blocked"),
         (Approval.next_attempt_at > now, "waiting"),
         else_="eligible",
     )
@@ -33,18 +43,37 @@ def _work_category(model, now):
 
 def recovery_union(now=None):
     now = now or utcnow()
+    prior_revision = aliased(Approval)
+    prior_execution_keys = select(
+        (literal("approval:") + cast(prior_revision.id, String))
+    ).where(
+        prior_revision.subject_type == Approval.subject_type,
+        prior_revision.subject_id == Approval.subject_id,
+        prior_revision.id != Approval.id,
+    )
+    has_prior_terminal = exists(
+        select(1).select_from(ActionExecution).where(
+            ActionExecution.idempotency_key.in_(prior_execution_keys),
+            ActionExecution.state.in_(["started", "succeeded", "ambiguous"]),
+        )
+    )
     approvals = select(
         literal("approval").label("source"), Approval.id.label("record_id"),
         (literal("Approval #") + cast(Approval.id, String) + literal(" · ") + Approval.proposed_action).label("label"),
-        func.coalesce(Approval.failure_detail, literal("Human decision or action recovery required")).label("reason"),
+        func.coalesce(
+            Approval.failure_detail,
+            case((has_prior_terminal, "A prior approval outcome must be reconciled before this revision can act."),
+                 else_=literal("Human decision or action recovery required")),
+        ).label("reason"),
         Approval.execution_status.label("raw_state"), Approval.attempts.label("attempts"),
         Approval.next_attempt_at.label("next_attempt_at"), Approval.created_at.label("occurred_at"),
-        _approval_category(now).label("category"),
+        _approval_category(now, has_prior_terminal).label("category"),
+        has_prior_terminal.label("prior_terminal"),
     ).where(
         Approval.replacement_approval_id.is_(None),
         or_(
             Approval.status == "pending",
-            Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action", "blocked_prior_outcome"]),
+            Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action", "blocked_prior_outcome", "superseded"]),
         ),
     )
     cases = select(
@@ -53,6 +82,7 @@ def recovery_union(now=None):
         func.coalesce(Case.failure_detail, literal("Support triage needs another attempt")).label("reason"),
         Case.status.label("raw_state"), Case.attempts.label("attempts"), Case.next_attempt_at.label("next_attempt_at"),
         Case.created_at.label("occurred_at"), _work_category(Case, now).label("category"),
+        literal(False).label("prior_terminal"),
     ).where(or_(Case.status.in_(["failed", "exhausted"]), (Case.status == "queued") & (Case.attempts > 0)))
     deliveries = select(
         literal("delivery").label("source"), Delivery.id.label("record_id"),
@@ -60,6 +90,7 @@ def recovery_union(now=None):
         func.coalesce(Delivery.error, literal("Order intake needs another attempt")).label("reason"),
         Delivery.status.label("raw_state"), Delivery.attempts.label("attempts"), Delivery.next_attempt_at.label("next_attempt_at"),
         Delivery.received_at.label("occurred_at"), _work_category(Delivery, now).label("category"),
+        literal(False).label("prior_terminal"),
     ).where(or_(Delivery.status.in_(["failed", "exhausted"]), (Delivery.status == "received") & (Delivery.attempts > 0)))
     return union_all(approvals, cases, deliveries).subquery()
 
@@ -88,7 +119,12 @@ def recovery_page(db, category="", q="", page=1, per_page=12, now=None):
     pages = max(1, ceil(total / per_page))
     page = min(page, pages)
     rows = db.execute(
-        select(view).where(*conditions).order_by(view.c.occurred_at.desc(), view.c.source, view.c.record_id.desc())
+        select(view).where(*conditions).order_by(
+            case(*[(view.c.category == name, priority) for name, priority in RECOVERY_PRIORITY.items()], else_=99),
+            view.c.occurred_at.asc(),
+            view.c.source.asc(),
+            view.c.record_id.asc(),
+        )
         .offset((page - 1) * per_page).limit(per_page)
     ).mappings().all()
     return [recovery_item(dict(row)) for row in rows], total, page, pages
@@ -97,13 +133,21 @@ def recovery_page(db, category="", q="", page=1, per_page=12, now=None):
 def recovery_item(row):
     source = row["source"]
     row["url"] = f"/{'approvals' if source == 'approval' else 'cases' if source == 'case' else 'deliveries'}/{row['record_id']}"
-    row["next_action"] = {
+    row["next_action"] = (
+        "Reconcile the prior approval outcome; this revision cannot act"
+        if row.get("prior_terminal")
+        else {
         "pending": "Review evidence and decide",
         "waiting": "Wait for the recorded retry deadline",
         "eligible": "Open the record and queue or run the retry",
         "exhausted": "Inspect attempts and authorize manual recovery",
-        "stale": "Compare current facts and create a replacement approval",
+        "stale": "Compare current facts and check replacement eligibility",
         "uncertain": "Reconcile the outcome; retry remains blocked",
-        "blocked": "Correct the action contract before reprocessing",
-    }[row["category"]]
+        "blocked": (
+            "Correct the action contract before reprocessing"
+            if row["raw_state"] == "invalid_action"
+            else "Reconcile the linked revision before taking further action"
+        ),
+        }[row["category"]]
+    )
     return row
