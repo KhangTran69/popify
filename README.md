@@ -174,14 +174,18 @@ See `.env.example` and `app/config.py`. `.env` is ignored by Git and Docker buil
 | `N8N_ENCRYPTION_KEY` | Stable key for n8n's persisted encrypted state |
 | `SHOPIFY_WEBHOOK_SECRET`, `SHOPIFY_STORE_DOMAIN` | HMAC secret and single-store allowlist |
 | `ORDER_DELAY_HOURS` | Delay threshold, default 48 hours |
+| `POPIFY_ENV` | Defaults to production; set `development` only for local use. Production requires non-placeholder secrets and `COOKIE_SECURE=true` |
 | `LLM_MODE` | `mock` by default; optional `openai` |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | Optional Responses API adapter |
+| `COOKIE_SECURE` | Set to `true` when served over HTTPS so session cookies use the Secure attribute |
 | `STORE_POLICIES` | Optional JSON map with all five classification categories |
 | `MAX_ACTION_ATTEMPTS`, `MAX_DELIVERY_ATTEMPTS` | Automatic retry budgets, default 3 |
 | `RETRY_BASE_SECONDS` | Base backoff, default 30 seconds |
 | `MOCK_ACTION_FAILURES`, `MOCK_ACTION_AMBIGUOUS`, `MOCK_RETRY_AFTER_SECONDS` | Controlled mock failure scenarios |
 
 OpenAI classification is constrained to five categories; its draft selection is restricted to safe greeting strings. The application appends trusted order facts and the relevant configured policy. This trades stylistic flexibility for predictable grounding. If the adapter fails, deterministic triage is used. No model can approve or execute an action. Real OpenAI calls remain unverified.
+
+When `LLM_MODE=openai`, the customer message is sent to the configured OpenAI API. The adapter removes common email, phone/number, and URL patterns and sends no order facts or internal policy text. This is best-effort minimization: names and other identifiers may remain, so enable this mode only where external processing is permitted for the data.
 
 For authenticated integration intake, POST a JSON inquiry to `/api/support` with `X-N8N-Secret`. Fields are `message`, `order_ref`, `email`, and an optional stable `request_key`; the response contains the queued case ID and state. The operator form is the preferred manual entry point.
 
