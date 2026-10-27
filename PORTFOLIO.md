@@ -41,7 +41,25 @@ Store operations combine repeatable work with decisions that need human judgment
 - Added an interactive guided scenario detail page with linked order, inquiry, approval revisions, persisted execution, and correlated audit events. The scenario progress and next step derive from saved state; retry timing and reconciliation consequences are explicit.
 - Added a PostgreSQL migration for immutable execution reconciliations, including a verifier for fresh and populated 0001–0006 schemas. Extended concurrency coverage for repeated identical and competing reconciliation requests. Fixed a progress-card style collision that made the attention stage render horizontally.
 
-## Current assessment and acceptance criteria — 27 October 2026
+## Current assessment and verification — 27 October 2026
+
+After PR #11 merged (`e3fee4e`), review found that `app/services.py` refused new evidence on an original execution once it had a replacement, while `app/templates/detail.html` directed the operator to a replacement that could not reconcile that execution. In `app/preview_scenarios.py`, failure injection was scoped to an approval instead of the journey, and the interactive exhaustion path created attempt records without the usual execution checks. `app/main.py` also ran the preview adapter on a replayed approval when a retry became due. Browser review found an undefined backoff timestamp in `app/templates/demo_scenario.html` and overflow from long reconciliation evidence.
+
+The follow-up implements these acceptance criteria:
+
+- Operators can append evidence to the original ambiguous execution after a replacement exists. Contradictions return the original to the uncertain recovery queue and block further related attempts; an already completed replacement remains recorded. The scenario and its list card point to the unresolved evidence. A previously successful execution directs operators to inspect its record rather than offering unavailable reconciliation.
+- A new preview decision invokes its first mock attempt once inside the lifecycle lock. Failure injection is scoped to the journey, and exhaustion takes separate guarded attempts at the stored backoff deadlines before manual recovery. The blocked-action scenario records a decision and demonstrates the adapter guard without creating an execution. Long evidence wraps at mobile widths.
+- `python -m scripts.verify` provides explicit local, PostgreSQL, preview, and live-demo targets and reports unavailable Docker separately from a failing check. A shared SQL helper selects related execution keys without loading all revision IDs into Python.
+
+Verification performed for this follow-up:
+
+- **Local behavior and workflow validation:** `python -m scripts.verify local` passed **93 tests** and validated all three workflow exports. Python compilation and `git diff --check` passed.
+- **PostgreSQL:** fresh-schema and populated 0007-to-0008 upgrade verification and the concurrency verifier passed on a temporary PostgreSQL 16.15 cluster, which was stopped and removed afterward. The verifier included later evidence racing a replacement execution and concurrent duplicate decision callbacks.
+- **Synthetic browser walkthrough:** completed success, rejection, transient retry, exhaustion with real 30- and 60-second backoff, stale-evidence replacement, blocked action, and ambiguity followed by replacement and conflicting later evidence. Direct inspection of the temporary SQLite database confirmed the displayed decisions, attempts, replacement links, and reconciliation history. The exhausted action succeeded on its fourth attempt after an explicit requeue; the blocked and rejected records created no execution.
+- **Visual inspection:** captured the later-evidence journey at 1280×813 and 390×844 in `docs/screenshots/scenario-later-evidence-desktop.jpg` and `docs/screenshots/scenario-later-evidence-mobile.jpg`. Browser back, keyboard focus, and a long unbroken evidence string were checked; the mobile document had no horizontal overflow. These are synthetic preview captures.
+- **Live n8n:** unavailable because the Docker daemon was not reachable. `python -m scripts.verify demo` and the Compose PostgreSQL target reported the missing prerequisite; the standalone disposable PostgreSQL checks above ran separately. PR #11 CI passed on its merged commit and is historical evidence, not CI for this follow-up.
+
+## Historical assessment and acceptance criteria — PR #10
 
 The branch starts from merged PR #9 (`119bb43`). Inspection of `app/services.py` showed each `ActionExecution` could have only one reconciliation, so an initial `still_unknown` assertion could not be followed after new evidence. `app/templates/detail.html` exposed reconciliation but not a complete revision sequence. `app/preview_scenarios.py` and `app/main.py` made preview examples inspectable, but starting one created pre-resolved records rather than a pending human decision. The scenario page bounded approval/audit histories without pagination, and stale pending scenarios did not surface a replacement action.
 
@@ -53,7 +71,7 @@ Acceptance criteria implemented:
 - Scenario revision, reconciliation, and audit histories are paginated. The current approval and authoritative reconciliation remain visible when browsing older pages.
 - Stale pending approvals offer a replacement action only after the operator can inspect reviewed and current evidence.
 
-## Current verification — 27 October 2026, Manila time
+## Historical verification — PR #10
 
 - **Behavior suite:** `pytest -q` passed: **79 tests**, including follow-up assertions after unknown outcomes, conflicting evidence and later resolution, unchanged ambiguous execution records, interactive scenario outcomes, stale evidence recovery, scenario history pagination with current-state visibility, and blocker links/requeue after confirmed non-execution.
 - **Workflow exports:** all three JSON workflow files passed `python -m scripts.validate_workflows`.
@@ -63,7 +81,7 @@ Acceptance criteria implemented:
 - **Visual inspection:** inspected the current isolated scenario runner and stale-evidence page at the browser's default desktop viewport, then at 390×844. Checked scenario stage wrapping, long message wrapping, form sizing, keyboard focus, and the current reconciliation in the page summary. The captured browser view is included with this work report; the existing repository screenshots remain historical and are not represented as screenshots of this change.
 - **Live n8n:** not run because Docker was unavailable (`docker info` failed and no local n8n endpoint was active). Workflow-export validation is not n8n execution evidence. Earlier real-workflow checks listed below are historical and were not repeated.
 
-## Follow-up assessment and verification — 27 October 2026
+## Historical follow-up assessment and verification — PR #11
 
 After PR #10 merged (`68857d5`), review found that the scenario revision history in `app/templates/demo_scenario.html` reversed the older/newer pager labels. The approval route in `app/main.py` also attempted preview execution for a replayed approve POST even when `decide_approval` had returned an already rejected approval. That produced an internal error on a stale form submission. The guided stages in `app/main.py` exposed only terse state strings, leaving the trigger, actual human decision, and persisted execution detail hard to follow.
 

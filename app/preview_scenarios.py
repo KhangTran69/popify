@@ -3,15 +3,29 @@
 import uuid
 from datetime import timedelta
 from sqlalchemy import select, func
+from sqlalchemy.orm import aliased
 
 from app.config import settings
 from app.models import (
     ActionExecution, Approval, Audit, Case, ExecutionReconciliation, Order, utcnow,
 )
-from app.services import audit, create_approval, decide_approval, execute_approved
+from app.services import (
+    audit, create_approval, decide_approval, execute_approved,
+    lock_approval_lifecycle, subject_execution_keys,
+)
 
 
 SCENARIOS = ("pending", "success", "rejected", "retryable", "exhausted", "stale", "ambiguous", "blocked")
+SCENARIO_GUIDANCE = {
+    "pending": "Review the evidence and choose a human decision.",
+    "success": "Approve once and inspect the saved mock result.",
+    "rejected": "Reject the request and confirm no action ran.",
+    "retryable": "Observe a transient failure, wait for backoff, and run a due retry.",
+    "exhausted": "Run each due mock attempt through its backoff until the budget is exhausted, then authorize recovery.",
+    "stale": "Compare changed facts and review a replacement approval.",
+    "ambiguous": "Reconcile uncertain execution without blindly retrying it.",
+    "blocked": "Inspect an unsupported action that cannot execute.",
+}
 
 
 def create_preview_scenario(db, name, actor="preview"):
@@ -161,20 +175,63 @@ def record_exhausted_attempts(db, approval, actor="preview"):
 
 
 def execute_preview_approval(db, approval, actor):
-    """Apply the selected scenario's one-shot failure only to its disposable run."""
+    """Run one guarded mock attempt, scoped to the whole synthetic journey."""
     if not settings.preview_mode:
         raise PermissionError("preview outcomes are available only in isolated preview mode")
+    approval = lock_approval_lifecycle(db, approval.id)
     prior = db.scalar(select(ActionExecution).where(
         ActionExecution.idempotency_key == f"approval:{approval.id}"
     ))
     case = db.get(Case, approval.subject_id) if approval.subject_type == "case" else None
     parts = (case.correlation_id or "").split(":") if case else []
     scenario_name = parts[1] if len(parts) >= 3 and parts[0] == "preview" else "success"
-    if scenario_name == "exhausted" and not prior:
-        record_exhausted_attempts(db, approval, actor)
-        return
-    outcome = scenario_name if scenario_name in ("retryable", "ambiguous") and not prior else None
+    has_journey_attempt = bool(db.scalar(select(ActionExecution.id).where(
+        ActionExecution.idempotency_key.in_(subject_execution_keys(
+            approval.subject_type, approval.subject_id
+        )),
+    ).limit(1)))
+    outcome = None
+    if scenario_name in ("retryable", "ambiguous") and not has_journey_attempt:
+        outcome = scenario_name
+    elif scenario_name == "exhausted":
+        attempts = prior.attempts if prior else 0
+        if not has_journey_attempt or (prior and attempts < settings.max_action_attempts):
+            outcome = "exhausted" if attempts + 1 >= settings.max_action_attempts else "retryable"
     execute_approved(db, approval, mock_outcome=outcome)
+
+
+def latest_reconciliations(db, approval_ids):
+    """Return the current assertion for each displayed approval."""
+    if not approval_ids:
+        return {}
+    latest = (select(
+        ExecutionReconciliation.approval_id.label("approval_id"),
+        func.max(ExecutionReconciliation.revision).label("revision"),
+    ).where(ExecutionReconciliation.approval_id.in_(approval_ids))
+      .group_by(ExecutionReconciliation.approval_id).subquery())
+    rows = db.scalars(select(ExecutionReconciliation).join(
+        latest,
+        (ExecutionReconciliation.approval_id == latest.c.approval_id)
+        & (ExecutionReconciliation.revision == latest.c.revision),
+    ).limit(len(approval_ids))).all()
+    return {item.approval_id: item for item in rows}
+
+
+def related_approval_ids(db, approval_ids, states):
+    """Find one related approval in the requested states for each displayed row."""
+    if not approval_ids:
+        return {}
+    related = aliased(Approval)
+    rows = db.execute(select(Approval.id, func.max(related.id)).join(
+        related, (related.subject_type == Approval.subject_type)
+        & (related.subject_id == Approval.subject_id) & (related.id != Approval.id),
+    ).where(Approval.id.in_(approval_ids), related.execution_status.in_(states))
+      .group_by(Approval.id).limit(len(approval_ids))).all()
+    return dict(rows)
+
+
+def unresolved_related_approvals(db, approval_ids):
+    return related_approval_ids(db, approval_ids, ("ambiguous", "disputed"))
 
 
 def load_preview_scenario(db, approval_id, reconciliation_page=1, revision_page=1, audit_page=1):
@@ -221,23 +278,7 @@ def load_preview_scenario(db, approval_id, reconciliation_page=1, revision_page=
         .order_by(ActionExecution.id)
         .limit(21)
     ).all() if approval_ids else []
-    latest_reconciliation_revisions = (
-        select(
-            ExecutionReconciliation.approval_id.label("approval_id"),
-            func.max(ExecutionReconciliation.revision).label("revision"),
-        )
-        .where(ExecutionReconciliation.approval_id.in_(approval_ids))
-        .group_by(ExecutionReconciliation.approval_id)
-        .subquery()
-    ) if approval_ids else None
-    reconciliation_rows = db.scalars(
-        select(ExecutionReconciliation).join(
-            latest_reconciliation_revisions,
-            (ExecutionReconciliation.approval_id == latest_reconciliation_revisions.c.approval_id)
-            & (ExecutionReconciliation.revision == latest_reconciliation_revisions.c.revision),
-        ).limit(21)
-    ).all() if approval_ids else []
-    reconciliations = {item.approval_id: item for item in reconciliation_rows}
+    reconciliations = latest_reconciliations(db, approval_ids)
     current_reconciliation_history = []
     reconciliation_total = db.scalar(select(func.count()).select_from(
         ExecutionReconciliation
