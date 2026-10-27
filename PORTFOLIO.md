@@ -41,7 +41,20 @@ Store operations combine repeatable work with decisions that need human judgment
 - Added an interactive guided scenario detail page with linked order, inquiry, approval revisions, persisted execution, and correlated audit events. The scenario progress and next step derive from saved state; retry timing and reconciliation consequences are explicit.
 - Added a PostgreSQL migration for immutable execution reconciliations, including a verifier for fresh and populated 0001–0006 schemas. Extended concurrency coverage for repeated identical and competing reconciliation requests. Fixed a progress-card style collision that made the attention stage render horizontally.
 
-## Current assessment and verification — 27 October 2026
+## Current reviewer experience and verification — 27 October 2026
+
+Inspection of `app/main.py` found that the isolated scenario route mixed database recovery interpretation with page assembly. `app/templates/demo_scenario.html` presented raw audit events after several separate record sections; a confirmed non-execution still marked the outcome stage complete even though a new approval was needed. The `/demo` workspace loaded only its latest 50 scenarios and offered no way to reach older runs.
+
+The scenario state and event labels now live in `app/scenario_view.py`. The page shows a chronological, bounded journey with direct links to the saved request, decisions, execution attempts, replacements, and operator conclusions. Confirmed non-execution keeps the outcome stage open until a new approval is created. The preview workspace pages saved scenarios and offers a two-run reviewer path: one successful mock action and one uncertain execution requiring human reconciliation. These changes preserve the existing service transaction and workflow contracts.
+
+Verification performed for this change:
+
+- **Local suite and exports:** `python -m scripts.verify local` passed **95 tests** and validated all three workflow JSON exports.
+- **PostgreSQL:** fresh and populated upgrade migration checks and the concurrency verifier passed on a disposable local PostgreSQL cluster. No migration was added in this change.
+- **Browser:** exercised the new success and ambiguity paths in an isolated preview, including a saved one-attempt success and an ambiguous attempt followed by an operator conclusion. Inspected the reviewer cards at 1280×813 and 390×844 and checked visible keyboard focus. The new images in `docs/screenshots/reviewer-path-desktop.jpg` and `docs/screenshots/reviewer-path-mobile.jpg` are synthetic preview captures.
+- **Live n8n:** `python -m scripts.verify demo` reported that the Docker daemon was unavailable; no real workflow run was claimed.
+
+## Historical assessment and verification — PR #12
 
 After PR #11 merged (`e3fee4e`), review found that `app/services.py` refused new evidence on an original execution once it had a replacement, while `app/templates/detail.html` directed the operator to a replacement that could not reconcile that execution. In `app/preview_scenarios.py`, failure injection was scoped to an approval instead of the journey, and the interactive exhaustion path created attempt records without the usual execution checks. `app/main.py` also ran the preview adapter on a replayed approval when a retry became due. Browser review found an undefined backoff timestamp in `app/templates/demo_scenario.html` and overflow from long reconciliation evidence.
 

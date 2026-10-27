@@ -590,7 +590,7 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
     assert page.status_code == 200
     assert f"{correlation_id}" in page.text
     assert f"/orders/" in page.text and f"/cases/" in page.text
-    assert "Correlated audit history" in page.text
+    assert "Journey history" in page.text
     assert "Append operator reconciliation" in page.text
     assert f"from_scenario={approval_id}" in page.text
     assert "Customer inquiry: Synthetic ambiguous support request" in page.text
@@ -2394,6 +2394,8 @@ def test_preview_ambiguity_is_injected_once_across_replacement(monkeypatch):
     assert "A related execution has unresolved evidence" in scenario_page.text
     assert f"/approvals/{original_id}?from_scenario={replacement_id}" in scenario_page.text
     assert "Related outcome needs review" in scenario_page.text
+    assert "Related approval #" in scenario_page.text
+    assert 'class="scenario-stage attention"' in scenario_page.text
     assert "Scenario complete · local mock succeeded" not in scenario_page.text
     listing = client.get('/demo')
     assert "A related approval has unresolved evidence" in listing.text
@@ -2406,6 +2408,60 @@ def test_preview_ambiguity_is_injected_once_across_replacement(monkeypatch):
     assert "A related execution is recorded as completed or still in progress" in resolved.text
     assert "Related outcome needs review" in resolved.text
     assert f"inspect approval #{original_id} before further action" in client.get('/demo').text
+
+
+def test_preview_workspace_pages_saved_scenarios_and_links_journey_events(monkeypatch):
+    from app.preview_scenarios import start_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    sign_in()
+    with TestingSession() as db:
+        ids = [start_preview_scenario(db, "success", "operator").id for _ in range(14)]
+        unrelated = create_approval(db, "support", "case", 100, "send_reply", {})
+        db.commit()
+
+    first = client.get("/demo")
+    assert first.status_code == 200
+    assert "14 saved scenarios" in first.text
+    assert f'href="/demo/scenarios/{unrelated.id}"' not in first.text
+    assert "Five-minute reviewer path" in first.text
+    assert f'href="/demo/scenarios/{ids[-1]}"' in first.text
+    assert f'href="/demo/scenarios/{ids[0]}"' not in first.text
+    assert 'href="?page=2"' in first.text
+
+    older = client.get("/demo?page=2")
+    assert older.status_code == 200
+    assert f'href="/demo/scenarios/{ids[0]}"' in older.text
+    assert 'href="?page=1"' in older.text
+
+    journey = client.get(f"/demo/scenarios/{ids[0]}")
+    assert journey.status_code == 200
+    assert "Journey history" in journey.text
+    assert "Customer request saved" in journey.text
+    assert "Human review requested" in journey.text
+    assert f'/approvals/{ids[0]}?from_scenario={ids[0]}' in journey.text
+    assert "Saved event evidence" in journey.text
+
+
+def test_confirmed_nonexecution_keeps_guided_outcome_open_until_fresh_approval(monkeypatch):
+    from app.preview_scenarios import create_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    sign_in()
+    with TestingSession() as db:
+        approval_id = create_preview_scenario(db, "ambiguous", "operator").id
+        reconcile_approval_execution(
+            db, approval_id, "confirmed_not_executed",
+            "Synthetic ledger shows no completed action for this request.",
+            "LEDGER-1", "operator", synthetic=True,
+        )
+    page = client.get(f"/demo/scenarios/{approval_id}")
+    assert page.status_code == 200
+    assert "Operator confirmed non-execution; the original attempt remains ambiguous" in page.text
+    assert 'class="scenario-stage attention"' in page.text
+    assert "Create a fresh pending approval" in page.text
 
 
 def test_preview_exhaustion_requires_due_attempts_and_decision_replay_does_not_retry(monkeypatch):
