@@ -5,7 +5,7 @@ from math import ceil
 from sqlalchemy import String, case, cast, exists, func, literal, or_, select, union_all
 from sqlalchemy.orm import aliased
 
-from app.models import ActionExecution, Approval, Case, Delivery, utcnow
+from app.models import ActionExecution, Approval, Case, Delivery, ExecutionReconciliation, utcnow
 
 
 RECOVERY_CATEGORIES = ("pending", "waiting", "eligible", "exhausted", "stale", "uncertain", "blocked")
@@ -23,7 +23,7 @@ RECOVERY_PRIORITY = {
 def _approval_category(now, prior_terminal):
     return case(
         (Approval.execution_status == "ambiguous", "uncertain"),
-        (Approval.execution_status.in_(["invalid_action", "blocked_prior_outcome", "superseded"]), "blocked"),
+        (Approval.execution_status.in_(["invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]), "blocked"),
         (prior_terminal, "blocked"),
         (Approval.status == "pending", "pending"),
         (Approval.execution_status == "exhausted", "exhausted"),
@@ -55,6 +55,10 @@ def recovery_union(now=None):
         select(1).select_from(ActionExecution).where(
             ActionExecution.idempotency_key.in_(prior_execution_keys),
             ActionExecution.state.in_(["started", "succeeded", "ambiguous"]),
+            ~exists(select(ExecutionReconciliation.id).where(
+                ExecutionReconciliation.action_execution_id == ActionExecution.id,
+                ExecutionReconciliation.outcome == "confirmed_not_executed",
+            )),
         )
     )
     approvals = select(
@@ -73,7 +77,7 @@ def recovery_union(now=None):
         Approval.replacement_approval_id.is_(None),
         or_(
             Approval.status == "pending",
-            Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action", "blocked_prior_outcome", "superseded"]),
+            Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]),
         ),
     )
     cases = select(
@@ -146,6 +150,8 @@ def recovery_item(row):
         "blocked": (
             "Correct the action contract before reprocessing"
             if row["raw_state"] == "invalid_action"
+            else "Create a fresh pending approval from current facts"
+            if row["raw_state"] == "reconciled_not_executed"
             else "Reconcile the linked revision before taking further action"
         ),
         }[row["category"]]

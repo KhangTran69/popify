@@ -1,12 +1,15 @@
 import hashlib, logging, uuid
 import json
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, exists
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.integrations import verify_shopify, generate_support_content
-from app.models import Order, Delivery, Case, Approval, Audit, ActionExecution, utcnow
+from app.models import (
+    Order, Delivery, Case, Approval, Audit, ActionExecution,
+    ExecutionReconciliation, utcnow,
+)
 
 log = logging.getLogger("commerceops")
 
@@ -502,6 +505,10 @@ def prior_terminal_execution(db, approval):
         select(ActionExecution).where(
             ActionExecution.idempotency_key.in_([f"approval:{item}" for item in revision_ids]),
             ActionExecution.state.in_(["started", "succeeded", "ambiguous"]),
+            ~exists(select(ExecutionReconciliation.id).where(
+                ExecutionReconciliation.action_execution_id == ActionExecution.id,
+                ExecutionReconciliation.outcome == "confirmed_not_executed",
+            )),
         ).order_by(ActionExecution.id.desc())
     )
 
@@ -695,23 +702,29 @@ def refresh_approval(db, approval_id, actor):
     approval = lock_approval_lifecycle(db, approval_id)
     if approval.replacement_approval_id:
         return db.get(Approval, approval.replacement_approval_id)
+    reconciled_not_executed = (
+        approval.status == "approved"
+        and approval.execution_status == "reconciled_not_executed"
+    )
     eligible = approval.status == "pending" or (
         approval.status == "approved" and approval.execution_status == "evidence_changed"
-    )
+    ) or reconciled_not_executed
     if not eligible:
-        raise ValueError("Only a pending or evidence-changed approval can be refreshed.")
+        raise ValueError("Only a pending, stale, or confirmed-not-executed approval can be refreshed.")
     lock_approval_sources(db, approval)
-    prior_execution = prior_terminal_execution(db, approval) or db.scalar(
-        select(ActionExecution).where(
-            ActionExecution.idempotency_key == f"approval:{approval.id}"
+    prior_execution = prior_terminal_execution(db, approval)
+    if not reconciled_not_executed:
+        prior_execution = prior_execution or db.scalar(
+            select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{approval.id}"
+            )
         )
-    )
     if prior_execution and prior_execution.state in ("started", "succeeded", "ambiguous"):
         raise ValueError(
             "The prior execution may have completed; reconcile its outcome before creating a replacement."
         )
     differences = approval_freshness_differences(db, approval)
-    if not differences:
+    if not differences and not reconciled_not_executed:
         raise ValueError("The approval evidence is current; refresh is not needed.")
     action, facts = replacement_approval_facts(db, approval, actor)
     if (approval.kind, approval.subject_type, action) not in ACTION_CONTRACTS:
@@ -842,13 +855,106 @@ def queue_approval_retry(db, approval_id, actor):
     return approval
 
 
+def reconcile_approval_execution(
+    db, approval_id, outcome, explanation, reference, actor, synthetic=False
+):
+    """Record one operator assertion about an ambiguous action outcome.
+
+    This never changes the original ActionExecution state or reruns the action.
+    A confirmed non-execution only allows a separately reviewed approval revision.
+    """
+    outcomes = {"confirmed_completed", "confirmed_not_executed", "still_unknown"}
+    if outcome not in outcomes:
+        raise ValueError("Choose a valid reconciliation outcome")
+    explanation = (explanation or "").strip()
+    reference = (reference or "").strip() or None
+    if len(explanation) < 10 or len(explanation) > 2000:
+        raise ValueError("Provide an explanation between 10 and 2000 characters")
+    if reference and len(reference) > 240:
+        raise ValueError("Supporting reference must be 240 characters or fewer")
+    if outcome in ("confirmed_completed", "confirmed_not_executed") and not reference:
+        raise ValueError("A supporting reference is required for a confirmed outcome")
+
+    approval = lock_approval_lifecycle(db, approval_id)
+    execution = db.scalar(
+        select(ActionExecution)
+        .where(ActionExecution.idempotency_key == f"approval:{approval.id}")
+        .with_for_update()
+    )
+    if not execution:
+        raise ValueError("No persisted execution is available to reconcile")
+    existing = db.scalar(
+        select(ExecutionReconciliation).where(
+            ExecutionReconciliation.action_execution_id == execution.id
+        )
+    )
+    if existing:
+        same_request = (
+            existing.outcome == outcome
+            and existing.explanation == explanation
+            and existing.reference == reference
+            and existing.actor == actor
+            and existing.synthetic == bool(synthetic)
+        )
+        if same_request:
+            return existing
+        raise ValueError("This execution already has a reconciliation record")
+    if approval.status != "approved" or approval.execution_status != "ambiguous" or execution.state != "ambiguous":
+        raise ValueError("Only an unresolved ambiguous execution can be reconciled")
+
+    correlation_id = (approval.supporting_facts or {}).get("correlation_id") or f"approval:{approval.id}"
+    reconciliation = ExecutionReconciliation(
+        action_execution_id=execution.id,
+        approval_id=approval.id,
+        outcome=outcome,
+        explanation=explanation,
+        reference=reference,
+        actor=actor,
+        correlation_id=correlation_id,
+        synthetic=bool(synthetic),
+    )
+    db.add(reconciliation)
+    approval.execution_status = {
+        "confirmed_completed": "reconciled_completed",
+        "confirmed_not_executed": "reconciled_not_executed",
+        "still_unknown": "ambiguous",
+    }[outcome]
+    approval.failure_detail = (
+        "Operator recorded the outcome as completed; the original execution remains ambiguous and no provider was queried."
+        if outcome == "confirmed_completed"
+        else "Operator recorded that no execution occurred; a new human approval is required before another mock action."
+        if outcome == "confirmed_not_executed"
+        else "The outcome remains unknown; retries and replacement approvals remain blocked."
+    )
+    audit(
+        db,
+        "approval",
+        approval.id,
+        "execution_outcome_reconciled",
+        actor,
+        details={
+            "execution_id": execution.id,
+            "outcome": outcome,
+            "explanation": explanation,
+            "reference": reference,
+            "original_execution_state": execution.state,
+            "synthetic": bool(synthetic),
+        },
+        correlation_id=correlation_id,
+    )
+    db.commit()
+    return reconciliation
+
+
 def execute_approved(db, approval, mock_outcome=None):
     """Run an approved mock action; ``mock_outcome`` is preview-only injection."""
     approval = lock_approval_lifecycle(db, approval.id)
     if approval.status != "approved":
         raise PermissionError("operator approval is required")
     if approval.replacement_approval_id:
-        if approval.execution_status in ("succeeded", "ambiguous"):
+        if approval.execution_status in (
+            "succeeded", "ambiguous", "reconciled_completed", "reconciled_not_executed"
+        ):
             return
         approval.execution_status = "superseded"
         approval.failure_detail = "Execution blocked: this approval has been replaced by a newer revision."
@@ -883,7 +989,8 @@ def execute_approved(db, approval, mock_outcome=None):
         db.flush()
         return
     if execution and execution.state in ("succeeded", "ambiguous"):
-        approval.execution_status = execution.state
+        if approval.execution_status not in ("reconciled_completed", "reconciled_not_executed"):
+            approval.execution_status = execution.state
         return
     prior_execution = prior_terminal_execution(db, approval)
     if prior_execution:

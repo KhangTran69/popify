@@ -5,6 +5,7 @@ from sqlalchemy import (
     DateTime,
     Integer,
     Boolean,
+    CheckConstraint,
     ForeignKey,
     UniqueConstraint,
     JSON,
@@ -159,6 +160,34 @@ class ActionExecution(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class ExecutionReconciliation(Base):
+    __tablename__ = "execution_reconciliations"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('confirmed_completed', 'confirmed_not_executed', 'still_unknown')",
+            name="ck_reconciliation_outcome",
+        ),
+        CheckConstraint(
+            "outcome = 'still_unknown' OR reference IS NOT NULL",
+            name="ck_reconciliation_reference",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    action_execution_id: Mapped[int] = mapped_column(
+        ForeignKey("action_executions.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    approval_id: Mapped[int] = mapped_column(
+        ForeignKey("approvals.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    outcome: Mapped[str] = mapped_column(String(32))
+    explanation: Mapped[str] = mapped_column(Text)
+    reference: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    actor: Mapped[str] = mapped_column(String(120))
+    correlation_id: Mapped[str] = mapped_column(String(150), index=True)
+    synthetic: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 Index("ix_approval_queue", Approval.status, Approval.execution_status)

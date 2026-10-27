@@ -22,14 +22,14 @@
     <div>
       <span class="demo-mark">LOCAL · TEMPORARY</span>
       <h2>Follow a persisted decision</h2>
-      <p>Start with the pending request, review the captured customer and order facts, then approve or reject it. Approval runs the mock adapter locally and saves the result, attempt, and audit event. Rejection records the operator decision without an execution. This disposable SQLite preview cannot reach n8n, Shopify, OpenAI, or external actions.</p>
+      <p>Open a scenario to follow its saved order, inquiry, approval revisions, mock execution, and correlated audit events. Continue each journey from the action supported by its current persisted state. This disposable SQLite preview cannot reach n8n, Shopify, OpenAI, or external actions.</p>
       <a class="button" href="/queues/approvals">Open pending and completed decisions →</a>
     </div>
     <div class="demo-preview">
-      <div><b>01</b><span>Trigger · synthetic inquiry and saved order</span><i>→</i></div>
+      <div><b>01</b><span>Trigger · synthetic order and saved inquiry</span><i>→</i></div>
       <div><b>02</b><span>Automation · triage draft and evidence snapshot</span><i>→</i></div>
-      <div><b>03</b><span>Human decision · approve or reject</span><i>→</i></div>
-      <div><b>04</b><span>Persisted result · local mock and audit timeline</span></div>
+      <div><b>03</b><span>Human decision · approve, reject, or reconcile</span><i>→</i></div>
+      <div><b>04</b><span>Persisted result · mock outcome and audit history</span></div>
     </div>
   </section>
   <section class="panel">
@@ -43,12 +43,14 @@
     <div class="preview-example-grid">
       {% for approval in preview_examples %}
       <article class="preview-example">
-        <span class="preview-step">{% if approval.status == 'pending' %}Human decision{% elif approval.execution_status == 'succeeded' %}Persisted success{% elif approval.status == 'rejected' %}Decision closed{% elif approval.execution_status == 'retryable' %}Transient failure{% elif approval.execution_status == 'exhausted' %}Retry budget used{% elif approval.execution_status == 'ambiguous' %}Outcome uncertain{% elif approval.execution_status == 'evidence_changed' %}Evidence became stale{% else %}Blocked contract{% endif %}</span>
-        <h3><a href="/approvals/{{ approval.id }}">{{ approval.proposed_action.replace('_', ' ')|capitalize }} · #{{ approval.id }} ↗</a></h3>
-        <p>{% if approval.status == 'pending' %}Review the recorded request, order context, policy, and draft before choosing. A local mock result is saved only after approval.{% elif approval.execution_status == 'succeeded' %}The decision and successful mock result are persisted with the attempt and audit history.{% elif approval.status == 'rejected' %}The operator decision is saved; no mock execution was created.{% elif approval.execution_status == 'retryable' %}A retry is waiting for its recorded backoff deadline. Preview does not run background workers.{% elif approval.execution_status == 'exhausted' %}The automatic retry budget is used. Inspect the failure, then manually queue the supported recovery attempt.{% elif approval.execution_status == 'ambiguous' %}No retry is available. The outcome must be reconciled before any further action.{% elif approval.execution_status == 'evidence_changed' %}The original approval is preserved. Compare the reviewed snapshot with current facts before creating a replacement.{% else %}The action has no registered adapter. No retry or replacement is offered.{% endif %}</p>
+        {% set reconciliation = preview_reconciliations.get(approval.id) %}
+        <span class="preview-step">{% if approval.status == 'pending' %}Human decision{% elif approval.execution_status == 'succeeded' %}Persisted success{% elif approval.status == 'rejected' %}Decision closed{% elif approval.execution_status == 'retryable' %}Transient failure{% elif approval.execution_status == 'exhausted' %}Retry budget used{% elif reconciliation and reconciliation.outcome == 'still_unknown' %}Outcome remains unknown{% elif reconciliation %}Operator reconciliation{% elif approval.execution_status == 'ambiguous' %}Outcome uncertain{% elif approval.execution_status == 'evidence_changed' %}Evidence became stale{% else %}Recovery review{% endif %}</span>
+        <h3><a href="/demo/scenarios/{{ approval.id }}">{{ approval.proposed_action.replace('_', ' ')|capitalize }} · #{{ approval.id }} ↗</a></h3>
+        <p>{% if approval.status == 'pending' %}Review this request and record the human decision.{% elif approval.execution_status == 'succeeded' %}The local mock result, attempt count, and audit history are saved.{% elif approval.status == 'rejected' %}The decision is saved; no execution was created.{% elif approval.execution_status == 'retryable' %}The recorded backoff deadline controls when a local retry can run.{% elif approval.execution_status == 'exhausted' %}Inspect the attempts, then choose whether to queue a manual recovery.{% elif reconciliation and reconciliation.outcome == 'still_unknown' %}The operator recorded the uncertainty; retries and replacement approvals remain blocked.{% elif reconciliation and reconciliation.outcome == 'confirmed_completed' %}The operator recorded completion. The original execution remains ambiguous; no provider was queried.{% elif reconciliation %}Non-execution was recorded; any new action requires a fresh approval.{% elif approval.execution_status == 'ambiguous' %}Record what is known. The synthetic timeout does not prove completion or non-execution.{% elif approval.execution_status == 'evidence_changed' %}Compare the reviewed snapshot with current facts before creating a replacement.{% else %}Open the scenario to inspect the supported recovery step.{% endif %}</p>
         <dl><dt>Decision</dt><dd>{{ approval.status }}{% if approval.actor %} · {{ approval.actor }}{% endif %}</dd><dt>Execution</dt><dd>{{ approval.execution_status.replace('_', ' ') }}</dd><dt>Attempt</dt><dd>{{ approval.attempts }}</dd><dt>Record</dt><dd>revision {{ approval.revision }}</dd></dl>
+        <a class="record-link" href="/demo/scenarios/{{ approval.id }}">Follow scenario →</a>
       </article>
-      {% endfor %}
+      {% else %}<div class="empty">No synthetic scenarios yet. Create one above to begin a guided walkthrough.</div>{% endfor %}
     </div>
     <div class="inline-actions">
       <a class="record-link" href="/recovery">Open the unified recovery workspace ↗</a>

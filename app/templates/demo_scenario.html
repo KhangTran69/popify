@@ -1,0 +1,113 @@
+{% extends 'base.html' %}
+{% block content %}
+<main id="main" class="wrap scenario-page">
+  <a class="back" href="/demo">← Back to scenario workspace</a>
+  <div class="headline">
+    <div>
+      <div class="eyebrow">GUIDED SCENARIO · ISOLATED PREVIEW</div>
+      <h1>{{ scenario.name|title }}</h1>
+      <p class="sub">Follow this saved synthetic journey from its trigger through operator decision and persisted result.</p>
+    </div>
+    <span class="mode"><i></i> Synthetic data · local mock only</span>
+  </div>
+
+  <section class="scenario-next notice warn" aria-labelledby="scenario-next-title">
+    <div><span class="eyebrow">NEXT STEP · BASED ON SAVED RECORDS</span><h2 id="scenario-next-title">{{ next_step }}</h2>
+      <p>Every action here affects only the temporary preview database. It does not call n8n, a provider, or an external service.</p>
+    </div>
+  </section>
+
+  <section class="scenario-stages" aria-label="Scenario progress">
+    {% for stage in stages %}
+      <article class="scenario-stage {{ stage.state }}">
+        <span class="stage-state">{{ stage.state.replace('_', ' ') }}</span>
+        <h2>{{ '%02d'|format(loop.index) }} · {{ stage.name }}</h2>
+        <p>{{ stage.detail }}</p>
+        {% if stage.href %}<a href="{{ stage.href }}">Open record ↗</a>{% endif %}
+      </article>
+    {% endfor %}
+  </section>
+
+  <div class="scenario-grid">
+    <section class="box" aria-labelledby="scenario-records-title">
+      <div class="panelhead"><div><h2 id="scenario-records-title">Records in this journey</h2><p>Linked by the synthetic scenario correlation ID.</p></div></div>
+      {% if scenario.order %}
+        <article class="scenario-record"><div><span class="preview-step">TRIGGER · ORDER</span><h3>{{ scenario.order.order_number }}</h3></div><a href="/orders/{{ scenario.order.id }}?from_scenario={{ scenario.scenario_id }}">Open order ↗</a>
+          <dl><dt>Created</dt><dd>{{ scenario.order.created_at|utc }}</dd><dt>Payment</dt><dd>{{ scenario.order.financial_status }}</dd><dt>Fulfillment</dt><dd>{{ scenario.order.fulfillment_status }}</dd><dt>Total</dt><dd>{{ scenario.order.currency }} {{ scenario.order.total }}</dd></dl>
+        </article>
+      {% endif %}
+      <article class="scenario-record"><div><span class="preview-step">AUTOMATION · SUPPORT</span><h3>Case #{{ scenario.case.id }}</h3></div><a href="/cases/{{ scenario.case.id }}?from_scenario={{ scenario.scenario_id }}">Open inquiry ↗</a>
+        <p class="message">{{ scenario.case.message }}</p>
+        <dl><dt>Triage state</dt><dd>{{ scenario.case.status.replace('_', ' ') }}</dd><dt>Category</dt><dd>{{ scenario.case.category.replace('_', ' ') }} · {{ scenario.case.confidence }}%</dd><dt>Draft</dt><dd>{{ scenario.case.draft or 'Not created' }}</dd><dt>Missing information</dt><dd>{{ scenario.case.missing_info or 'None recorded' }}</dd></dl>
+      </article>
+      <div class="revision-history">
+        <h3>Approval revisions</h3>
+        {% for approval in approvals %}
+          {% set action_execution = scenario.executions.get('approval:' ~ approval.id) %}
+          {% set approval_reconciliation = scenario.reconciliations.get(approval.id) %}
+          <article class="scenario-record">
+            <a href="/approvals/{{ approval.id }}?from_scenario={{ scenario.scenario_id }}">Approval #{{ approval.id }} · revision {{ approval.revision }} · {{ approval.proposed_action.replace('_', ' ') }} ↗</a>
+            <dl><dt>Decision</dt><dd>{{ approval.status }}{% if approval.actor %} · {{ approval.actor }}{% endif %}</dd><dt>Decision time</dt><dd>{{ approval.decision_at|utc }}</dd><dt>Execution status</dt><dd>{{ action_execution.state if action_execution else approval.execution_status.replace('_', ' ') }}</dd><dt>Attempts</dt><dd>{{ action_execution.attempts if action_execution else approval.attempts }}</dd></dl>
+        {% if approval_reconciliation %}<div class="notice {{ 'good' if approval_reconciliation.outcome == 'confirmed_completed' else 'warn' }}"><strong>{{ approval_reconciliation.outcome.replace('_', ' ') }}</strong><p>{{ approval_reconciliation.explanation }}</p><small>{{ approval_reconciliation.actor }} · {{ approval_reconciliation.created_at|utc }}{% if approval_reconciliation.reference %} · {{ approval_reconciliation.reference }}{% endif %}</small><p>The original ActionExecution remains {{ action_execution.state if action_execution else 'ambiguous' }}; this operator assertion did not query a provider.</p></div>{% endif %}
+            {% if approval.replacement_approval_id %}<small>Replaced by approval #{{ approval.replacement_approval_id }}</small>{% endif %}
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="box" aria-labelledby="scenario-action-title">
+      <div class="panelhead"><div><h2 id="scenario-action-title">Continue this scenario</h2><p>Choose the action supported by the current persisted state.</p></div></div>
+      {% if current.status == 'pending' %}
+        <a class="button" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Review pending decision ↗</a>
+        <p class="field-help">Approval executes one local mock action. Rejection records the decision without creating an execution.</p>
+      {% elif reconciliable %}
+        <div class="notice warn"><strong>Outcome uncertain · no automatic retry</strong><p>A timeout alone cannot establish whether the action completed. Record an operator conclusion and a reference for either definite outcome. No provider is queried.</p></div>
+        <form class="reconciliation-form" method="post" action="/approvals/{{ current.id }}/reconcile?from_scenario={{ scenario.scenario_id }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario_id" value="{{ scenario.scenario_id }}">
+          <label for="scenario-outcome">Operator's conclusion</label>
+          <select id="scenario-outcome" name="outcome" required><option value="still_unknown">Still unknown · keep recovery blocked</option><option value="confirmed_completed">Confirmed completed · close recovery</option><option value="confirmed_not_executed">Confirmed not executed · require a fresh approval</option></select>
+          <label for="scenario-explanation">Explanation</label><textarea id="scenario-explanation" name="explanation" minlength="10" maxlength="2000" required></textarea>
+          <label for="scenario-reference">Supporting reference</label><input id="scenario-reference" name="reference" maxlength="240"><p class="field-help">Required for either definite conclusion. Recorded exactly as supplied; not externally verified.</p>
+          <button>Record operator reconciliation</button>
+        </form>
+      {% elif current.execution_status in ['ambiguous', 'reconciled_completed', 'reconciled_not_executed'] and reconciliation %}
+        <div class="notice {{ 'good' if reconciliation.outcome == 'confirmed_completed' else 'warn' }}"><strong>{% if reconciliation.outcome == 'still_unknown' %}Outcome remains unknown{% else %}{{ reconciliation.outcome.replace('_', ' ') }}{% endif %}</strong><p>The original execution remains ambiguous. {% if reconciliation.outcome == 'still_unknown' %}Keep retry and replacement actions blocked pending new evidence. No provider was queried.{% else %}The recorded conclusion is an operator assertion; no provider was queried.{% endif %} {{ reconciliation.explanation }}</p></div>
+        {% if current.execution_status == 'reconciled_not_executed' and not current.replacement_approval_id %}<form method="post" action="/approvals/{{ current.id }}/refresh?from_scenario={{ scenario.scenario_id }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh pending approval</button></form>{% endif %}
+      {% elif current.execution_status == 'reconciled_not_executed' and not current.replacement_approval_id %}
+        <div class="notice warn"><strong>Fresh human review required</strong><p>Non-execution was recorded. This does not retry the old action.</p></div>
+        <form method="post" action="/approvals/{{ current.id }}/refresh"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh pending approval</button></form>
+      {% elif current.execution_status in ['queued', 'retryable'] and current.next_attempt_at and current.next_attempt_at > now %}
+        <div class="notice warn"><strong>Waiting for backoff</strong><p>Next eligible attempt: {{ current.next_attempt_at|utc }}. Preview does not run background workers.</p></div>
+        <a class="record-link" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Inspect retry details ↗</a>
+      {% elif current.execution_status in ['queued', 'retryable'] %}
+        <form method="post" action="/approvals/{{ current.id }}/preview-run?from_scenario={{ scenario.scenario_id }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario_id" value="{{ scenario.scenario_id }}"><button>Run one due local mock attempt</button></form>
+      {% elif current.execution_status == 'exhausted' %}
+        <a class="button" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Review attempts and queue recovery ↗</a>
+      {% elif current.execution_status == 'evidence_changed' %}
+        <a class="button" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Compare facts and review replacement ↗</a>
+      {% elif current.status == 'rejected' %}
+        <div class="notice"><strong>Scenario complete · rejected</strong><p>The decision is persisted; no execution exists.</p></div>
+      {% elif current.execution_status == 'succeeded' %}
+        <div class="notice good"><strong>Scenario complete · local mock succeeded</strong><p>The saved execution and audit history below verify the result.</p></div>
+      {% elif current.execution_status == 'reconciled_completed' %}
+        <div class="notice good"><strong>Scenario complete by operator assertion</strong><p>The original execution remains ambiguous. No provider was queried.</p></div>
+      {% else %}
+        <a class="record-link" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Open current approval and recovery guidance ↗</a>
+      {% endif %}
+
+      <div class="scenario-executions"><h3>Persisted executions</h3>
+        {% set execution_count = namespace(value=0) %}
+        {% for approval in approvals %}{% set action_execution = scenario.executions.get('approval:' ~ approval.id) %}
+          {% if action_execution %}{% set execution_count.value = execution_count.value + 1 %}<article><strong>{{ action_execution.state.replace('_', ' ') }}</strong><small>Approval #{{ approval.id }} · {{ action_execution.attempts }} attempts</small><small>Created {{ action_execution.created_at|utc }} · Updated {{ action_execution.updated_at|utc }}</small><p>{{ action_execution.detail or 'No execution detail recorded.' }}</p></article>{% endif %}
+        {% endfor %}
+        {% if execution_count.value == 0 %}<div class="empty">No execution record exists. This is expected for a pending or rejected scenario.</div>{% endif %}
+      </div>
+    </section>
+  </div>
+
+  <section class="box scenario-audit" aria-labelledby="scenario-audit-title">
+    <div class="panelhead"><div><h2 id="scenario-audit-title">Correlated audit history</h2><p class="mono">{{ scenario.correlation_id }} · showing up to 100 events</p></div><span class="count">{{ events|length }}</span></div>
+    <div class="timeline">{% for event in events %}<article class="event"><strong>{{ event.event.replace('_', ' ').capitalize() }}</strong><small>{{ event.created_at|utc }} · {{ event.actor }}</small><small>{{ event.entity_type }} #{{ event.entity_id }}</small>{% if event.entity_type in ['order', 'case', 'approval'] %}<a href="/{{ 'orders' if event.entity_type == 'order' else 'cases' if event.entity_type == 'case' else 'approvals' }}/{{ event.entity_id }}?from_scenario={{ scenario.scenario_id }}">Open event record ↗</a>{% endif %}{% if event.details %}<details><summary>Event details</summary><pre>{{ event.details|tojson(indent=2) }}</pre></details>{% endif %}</article>{% else %}<div class="empty">No audit events have been recorded for this scenario.</div>{% endfor %}</div>
+  </section>
+</main>
+{% endblock %}

@@ -8,7 +8,9 @@ from sqlalchemy.pool import StaticPool
 from app import main
 from app.db import Base, get_db
 from app.config import settings
-from app.models import Order, Delivery, Approval, ActionExecution, Case, utcnow
+from app.models import (
+    Order, Delivery, Approval, ActionExecution, ExecutionReconciliation, Case, utcnow,
+)
 from app.services import (
     process_delivery,
     create_approval as service_create_approval,
@@ -23,6 +25,7 @@ from app.services import (
     approval_freshness_differences,
     approval_freshness_comparison,
     queue_approval_retry,
+    reconcile_approval_execution,
 )
 
 engine = create_engine(
@@ -455,6 +458,174 @@ def test_ambiguous_action_outcome_blocks_blind_retry(monkeypatch):
         execute_approved(db, approval)
         db.commit()
         assert approval.execution_status == "ambiguous" and approval.attempts == 1
+
+
+def make_ambiguous_approval(subject_id):
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", subject_id, "send_reply",
+            {"draft": "Reviewed synthetic reply", "category": "order_status", "confidence": 80},
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        execute_approved(db, approval, mock_outcome="ambiguous")
+        db.commit()
+        return approval.id
+
+
+def test_reconciliation_records_operator_assertion_without_rewriting_ambiguous_execution():
+    token = sign_in()
+    approval_id = make_ambiguous_approval(2101)
+    form = {
+        "csrf_token": token,
+        "outcome": "confirmed_completed",
+        "explanation": "Operator checked the synthetic completion ledger.",
+        "reference": "SYNTH-LEDGER-2101",
+    }
+    response = client.post(f"/approvals/{approval_id}/reconcile", data=form, follow_redirects=False)
+    assert response.status_code == 303
+    with TestingSession() as db:
+        approval = db.get(Approval, approval_id)
+        execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        ))
+        reconciliation = db.scalar(select(ExecutionReconciliation).where(
+            ExecutionReconciliation.approval_id == approval_id
+        ))
+        assert approval.execution_status == "reconciled_completed"
+        assert execution.state == "ambiguous" and execution.attempts == 1
+        assert reconciliation.actor == "operator"
+        assert reconciliation.reference == "SYNTH-LEDGER-2101"
+        assert reconciliation.outcome == "confirmed_completed"
+    detail = client.get(f"/approvals/{approval_id}")
+    assert "Operator recorded completed" in detail.text
+    assert "no provider was queried" in detail.text
+    assert "Execution outcome reconciled" in detail.text
+
+    # Repeating the same submission is idempotent; a different assertion cannot overwrite it.
+    duplicate = client.post(f"/approvals/{approval_id}/reconcile", data=form, follow_redirects=False)
+    assert duplicate.status_code == 303
+    conflict = client.post(f"/approvals/{approval_id}/reconcile", data={
+        **form, "outcome": "confirmed_not_executed", "reference": "SYNTH-NO-EXEC-2101",
+    }, follow_redirects=False)
+    assert conflict.status_code == 409
+    with TestingSession() as db:
+        assert db.scalar(select(func.count()).select_from(ExecutionReconciliation).where(
+            ExecutionReconciliation.approval_id == approval_id
+        )) == 1
+
+
+def test_confirmed_nonexecution_requires_fresh_pending_approval_and_never_retries_old_revision():
+    approval_id = make_ambiguous_approval(2102)
+    with TestingSession() as db:
+        original = db.get(Approval, approval_id)
+        reconcile_approval_execution(
+            db, approval_id, "confirmed_not_executed",
+            "Synthetic review confirms no mock action was recorded.",
+            "SYNTH-REVIEW-2102", "operator", synthetic=True,
+        )
+        assert original.execution_status == "reconciled_not_executed"
+        original_execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        ))
+        assert original_execution.state == "ambiguous"
+        replacement = refresh_approval(db, approval_id, "operator")
+        replacement_id = replacement.id
+        assert replacement.status == "pending" and replacement.execution_status == "not_started"
+        execute_approved(db, original)
+        db.commit()
+        assert original.execution_status == "reconciled_not_executed"
+        assert original_execution.state == "ambiguous"
+    with TestingSession() as db:
+        replacement = decide_approval(db, replacement_id, "approved", "operator")
+        execute_approved(db, replacement)
+        db.commit()
+        assert replacement.execution_status == "succeeded"
+        original_execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        ))
+        assert original_execution.state == "ambiguous" and original_execution.attempts == 1
+        rows, _, _, _ = __import__("app.recovery", fromlist=["recovery_page"]).recovery_page(db)
+        assert all(row["record_id"] != approval_id for row in rows)
+
+
+def test_unknown_reconciliation_keeps_approval_uncertain_and_blocks_recovery_actions():
+    token = sign_in()
+    approval_id = make_ambiguous_approval(2103)
+    response = client.post(f"/approvals/{approval_id}/reconcile", data={
+        "csrf_token": token,
+        "outcome": "still_unknown",
+        "explanation": "Available synthetic information cannot confirm either outcome.",
+        "reference": "",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with TestingSession() as db:
+        approval = db.get(Approval, approval_id)
+        assert approval.execution_status == "ambiguous"
+        rows, _, _, _ = __import__("app.recovery", fromlist=["recovery_page"]).recovery_page(db, category="uncertain")
+        assert any(row["record_id"] == approval_id for row in rows)
+        with pytest.raises(ValueError, match="Only a pending, stale"):
+            refresh_approval(db, approval_id, "operator")
+    retry_response = client.post(f"/approvals/{approval_id}/retry", data={"csrf_token": token}, follow_redirects=False)
+    assert retry_response.status_code == 409
+    detail = client.get(f"/approvals/{approval_id}")
+    assert "Outcome remains unknown" in detail.text
+    assert "retries and replacement approvals remain blocked" in detail.text
+
+
+def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(monkeypatch):
+    from app.preview_scenarios import create_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    token = sign_in()
+    with TestingSession() as db:
+        approval = create_preview_scenario(db, "ambiguous", actor="operator")
+        approval_id = approval.id
+        correlation_id = approval.supporting_facts["correlation_id"]
+    page = client.get(f"/demo/scenarios/{approval_id}")
+    assert page.status_code == 200
+    assert f"{correlation_id}" in page.text
+    assert f"/orders/" in page.text and f"/cases/" in page.text
+    assert "Correlated audit history" in page.text
+    assert "Record operator reconciliation" in page.text
+    assert f"from_scenario={approval_id}" in page.text
+    result = client.post(
+        f"/approvals/{approval_id}/reconcile?from_scenario={approval_id}",
+        data={"csrf_token": token, "scenario_id": approval_id,
+              "outcome": "still_unknown",
+              "explanation": "Synthetic evidence leaves the outcome unknown.",
+              "reference": ""},
+        follow_redirects=False,
+    )
+    assert result.status_code == 303
+    assert result.headers["location"] == f"/demo/scenarios/{approval_id}"
+    refreshed = client.get(result.headers["location"])
+    assert "Outcome remains unknown" in refreshed.text
+    assert "No provider was queried" in refreshed.text
+
+    # A confirmed non-execution returns to the same scenario and offers only
+    # a new pending decision, never a retry of the ambiguous execution.
+    with TestingSession() as db:
+        confirmed = create_preview_scenario(db, "ambiguous", actor="operator")
+        confirmed_id = confirmed.id
+    reconciled = client.post(
+        f"/approvals/{confirmed_id}/reconcile?from_scenario={confirmed_id}",
+        data={"csrf_token": token, "scenario_id": confirmed_id,
+              "outcome": "confirmed_not_executed",
+              "explanation": "Synthetic review confirms no mock execution was saved.",
+              "reference": "SYNTH-FRESH-APPROVAL"},
+        follow_redirects=False,
+    )
+    assert reconciled.headers["location"] == f"/demo/scenarios/{confirmed_id}"
+    assert "Create a fresh pending approval" in client.get(reconciled.headers["location"]).text
+    replacement = client.post(
+        f"/approvals/{confirmed_id}/refresh?from_scenario={confirmed_id}",
+        data={"csrf_token": token}, follow_redirects=False,
+    )
+    assert replacement.status_code == 303
+    assert replacement.headers["location"].startswith("/demo/scenarios/")
+    replacement_page = client.get(replacement.headers["location"])
+    assert "Review the evidence and approve or reject the pending decision." in replacement_page.text
 
 
 def test_execution_is_bound_to_reviewed_action_and_evidence():
