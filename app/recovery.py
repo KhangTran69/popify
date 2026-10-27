@@ -22,7 +22,7 @@ RECOVERY_PRIORITY = {
 
 def _approval_category(now, prior_terminal):
     return case(
-        (Approval.execution_status == "ambiguous", "uncertain"),
+        (Approval.execution_status.in_(["ambiguous", "disputed"]), "uncertain"),
         (Approval.execution_status.in_(["invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]), "blocked"),
         (prior_terminal, "blocked"),
         (Approval.status == "pending", "pending"),
@@ -44,6 +44,8 @@ def _work_category(model, now):
 def recovery_union(now=None):
     now = now or utcnow()
     prior_revision = aliased(Approval)
+    latest_reconciliation = aliased(ExecutionReconciliation)
+    successor_reconciliation = aliased(ExecutionReconciliation)
     prior_execution_keys = select(
         (literal("approval:") + cast(prior_revision.id, String))
     ).where(
@@ -51,14 +53,20 @@ def recovery_union(now=None):
         prior_revision.subject_id == Approval.subject_id,
         prior_revision.id != Approval.id,
     )
+    latest_confirms_nonexecution = exists(
+        select(1).select_from(latest_reconciliation).where(
+            latest_reconciliation.action_execution_id == ActionExecution.id,
+            latest_reconciliation.outcome == "confirmed_not_executed",
+            ~exists(select(1).select_from(successor_reconciliation).where(
+                successor_reconciliation.previous_reconciliation_id == latest_reconciliation.id
+            )),
+        )
+    )
     has_prior_terminal = exists(
         select(1).select_from(ActionExecution).where(
             ActionExecution.idempotency_key.in_(prior_execution_keys),
             ActionExecution.state.in_(["started", "succeeded", "ambiguous"]),
-            ~exists(select(ExecutionReconciliation.id).where(
-                ExecutionReconciliation.action_execution_id == ActionExecution.id,
-                ExecutionReconciliation.outcome == "confirmed_not_executed",
-            )),
+            ~latest_confirms_nonexecution,
         )
     )
     approvals = select(
@@ -77,7 +85,7 @@ def recovery_union(now=None):
         Approval.replacement_approval_id.is_(None),
         or_(
             Approval.status == "pending",
-            Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "evidence_changed", "invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]),
+            Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "disputed", "evidence_changed", "invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]),
         ),
     )
     cases = select(

@@ -33,12 +33,12 @@
     </div>
   </section>
   <section class="panel">
-    <div class="panelhead"><div><h2>Scenario workspace</h2><p>Each state below is backed by a seeded synthetic approval and timeline. Open a record to inspect its evidence and supported next step.</p></div></div>
+    <div class="panelhead"><div><h2>Scenario workspace</h2><p>Saved examples show historical outcomes. Creating a run starts at a real pending human decision; the selected outcome is applied only after you approve or reject it.</p></div></div>
     <form method="post" action="/demo/preview/scenarios" class="inline-actions">
       <input type="hidden" name="csrf_token" value="{{ csrf }}">
-      <label for="scenario">Create a fresh isolated scenario</label>
-      <select id="scenario" name="scenario">{% for scenario in preview_scenarios %}<option value="{{ scenario }}">{{ scenario.replace('_', ' ')|capitalize }}</option>{% endfor %}</select>
-      <button>Create and inspect</button>
+      <label for="scenario">Start a new guided run (pending human decision)</label>
+      <select id="scenario" name="scenario">{% for scenario in preview_scenarios %}<option value="{{ scenario }}">{{ scenario.replace('_', ' ')|capitalize }} · {{ preview_scenario_descriptions[scenario] }}</option>{% endfor %}</select>
+      <button>Start guided run</button>
     </form>
     <div class="preview-example-grid">
       {% for approval in preview_examples %}

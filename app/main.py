@@ -23,7 +23,8 @@ from app.models import (
 from app.presentation import record_navigation, retry_guidance, snapshot_utc
 from app.recovery import RECOVERY_CATEGORIES, recovery_counts, recovery_page
 from app.preview_scenarios import (
-    SCENARIOS, create_preview_scenario, load_preview_scenario,
+    SCENARIOS, create_preview_scenario, start_preview_scenario,
+    execute_preview_approval, load_preview_scenario,
     preview_scenario_contains,
 )
 from app.services import (
@@ -36,6 +37,7 @@ from app.services import (
     prior_terminal_execution,
     queue_approval_retry,
     reconcile_approval_execution,
+    execution_reconciliation_history,
     ACTION_CONTRACTS,
     ApprovalEvidenceStale,
     queue_support,
@@ -431,6 +433,16 @@ def guided_demo_home(
             "preview_examples": preview_examples,
             "preview_reconciliations": preview_reconciliations,
             "preview_scenarios": SCENARIOS,
+            "preview_scenario_descriptions": {
+                "pending": "review and decide",
+                "success": "approve to save a successful mock result",
+                "rejected": "reject with no execution created",
+                "retryable": "observe a transient failure, then retry after backoff",
+                "exhausted": "inspect exhausted attempts and queue recovery",
+                "stale": "compare changed facts and create a replacement",
+                "ambiguous": "reconcile uncertain execution without blind retry",
+                "blocked": "review a blocked action contract without execution",
+            },
         },
     )
 
@@ -447,7 +459,7 @@ def preview_scenario_create(
     if not settings.preview_mode:
         raise HTTPException(404)
     try:
-        approval = create_preview_scenario(db, scenario, actor)
+        approval = start_preview_scenario(db, scenario, actor)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     return RedirectResponse(f"/demo/scenarios/{approval.id}", status_code=303)
@@ -462,14 +474,25 @@ def preview_scenario_detail(
 ):
     if not settings.preview_mode:
         raise HTTPException(404)
-    scenario = load_preview_scenario(db, approval_id)
+    try:
+        reconciliation_page = max(1, int(request.query_params.get("reconciliation_page", "1")))
+        revision_page = max(1, int(request.query_params.get("revision_page", "1")))
+        audit_page = max(1, int(request.query_params.get("audit_page", "1")))
+    except ValueError:
+        reconciliation_page, revision_page, audit_page = 1, 1, 1
+    scenario = load_preview_scenario(
+        db, approval_id, reconciliation_page, revision_page, audit_page
+    )
     if not scenario:
         raise HTTPException(404, "Synthetic scenario not found")
     current = scenario["current"]
     execution = scenario["executions"].get(f"approval:{current.id}")
     reconciliation = scenario["reconciliations"].get(current.id)
     status = current.execution_status
-    if current.status == "pending":
+    freshness_differences = approval_freshness_differences(db, current)
+    if current.status == "pending" and freshness_differences:
+        next_step = "The reviewed evidence is stale. Compare the saved snapshot with current facts before creating a replacement approval."
+    elif current.status == "pending":
         next_step = "Review the evidence and approve or reject the pending decision."
     elif current.status == "rejected":
         next_step = "This scenario is complete; the rejected action has no execution record."
@@ -477,8 +500,8 @@ def preview_scenario_detail(
         next_step = "This scenario is complete; inspect the persisted mock execution and audit events."
     elif status == "ambiguous" and reconciliation is None:
         next_step = "Record what is known about the ambiguous outcome. No provider lookup is performed."
-    elif status == "ambiguous" and reconciliation and reconciliation.outcome == "still_unknown":
-        next_step = "The outcome remains uncertain. Keep retries and replacement approvals blocked."
+    elif status in ("ambiguous", "disputed") and reconciliation and reconciliation.outcome in ("still_unknown", "conflicting_evidence"):
+        next_step = "The outcome remains uncertain. Append new supporting evidence; retries and replacement approvals stay blocked."
     elif status == "reconciled_completed":
         next_step = "This scenario is complete by operator assertion; the original execution remains ambiguous."
     elif status == "reconciled_not_executed":
@@ -491,6 +514,8 @@ def preview_scenario_detail(
         next_step = "Review the attempt history, then explicitly queue a manual recovery attempt."
     elif status == "evidence_changed":
         next_step = "Compare reviewed and current facts before creating a replacement approval."
+    elif status == "invalid_action":
+        next_step = "This action has no registered mock adapter. Inspect the blocked approval contract; no execution or retry is available."
     else:
         next_step = "Open the approval to review its supported recovery action."
 
@@ -506,8 +531,8 @@ def preview_scenario_detail(
         {"name": "Automation", "state": "complete" if automation_complete else "waiting",
          "detail": f"Support draft is {scenario['case'].status.replace('_', ' ')}.",
          "href": f"/cases/{scenario['case'].id}?from_scenario={scenario['scenario_id']}"},
-        {"name": "Human decision", "state": "complete" if decision_complete else "current",
-         "detail": f"{current.status}{' by ' + current.actor if current.actor else ''}.",
+        {"name": "Human decision", "state": "complete" if decision_complete else "attention" if freshness_differences else "current",
+         "detail": "Evidence changed after this approval was created." if freshness_differences else f"{current.status}{' by ' + current.actor if current.actor else ''}.",
          "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
         {"name": "Persisted outcome", "state": "complete" if result_complete else "attention",
          "detail": f"{status.replace('_', ' ')} · {current.attempts} attempts.",
@@ -529,7 +554,18 @@ def preview_scenario_detail(
             "stages": stages,
             "approvals": scenario["approvals"],
             "events": scenario["events"],
-            "reconciliable": bool(execution and execution.state == "ambiguous" and reconciliation is None),
+            "reconciliable": bool(execution and execution.state == "ambiguous"
+                                   and not current.replacement_approval_id
+                                   and current.execution_status in ("ambiguous", "disputed", "reconciled_completed", "reconciled_not_executed")),
+            "reconciliation_history": scenario["reconciliation_history"],
+            "reconciliation_page": scenario["reconciliation_page"],
+            "reconciliation_pages": scenario["reconciliation_pages"],
+            "approval_history": scenario["approval_history"],
+            "approval_page": scenario["approval_page"],
+            "approval_pages": scenario["approval_pages"],
+            "audit_page": scenario["audit_page"],
+            "audit_pages": scenario["audit_pages"],
+            "freshness_differences": freshness_differences,
         },
     )
 
@@ -962,10 +998,22 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
     current_order = None
     freshness_differences = []
     approval_history = []
+    approval_history_total = 0
+    approval_history_page = 1
+    approval_history_pages = 1
+    latest_approval = None
     approval_revision_rows = []
     prior_approval = None
+    prior_blocking_approval = None
+    prior_blocking_execution = None
     refresh_blocked_by_execution = False
     reconciliation = None
+    previous_reconciliation = None
+    reconciliation_history = []
+    reconciliation_history_total = 0
+    reconciliation_history_page = 1
+    reconciliation_history_pages = 1
+    reconciliation_page_url = ""
     ambiguous_execution = None
     if kind == "approval":
         subject = db.get(Order if entity.subject_type == "order" else Case, entity.subject_id)
@@ -978,18 +1026,53 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
         )
         if prior_execution and prior_execution.state == "ambiguous":
             ambiguous_execution = prior_execution
-            reconciliation = db.scalar(
-                select(ExecutionReconciliation).where(
-                    ExecutionReconciliation.action_execution_id == prior_execution.id
-                )
+            try:
+                reconciliation_history_page = int(request.query_params.get("reconciliation_page", "1"))
+            except ValueError:
+                reconciliation_history_page = 1
+            (reconciliation_history, reconciliation_history_total,
+             reconciliation_history_page, reconciliation_history_pages) = execution_reconciliation_history(
+                db, prior_execution.id, reconciliation_history_page
             )
+            reconciliation = db.scalar(
+                select(ExecutionReconciliation)
+                .where(ExecutionReconciliation.action_execution_id == prior_execution.id)
+                .order_by(ExecutionReconciliation.revision.desc(), ExecutionReconciliation.id.desc())
+                .limit(1)
+            )
+            if reconciliation_history_pages > 1:
+                page_params = {"reconciliation_page": reconciliation_history_page}
+                separator = "&" if detail_query else "?"
+                reconciliation_page_url = detail_query + separator + urlencode(page_params)
+            if reconciliation and reconciliation.previous_reconciliation_id:
+                previous_reconciliation = db.get(
+                    ExecutionReconciliation, reconciliation.previous_reconciliation_id
+                )
+        prior_blocking_execution = prior_terminal_execution(db, entity)
+        if prior_blocking_execution:
+            blocker_key = prior_blocking_execution.idempotency_key
+            if blocker_key.startswith("approval:") and blocker_key.removeprefix("approval:").isdigit():
+                prior_blocking_approval = db.get(
+                    Approval, int(blocker_key.removeprefix("approval:"))
+                )
         refresh_blocked_by_execution = bool(
             prior_execution and prior_execution.state in ("started", "succeeded", "ambiguous")
             and not (reconciliation and reconciliation.outcome == "confirmed_not_executed")
         )
-        refresh_blocked_by_execution = refresh_blocked_by_execution or bool(
-            prior_terminal_execution(db, entity)
-        )
+        refresh_blocked_by_execution = refresh_blocked_by_execution or bool(prior_blocking_execution)
+        approval_history_total = db.scalar(
+            select(func.count()).select_from(Approval).where(
+                Approval.subject_type == entity.subject_type,
+                Approval.subject_id == entity.subject_id,
+                Approval.id != entity.id,
+            )
+        ) or 0
+        approval_history_pages = max(1, (approval_history_total + 19) // 20)
+        try:
+            approval_history_page = max(1, int(request.query_params.get("revision_page", "1")))
+        except ValueError:
+            approval_history_page = 1
+        approval_history_page = min(approval_history_page, approval_history_pages)
         approval_history = db.scalars(
             select(Approval)
             .where(
@@ -998,8 +1081,18 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
                 Approval.id != entity.id,
             )
             .order_by(Approval.revision.desc(), Approval.id.desc())
+            .offset((approval_history_page - 1) * 20)
             .limit(20)
         ).all()
+        latest_approval = db.scalar(
+            select(Approval).where(
+                Approval.subject_type == entity.subject_type,
+                Approval.subject_id == entity.subject_id,
+                Approval.replacement_approval_id.is_(None),
+            ).order_by(Approval.revision.desc(), Approval.id.desc()).limit(1)
+        )
+        if latest_approval and latest_approval.id not in {entity.id, *(item.id for item in approval_history)}:
+            approval_history.append(latest_approval)
         prior_approval = db.scalar(
             select(Approval).where(Approval.replacement_approval_id == entity.id)
         )
@@ -1050,10 +1143,22 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "freshness_differences": freshness_differences,
             "freshness_comparison": approval_freshness_comparison(db, entity) if kind == "approval" else [],
             "approval_history": approval_history,
+            "approval_history_total": approval_history_total,
+            "approval_history_page": approval_history_page,
+            "approval_history_pages": approval_history_pages,
+            "latest_approval": latest_approval,
             "approval_revision_rows": approval_revision_rows,
             "prior_approval": prior_approval,
+            "prior_blocking_approval": prior_blocking_approval,
+            "prior_outcome_pending": bool(prior_blocking_execution),
             "refresh_blocked_by_execution": refresh_blocked_by_execution,
             "reconciliation": reconciliation,
+            "previous_reconciliation": previous_reconciliation,
+            "reconciliation_history": reconciliation_history,
+            "reconciliation_history_total": reconciliation_history_total,
+            "reconciliation_history_page": reconciliation_history_page,
+            "reconciliation_history_pages": reconciliation_history_pages,
+            "reconciliation_page_url": reconciliation_page_url,
             "ambiguous_execution": ambiguous_execution,
             "scenario_id": scenario_id,
             "refresh_supported": kind == "approval"
@@ -1152,9 +1257,7 @@ def approval_decision(
     try:
         approval = decide_approval(db, approval_id, decision, actor)
         if settings.preview_mode and decision == "approved":
-            # The disposable preview has no workflow runner. Execute only its
-            # registered mock adapter so the scenario records a real local result.
-            execute_approved(db, approval)
+            execute_preview_approval(db, approval, actor)
             db.commit()
     except LookupError:
         raise HTTPException(404)
@@ -1162,6 +1265,10 @@ def approval_decision(
         return detail_response("approval", approval_id, request, actor, db, status_code=409)
     except ValueError as exc:
         raise HTTPException(409, str(exc))
+    scenario_id = request.query_params.get("from_scenario")
+    if settings.preview_mode and scenario_id and preview_scenario_contains(db, scenario_id, "approval", approval_id):
+        scenario = load_preview_scenario(db, scenario_id)
+        return RedirectResponse(f"/demo/scenarios/{scenario['scenario_id']}", status_code=303)
     suffix, _ = record_navigation(request.query_params, "approval")
     return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 
@@ -1264,7 +1371,7 @@ def preview_run(
         raise HTTPException(409, "This preview action is not ready for a local mock attempt")
     if approval.next_attempt_at and as_utc(approval.next_attempt_at) > utcnow():
         raise HTTPException(409, "The recorded backoff deadline has not arrived")
-    execute_approved(db, approval)
+    execute_preview_approval(db, approval, actor)
     audit(db, "approval", approval.id, "preview_mock_attempt_requested", actor)
     db.commit()
     scenario_id = request.query_params.get("from_scenario")

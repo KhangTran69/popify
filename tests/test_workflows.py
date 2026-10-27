@@ -497,7 +497,7 @@ def test_reconciliation_records_operator_assertion_without_rewriting_ambiguous_e
         assert reconciliation.reference == "SYNTH-LEDGER-2101"
         assert reconciliation.outcome == "confirmed_completed"
     detail = client.get(f"/approvals/{approval_id}")
-    assert "Operator recorded completed" in detail.text
+    assert "Current conclusion · completed" in detail.text
     assert "no provider was queried" in detail.text
     assert "Execution outcome reconciled" in detail.text
 
@@ -507,11 +507,15 @@ def test_reconciliation_records_operator_assertion_without_rewriting_ambiguous_e
     conflict = client.post(f"/approvals/{approval_id}/reconcile", data={
         **form, "outcome": "confirmed_not_executed", "reference": "SYNTH-NO-EXEC-2101",
     }, follow_redirects=False)
-    assert conflict.status_code == 409
+    assert conflict.status_code == 303
     with TestingSession() as db:
-        assert db.scalar(select(func.count()).select_from(ExecutionReconciliation).where(
+        approval = db.get(Approval, approval_id)
+        rows = db.scalars(select(ExecutionReconciliation).where(
             ExecutionReconciliation.approval_id == approval_id
-        )) == 1
+        ).order_by(ExecutionReconciliation.revision)).all()
+        assert len(rows) == 2 and rows[1].outcome == "conflicting_evidence"
+        assert rows[1].asserted_outcome == "confirmed_not_executed"
+        assert approval.execution_status == "disputed"
 
 
 def test_confirmed_nonexecution_requires_fresh_pending_approval_and_never_retries_old_revision():
@@ -568,7 +572,7 @@ def test_unknown_reconciliation_keeps_approval_uncertain_and_blocks_recovery_act
     retry_response = client.post(f"/approvals/{approval_id}/retry", data={"csrf_token": token}, follow_redirects=False)
     assert retry_response.status_code == 409
     detail = client.get(f"/approvals/{approval_id}")
-    assert "Outcome remains unknown" in detail.text
+    assert "Current conclusion · still unknown" in detail.text
     assert "retries and replacement approvals remain blocked" in detail.text
 
 
@@ -587,7 +591,7 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
     assert f"{correlation_id}" in page.text
     assert f"/orders/" in page.text and f"/cases/" in page.text
     assert "Correlated audit history" in page.text
-    assert "Record operator reconciliation" in page.text
+    assert "Append operator reconciliation" in page.text
     assert f"from_scenario={approval_id}" in page.text
     result = client.post(
         f"/approvals/{approval_id}/reconcile?from_scenario={approval_id}",
@@ -601,7 +605,8 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
     assert result.headers["location"] == f"/demo/scenarios/{approval_id}"
     refreshed = client.get(result.headers["location"])
     assert "Outcome remains unknown" in refreshed.text
-    assert "No provider was queried" in refreshed.text
+    assert "Append operator reconciliation" in refreshed.text
+    assert "no provider was queried" in refreshed.text
 
     # A confirmed non-execution returns to the same scenario and offers only
     # a new pending decision, never a retry of the ambiguous execution.
@@ -1993,3 +1998,215 @@ def test_guided_demo_does_not_present_failed_triage_as_complete():
     assert page.status_code == 200
     assert "Triage did not complete" in page.text
     assert "inspect the failure" in page.text
+
+
+def test_reconciliation_appends_unknown_then_definite_evidence_and_preserves_history():
+    approval_id = make_ambiguous_approval(2191)
+    with TestingSession() as db:
+        first = reconcile_approval_execution(
+            db, approval_id, "still_unknown",
+            "The first review cannot establish the provider outcome.", "", "operator", synthetic=True,
+        )
+        first_id = first.id
+        second = reconcile_approval_execution(
+            db, approval_id, "confirmed_not_executed",
+            "A later ledger review confirms no action was completed.", "SYNTH-LATER-2191", "operator2", synthetic=True,
+        )
+        execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        ))
+        assert second.revision == 2 and second.previous_reconciliation_id == first_id
+        assert second.outcome == "confirmed_not_executed"
+        assert execution.state == "ambiguous" and execution.attempts == 1
+        assert db.get(Approval, approval_id).execution_status == "reconciled_not_executed"
+        rows = db.scalars(select(ExecutionReconciliation).where(
+            ExecutionReconciliation.approval_id == approval_id
+        ).order_by(ExecutionReconciliation.revision)).all()
+        assert [(r.revision, r.outcome, r.actor) for r in rows] == [
+            (1, "still_unknown", "operator"), (2, "confirmed_not_executed", "operator2")
+        ]
+
+
+def test_conflicting_definite_reconciliation_is_visible_and_can_be_resolved():
+    approval_id = make_ambiguous_approval(2192)
+    with TestingSession() as db:
+        first = reconcile_approval_execution(
+            db, approval_id, "confirmed_completed",
+            "First source indicates the action was completed.", "SYNTH-COMPLETE-2192", "operator", synthetic=True,
+        )
+        conflict = reconcile_approval_execution(
+            db, approval_id, "confirmed_not_executed",
+            "A second source contradicts the first conclusion.", "SYNTH-NOEXEC-2192", "operator2", synthetic=True,
+        )
+        assert conflict.revision == 2 and conflict.previous_reconciliation_id == first.id
+        assert conflict.outcome == "conflicting_evidence"
+        assert conflict.asserted_outcome == "confirmed_not_executed"
+        assert db.get(Approval, approval_id).execution_status == "disputed"
+        resolved = reconcile_approval_execution(
+            db, approval_id, "confirmed_not_executed",
+            "A final reviewed ledger supports the second conclusion.", "SYNTH-FINAL-2192", "operator3", synthetic=True,
+        )
+        assert resolved.revision == 3 and resolved.previous_reconciliation_id == conflict.id
+        assert resolved.outcome == "confirmed_not_executed"
+        assert db.get(Approval, approval_id).execution_status == "reconciled_not_executed"
+        assert db.scalar(select(func.count()).select_from(ExecutionReconciliation).where(
+            ExecutionReconciliation.approval_id == approval_id
+        )) == 3
+
+
+def test_preview_scenario_creation_starts_pending_then_applies_named_mock_outcome(monkeypatch):
+    from app.preview_scenarios import start_preview_scenario, execute_preview_approval
+    monkeypatch.setattr(settings, "preview_mode", True)
+    with TestingSession() as db:
+        approval = start_preview_scenario(db, "retryable", "operator")
+        approval_id = approval.id
+        assert approval.status == "pending" and approval.execution_status == "not_started"
+        assert db.scalar(select(ActionExecution)) is None
+        decide_approval(db, approval_id, "approved", "operator")
+        execute_preview_approval(db, approval, "operator")
+        assert approval.execution_status == "retryable"
+        assert approval.attempts == 1
+        assert db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        )).state == "retryable"
+
+
+def test_preview_scenario_paginates_histories_without_hiding_current_state(monkeypatch):
+    from app.preview_scenarios import start_preview_scenario, load_preview_scenario, preview_scenario_contains
+    from app.models import Audit
+    from app.services import audit
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    with TestingSession() as db:
+        first = start_preview_scenario(db, "ambiguous", "operator")
+        original_id = first.id
+        previous = first
+        for revision in range(2, 22):
+            previous.status = "superseded"
+            replacement = create_approval(
+                db, previous.kind, previous.subject_type, previous.subject_id,
+                previous.proposed_action, previous.supporting_facts, revision=revision,
+            )
+            previous.replacement_approval_id = replacement.id
+            previous = replacement
+        current = previous
+        decide_approval(db, current.id, "approved", "operator")
+        execute_approved(db, current, mock_outcome="ambiguous")
+        db.commit()
+        for index in range(21):
+            reconcile_approval_execution(
+                db, current.id, "still_unknown",
+                f"Follow-up evidence review {index} leaves the result uncertain.",
+                "", f"operator-{index}", synthetic=True,
+            )
+        correlation_id = current.supporting_facts["correlation_id"]
+        for index in range(101):
+            audit(db, "case", current.subject_id, "preview_history_marker", "operator",
+                  details={"index": index}, correlation_id=correlation_id)
+        db.commit()
+        loaded = load_preview_scenario(
+            db, original_id, reconciliation_page=2, revision_page=2, audit_page=2
+        )
+        assert loaded["approval_pages"] == 2 and loaded["approval_page"] == 2
+        assert loaded["current"].id == current.id
+        assert loaded["current"] in loaded["approvals"]
+        assert loaded["reconciliation_pages"] == 2 and loaded["reconciliation_total"] == 21
+        assert loaded["reconciliations"][current.id].revision == 21
+        assert loaded["audit_pages"] == 2 and loaded["audit_page"] == 2
+        assert len(loaded["events"]) == loaded["audit_total"] - 100
+        assert any(event.event == "preview_history_marker" for event in loaded["events"])
+        assert any(event.event == "approval_requested" for event in loaded["events"])
+        assert preview_scenario_contains(db, original_id, "approval", current.id)
+
+
+def test_stale_preview_run_explains_comparison_then_creates_pending_replacement(monkeypatch):
+    from app.preview_scenarios import start_preview_scenario
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    token = sign_in()
+    with TestingSession() as db:
+        approval = start_preview_scenario(db, "stale", "operator")
+        approval_id = approval.id
+    scenario_page = client.get(f"/demo/scenarios/{approval_id}")
+    assert "Compare the saved snapshot with current facts" in scenario_page.text
+    assert "Evidence changed after this approval was created." in scenario_page.text
+    approval_page = client.get(f"/approvals/{approval_id}?from_scenario={approval_id}")
+    assert "Create replacement for current facts" in approval_page.text
+    assert "New synthetic customer information arrived after the approval snapshot." in approval_page.text
+    refreshed = client.post(
+        f"/approvals/{approval_id}/refresh?from_scenario={approval_id}",
+        data={"csrf_token": token}, follow_redirects=False,
+    )
+    assert refreshed.status_code == 303
+    assert refreshed.headers["location"].startswith("/demo/scenarios/")
+    with TestingSession() as db:
+        original = db.get(Approval, approval_id)
+        replacement = db.get(Approval, original.replacement_approval_id)
+        assert original.status == "superseded"
+        assert replacement.status == "pending" and replacement.execution_status == "not_started"
+        assert replacement.evidence_hash != original.evidence_hash
+
+
+def test_blocked_preview_scenario_requires_approval_and_never_executes(monkeypatch):
+    from app.preview_scenarios import start_preview_scenario, execute_preview_approval
+    monkeypatch.setattr(settings, "preview_mode", True)
+    sign_in()
+    with TestingSession() as db:
+        approval = start_preview_scenario(db, "blocked", "operator")
+        assert approval.status == "pending"
+        assert approval.proposed_action == "unsupported_demo_action"
+        decide_approval(db, approval.id, "approved", "operator")
+        execute_preview_approval(db, approval, "operator")
+        assert approval.execution_status == "invalid_action"
+        execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval.id}"
+        ))
+        assert execution is None
+        approval_id = approval.id
+        db.commit()
+    page = client.get(f"/demo/scenarios/{approval_id}")
+    assert "Blocked · no mock adapter is registered" in page.text
+    assert "No execution was created because the action contract has no registered mock adapter." in page.text
+
+
+def test_blocked_approval_links_blocker_and_requeues_after_confirmed_nonexecution():
+    token = sign_in()
+    with TestingSession() as db:
+        facts = {
+            "draft": "Reviewed refund response", "category": "refund", "confidence": 92,
+            "customer_message": "Please review this refund request.",
+            "policy": settings.store_policies["refund"], "missing_info": "",
+        }
+        blocker = create_approval(db, "support", "case", 2391, "send_reply", facts)
+        decide_approval(db, blocker.id, "approved", "operator")
+        execute_approved(db, blocker, mock_outcome="ambiguous")
+        db.commit()
+        alternate = service_create_approval(
+            db, "exception", "case", blocker.subject_id, "review_refund_request",
+            dict(blocker.supporting_facts), revision=2,
+        )
+        decide_approval(db, alternate.id, "approved", "operator")
+        execute_approved(db, alternate)
+        db.commit()
+        blocker_id, alternate_id = blocker.id, alternate.id
+        assert alternate.execution_status == "blocked_prior_outcome"
+
+    page = client.get(f"/approvals/{alternate_id}")
+    assert f"/approvals/{blocker_id}" in page.text
+    assert "Blocking approval" in page.text
+
+    with TestingSession() as db:
+        reconcile_approval_execution(
+            db, blocker_id, "confirmed_not_executed",
+            "The synthetic ledger confirms the earlier mock did not complete.",
+            "SYNTH-PRIOR-2391", "operator", synthetic=True,
+        )
+        alternate = queue_approval_retry(db, alternate_id, "operator")
+        assert alternate.execution_status == "queued"
+        execute_approved(db, alternate)
+        db.commit()
+        assert alternate.execution_status == "succeeded"
+        original_execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{blocker_id}"
+        ))
+        assert original_execution.state == "ambiguous" and original_execution.attempts == 1

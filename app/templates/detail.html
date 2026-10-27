@@ -57,7 +57,7 @@
           <dt>Decision</dt><dd><span class="pill {{ 'warn' if entity.status == 'pending' else 'good' if entity.status == 'approved' else 'bad' if entity.status == 'superseded' else '' }}">{{ entity.status }}</span>{% if entity.revision > 1 %}<small>Revision {{ entity.revision }}</small>{% endif %}</dd>
           <dt>Decided by</dt><dd>{{ entity.actor or 'Awaiting operator' }}</dd>
           <dt>Decision time</dt><dd>{{ entity.decision_at|utc }}</dd>
-          <dt>Execution</dt><dd><span class="pill {{ 'good' if entity.execution_status in ['succeeded', 'reconciled_completed'] else 'bad' if entity.execution_status in ['ambiguous', 'exhausted', 'evidence_changed', 'invalid_action'] else 'warn' }}">{{ entity.execution_status.replace('_', ' ') }}</span></dd>
+          <dt>Execution</dt><dd><span class="pill {{ 'good' if entity.execution_status in ['succeeded', 'reconciled_completed'] else 'bad' if entity.execution_status in ['ambiguous', 'disputed', 'exhausted', 'evidence_changed', 'invalid_action'] else 'warn' }}">{{ entity.execution_status.replace('_', ' ') }}</span></dd>
           <dt>Attempts</dt><dd>{{ entity.attempts }}</dd>
           <dt>Next attempt</dt><dd>{{ entity.next_attempt_at|utc }}</dd>
         </dl>
@@ -66,7 +66,7 @@
             <div class="evidence-comparison">{% for difference in freshness_comparison %}<article><strong>{{ difference.field }}</strong><small>{{ difference.reason }}</small><dl><dt>Reviewed</dt><dd>{{ difference.reviewed }}</dd><dt>Current</dt><dd>{{ difference.current }}</dd></dl></article>{% endfor %}</div>
           </div>
           {% if refresh_supported and (entity.status == 'pending' or entity.execution_status == 'evidence_changed') and not entity.replacement_approval_id and not refresh_blocked_by_execution %}
-            <form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh approval from current facts</button></form>
+            <form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create replacement for current facts</button></form>
           {% endif %}
         {% elif entity.status == 'superseded' %}
           <div class="notice">This pending revision was superseded before a decision was recorded.</div>
@@ -127,47 +127,43 @@
         {% elif entity.status == 'approved' and entity.execution_status in ['failed', 'retryable', 'exhausted', 'queued'] %}
           <div class="notice warn"><strong>{% if entity.execution_status == 'exhausted' %}Automatic retry budget used{% elif entity.execution_status == 'queued' %}Recovery attempt queued{% else %}Action needs another attempt{% endif %}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
           {% if preview_mode and preview_run_due %}<form method="post" action="/approvals/{{ entity.id }}/preview-run{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Run due local mock attempt</button></form>{% elif preview_mode and entity.execution_status == 'queued' %}<p class="field-help">The attempt remains queued until its recorded retry deadline.</p>{% elif entity.execution_status in ['failed', 'exhausted'] %}<form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue action retry</button></form>{% endif %}
-        {% elif entity.execution_status in ['ambiguous', 'reconciled_completed', 'reconciled_not_executed'] %}
-          {% if reconciliation %}
-            <div class="notice {{ 'good' if reconciliation.outcome == 'confirmed_completed' else 'warn' }} reconciliation-result">
-            <strong>{% if reconciliation.outcome == 'confirmed_completed' %}Operator recorded completed{% elif reconciliation.outcome == 'confirmed_not_executed' %}Operator recorded not executed{% else %}Outcome remains unknown{% endif %}</strong>
-              <p>The original execution record remains <strong>ambiguous</strong>. This is an operator assertion; no provider was queried and no action was retried. {{ entity.failure_detail }}</p>
-              <dl class="facts"><dt>Recorded by</dt><dd>{{ reconciliation.actor }}</dd><dt>Recorded at</dt><dd>{{ reconciliation.created_at|utc }}</dd><dt>Explanation</dt><dd>{{ reconciliation.explanation }}</dd><dt>Supporting reference</dt><dd>{{ reconciliation.reference or 'Not provided for an unknown outcome' }}</dd></dl>
+        {% elif entity.execution_status in ['ambiguous', 'disputed', 'reconciled_completed', 'reconciled_not_executed'] %}
+          {% if ambiguous_execution %}
+            {% if reconciliation %}
+              <div class="notice {{ 'good' if reconciliation.outcome == 'confirmed_completed' else 'warn' }} reconciliation-result">
+                <strong>{% if reconciliation.outcome == 'confirmed_completed' %}Current conclusion · completed{% elif reconciliation.outcome == 'confirmed_not_executed' %}Current conclusion · not executed{% elif reconciliation.outcome == 'conflicting_evidence' %}Conflicting evidence · recovery remains blocked{% else %}Current conclusion · still unknown{% endif %}</strong>
+                <p>The original execution remains recorded as ambiguous. These are operator assertions; no provider was queried and no action was retried.</p>
+                {% if reconciliation.outcome == 'conflicting_evidence' %}<p>Earlier conclusion: {{ previous_reconciliation.outcome.replace('_', ' ') if previous_reconciliation else 'Not recorded' }}. New assertion: {{ reconciliation.asserted_outcome.replace('_', ' ') }}.</p>{% endif %}
+                <p>{{ entity.failure_detail }}</p>
+              </div>
+              <div class="related revision-history"><h3>Reconciliation history · {{ reconciliation_history_total }} assertions</h3>{% for item in reconciliation_history %}<article><strong>Assertion {{ item.revision }} · {% if item.outcome == 'conflicting_evidence' %}conflicting evidence{% else %}{{ item.outcome.replace('_', ' ') }}{% endif %}{% if item.id == reconciliation.id %} · current{% endif %}</strong>{% if item.asserted_outcome %}<span>Operator asserted {{ item.asserted_outcome.replace('_', ' ') }}</span>{% endif %}<small>{{ item.actor }} · {{ item.created_at|utc }}{% if item.synthetic %} · Synthetic preview{% endif %}</small><p>{{ item.explanation }}</p><small>Reference: {{ item.reference or 'None supplied' }} · Audit correlation: {{ item.correlation_id }}</small></article>{% endfor %}
+                {% if reconciliation_history_pages > 1 %}<nav class="pagination" aria-label="Reconciliation history pages">{% if reconciliation_history_page > 1 %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}reconciliation_page={{ reconciliation_history_page - 1 }}">Newer assertions</a>{% endif %}<span>Page {{ reconciliation_history_page }} of {{ reconciliation_history_pages }}</span>{% if reconciliation_history_page < reconciliation_history_pages %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}reconciliation_page={{ reconciliation_history_page + 1 }}">Older assertions</a>{% endif %}</nav>{% endif %}
+              </div>
               {% if reconciliation.synthetic %}<span class="mode">Synthetic preview assertion</span>{% endif %}
-              {% if reconciliation.outcome == 'confirmed_not_executed' and not entity.replacement_approval_id and refresh_supported %}
-                <p>A new action still requires a separate human review.</p>
-                <form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh pending approval</button></form>
-              {% elif entity.replacement_approval_id %}<p>Fresh review: <a href="/approvals/{{ entity.replacement_approval_id }}{{ detail_query }}">Open replacement approval #{{ entity.replacement_approval_id }} ↗</a></p>{% endif %}
-            </div>
-          {% elif ambiguous_execution %}
-            <div class="notice warn"><strong>Outcome uncertain · retry blocked</strong><p>Record what the operator can support. A definite outcome requires a reference. Submitting this form does not query a provider, change the original execution result, or retry the action.</p></div>
-            <form class="reconciliation-form" method="post" action="/approvals/{{ entity.id }}/reconcile{{ detail_query }}">
-              <input type="hidden" name="csrf_token" value="{{ csrf }}">
-              {% if scenario_id %}<input type="hidden" name="scenario_id" value="{{ scenario_id }}">{% endif %}
-              <label for="reconcile-outcome">Operator's conclusion</label>
-              <select id="reconcile-outcome" name="outcome" required><option value="still_unknown">Still unknown · keep recovery blocked</option><option value="confirmed_completed">Confirmed completed · close recovery</option><option value="confirmed_not_executed">Confirmed not executed · require a fresh approval</option></select>
-              <label for="reconcile-explanation">Explanation</label><textarea id="reconcile-explanation" name="explanation" minlength="10" maxlength="2000" required aria-describedby="reconcile-help"></textarea>
-              <label for="reconcile-reference">Supporting reference</label><input id="reconcile-reference" name="reference" maxlength="240" aria-describedby="reconcile-help">
-              <p id="reconcile-help" class="field-help">Required for either definite conclusion. For example, enter the synthetic case note or review reference. This value is recorded as supplied and is not verified externally.</p>
-              <button>Record reconciliation</button>
-            </form>
-          {% else %}
-            <div class="notice error"><strong>Outcome uncertain · retry blocked</strong><p>No ambiguous execution record exists to reconcile. A maintainer must inspect the audit history; do not create a replacement or retry.</p></div>
-          {% endif %}
-        {% elif entity.execution_status in ['reconciled_completed', 'reconciled_not_executed'] and reconciliation %}
-          <div class="notice {{ 'good' if entity.execution_status == 'reconciled_completed' else 'warn' }}">
-            <strong>{{ 'Operator recorded completion' if entity.execution_status == 'reconciled_completed' else 'Operator recorded non-execution' }}</strong>
-            <p>The original ActionExecution state is still ambiguous. No provider was queried and no action was retried.</p>
-            <p>{{ reconciliation.explanation }}{% if reconciliation.reference %} · Reference: {{ reconciliation.reference }}{% endif %}</p>
-            <small>{{ reconciliation.actor }} · {{ reconciliation.created_at|utc }}{% if reconciliation.synthetic %} · Synthetic preview assertion{% endif %}</small>
-            {% if entity.execution_status == 'reconciled_not_executed' and not entity.replacement_approval_id and refresh_supported %}<form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh pending approval</button></form>{% endif %}
-          </div>
+              {% if reconciliation.outcome == 'confirmed_not_executed' and not entity.replacement_approval_id and refresh_supported %}<p>A new action still needs a separate human decision.</p><form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh pending approval</button></form>{% endif %}
+              {% if entity.replacement_approval_id %}<p>Current revision: <a href="/approvals/{{ entity.replacement_approval_id }}{{ detail_query }}">Open replacement approval #{{ entity.replacement_approval_id }} ↗</a>. Follow-up evidence must be recorded there.</p>{% endif %}
+            {% else %}<div class="notice warn"><strong>Outcome uncertain · retry blocked</strong><p>A timeout does not prove completion or non-execution. Record the evidence you can support. Definite conclusions require a reference.</p></div>{% endif %}
+            {% if entity.failure_detail and reconciliation %}<p class="field-help">{{ entity.failure_detail }}</p>{% endif %}
+            {% if not entity.replacement_approval_id %}
+              <form class="reconciliation-form" method="post" action="/approvals/{{ entity.id }}/reconcile{{ detail_query }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                {% if scenario_id %}<input type="hidden" name="scenario_id" value="{{ scenario_id }}">{% endif %}
+                <label for="reconcile-outcome">New operator conclusion</label>
+                <select id="reconcile-outcome" name="outcome" required><option value="still_unknown">Still unknown · keep recovery blocked</option><option value="confirmed_completed">Confirmed completed · close recovery</option><option value="confirmed_not_executed">Confirmed not executed · require a fresh approval</option></select>
+                <label for="reconcile-explanation">Evidence and explanation</label><textarea id="reconcile-explanation" name="explanation" minlength="10" maxlength="2000" required aria-describedby="reconcile-help"></textarea>
+                <label for="reconcile-reference">Supporting reference</label><input id="reconcile-reference" name="reference" maxlength="240" aria-describedby="reconcile-help">
+                <p id="reconcile-help" class="field-help">A definite conclusion requires a reference. New assertions are appended to history; the reference is stored as supplied and is not externally verified.</p>
+                <button>Append reconciliation</button>
+              </form>
+            {% endif %}
+          {% else %}<div class="notice error"><strong>Outcome uncertain · retry blocked</strong><p>No ambiguous execution record exists to reconcile. A maintainer must inspect the audit history; do not create a replacement or retry.</p></div>{% endif %}
         {% elif entity.execution_status == 'evidence_changed' %}
           <div class="notice error"><strong>Execution blocked.</strong><p>{% if refresh_blocked_by_execution %}The prior execution may have completed or has an uncertain outcome. Reconcile its persisted result before any replacement or retry.{% elif freshness_differences %}Review the current facts above and create a fresh pending approval before any further mock execution.{% else %}The stored execution contract does not match the reviewed action. A maintainer must reconcile the persisted execution before any replacement or retry.{% endif %}</p></div>
         {% elif entity.execution_status == 'invalid_action' %}
           <div class="notice error"><strong>Execution blocked.</strong><p>This action has no registered mock adapter. No retry or replacement can be created here; a maintainer must correct the action contract before the source item is reprocessed.</p></div>
         {% elif entity.execution_status == 'blocked_prior_outcome' %}
-          <div class="notice error"><strong>Another revision may already have acted.</strong><p>Reconcile the prior started, successful, or ambiguous execution. This revision cannot execute or retry until that persisted outcome is resolved.</p></div>
+          {% if prior_outcome_pending %}<div class="notice error"><strong>Another revision may already have acted.</strong><p>This revision cannot execute or retry until the earlier execution is resolved.</p>{% if prior_blocking_approval %}<p>Blocking approval: <a href="/approvals/{{ prior_blocking_approval.id }}{{ detail_query }}">Approval #{{ prior_blocking_approval.id }} · revision {{ prior_blocking_approval.revision }} · {{ prior_blocking_approval.execution_status.replace('_', ' ') }} ↗</a></p>{% else %}<p>The earlier execution record could not be linked to an approval. Ask a maintainer to inspect its persisted idempotency key.</p>{% endif %}</div>
+          {% else %}<div class="notice warn"><strong>Earlier execution confirmed not to have occurred.</strong><p>This previously approved action can be requeued after its current evidence is checked. If that evidence has changed, the record will move to stale review instead.</p></div><form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Requeue approved action</button></form>{% endif %}
         {% elif entity.execution_status == 'superseded' %}
           <div class="notice error"><strong>This approval has been replaced.</strong><p>Its evidence remains in the audit history, but it cannot execute. Open the replacement approval to review the current facts.</p></div>
         {% elif entity.execution_status == 'succeeded' %}
@@ -180,7 +176,7 @@
         <div class="related"><a href="/demo/{{ entity.supporting_facts.get('correlation_id').split(':')[-1] }}">← Back to guided run</a></div>
       {% endif %}
       {% if prior_approval %}<div class="notice">Revision {{ entity.revision }} replaces <a href="/approvals/{{ prior_approval.id }}{{ detail_query }}">approval #{{ prior_approval.id }} · revision {{ prior_approval.revision }} ↗</a>. Its decision and attempts remain in the audit history.</div>{% endif %}
-      {% if approval_revision_rows|length > 1 %}<div class="related revision-history"><h3>Approval revision history</h3>{% for row in approval_revision_rows %}{% set a = row.approval %}<article><a href="/approvals/{{ a.id }}{{ detail_query }}">Revision {{ a.revision }} · {{ a.proposed_action.replace('_', ' ') }} ↗</a><span>{{ a.status }} · {{ a.execution_status }} · {{ a.attempts }} attempts</span><small>Decision: {{ a.actor or 'Not decided' }} · {{ a.decision_at|utc }}</small>{% if row.replaced_from %}<small>Replaces revision of approval #{{ row.replaced_from }}</small>{% endif %}{% if row.replacement_event %}<small>Replacement reason: {{ row.replacement_event.details.get('differences', [])|join('; ') or 'Evidence was refreshed' }} · {{ row.replacement_event.actor }} · {{ row.replacement_event.created_at|utc }}</small>{% endif %}{% if a.replacement_approval_id %}<small>Replaced by approval #{{ a.replacement_approval_id }}</small>{% endif %}</article>{% endfor %}</div>{% endif %}
+      {% if approval_revision_rows|length > 1 %}<div class="related revision-history"><h3>Approval revision history · {{ approval_history_total + 1 }} total</h3>{% for row in approval_revision_rows %}{% set a = row.approval %}<article><a href="/approvals/{{ a.id }}{{ detail_query }}">Revision {{ a.revision }} · {{ a.proposed_action.replace('_', ' ') }} ↗</a><span>{{ a.status }} · {{ a.execution_status }} · {{ a.attempts }} attempts</span><small>Decision: {{ a.actor or 'Not decided' }} · {{ a.decision_at|utc }}</small>{% if row.replaced_from %}<small>Replaces revision of approval #{{ row.replaced_from }}</small>{% endif %}{% if row.replacement_event %}<small>Replacement reason: {{ row.replacement_event.details.get('differences', [])|join('; ') or 'Evidence was refreshed' }} · {{ row.replacement_event.actor }} · {{ row.replacement_event.created_at|utc }}</small>{% endif %}{% if a.replacement_approval_id %}<small>Replaced by approval #{{ a.replacement_approval_id }}</small>{% endif %}</article>{% endfor %}{% if approval_history_pages > 1 %}<nav class="pagination" aria-label="Approval revision history pages">{% if approval_history_page > 1 %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}revision_page={{ approval_history_page - 1 }}">More recent revisions</a>{% endif %}<span>Page {{ approval_history_page }} of {{ approval_history_pages }}{% if latest_approval %} · Current revision #{{ latest_approval.revision }} is linked above{% endif %}</span>{% if approval_history_page < approval_history_pages %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}revision_page={{ approval_history_page + 1 }}">Older revisions</a>{% endif %}</nav>{% endif %}</div>{% endif %}
       {% if related %}<div class="related"><h3>Related approvals</h3>{% for a in related %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · {{ a.proposed_action.replace('_', ' ') }} <span>{{ a.status }} →</span></a>{% endfor %}</div>{% endif %}
     </section>
     <section class="box"><div class="panelhead timeline-heading"><h2>Event timeline</h2><span class="count">{{ timeline|length }}</span></div>{% if timeline_limited or related_cases_limited %}<p class="field-help">Showing at most the latest 100 related events{% if related_cases_limited %} across the 100 most recent related support cases{% endif %}.</p>{% endif %}
