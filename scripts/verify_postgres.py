@@ -535,19 +535,76 @@ def run():
         with ThreadPoolExecutor(max_workers=2) as pool:
             outcomes = list(pool.map(conflicting_request,
                                      ["confirmed_completed", "confirmed_not_executed"]))
-        assert sum(result[0] == "ok" for result in outcomes) == 1, outcomes
+        assert all(result[0] == "ok" for result in outcomes), outcomes
+        assert "conflicting_evidence" in [result[1] for result in outcomes], outcomes
         with sessions() as db:
-            persisted = db.scalar(select(ExecutionReconciliation).where(
+            rows = db.scalars(select(ExecutionReconciliation).where(
                 ExecutionReconciliation.approval_id == conflicting_id
-            ))
-            assert persisted.outcome in ("confirmed_completed", "confirmed_not_executed")
-            assert db.get(Approval, conflicting_id).execution_status == (
-                "reconciled_completed" if persisted.outcome == "confirmed_completed"
-                else "reconciled_not_executed"
+            ).order_by(ExecutionReconciliation.revision)).all()
+            assert len(rows) == 2 and rows[1].outcome == "conflicting_evidence", rows
+            assert rows[1].previous_reconciliation_id == rows[0].id
+            disputed = db.get(Approval, conflicting_id)
+            assert disputed.execution_status == "disputed"
+            resolved = reconcile_approval_execution(
+                db, conflicting_id, "confirmed_not_executed",
+                "A later locked review confirms the action did not execute.",
+                f"SYNTH-CONCURRENT-RESOLVED-{conflicting_id}", "test-operator-2", synthetic=True,
             )
+            assert resolved.revision == 3 and resolved.outcome == "confirmed_not_executed"
+            assert resolved.previous_reconciliation_id == rows[1].id
+            original = db.scalar(select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{conflicting_id}"
+            ))
+            assert original.state == "ambiguous" and original.attempts == 1
+            assert disputed.execution_status == "reconciled_not_executed"
+
+        blocked_id = ambiguous_case("concurrent-blocker-release")
+        with sessions() as db:
+            blocker = db.get(Approval, blocked_id)
+            queued_approval = create_approval(
+                db, blocker.kind, blocker.subject_type, blocker.subject_id,
+                blocker.proposed_action, dict(blocker.supporting_facts), revision=2,
+            )
+            decide_approval(db, queued_approval.id, "approved", "test-operator")
+            execute_approved(db, queued_approval)
+            db.commit()
+            queued_id = queued_approval.id
+            assert queued_approval.execution_status == "blocked_prior_outcome"
+
+        def resolve_blocker():
+            with sessions() as db:
+                return reconcile_approval_execution(
+                    db, blocked_id, "confirmed_not_executed",
+                    "The isolated ledger confirms the earlier mock did not execute.",
+                    f"SYNTH-RELEASE-{blocked_id}", "test-operator", synthetic=True,
+                ).outcome
+
+        def release_new_approval():
+            with sessions() as db:
+                try:
+                    return queue_approval_retry(db, queued_id, "test-operator").execution_status
+                except ValueError:
+                    db.rollback()
+                    return "still_blocked"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            release_results = list(pool.map(lambda fn: fn(), (resolve_blocker, release_new_approval)))
+        assert release_results[0] == "confirmed_not_executed", release_results
+        with sessions() as db:
+            queued_approval = db.get(Approval, queued_id)
+            if queued_approval.execution_status == "blocked_prior_outcome":
+                queue_approval_retry(db, queued_id, "test-operator")
+            assert queued_approval.execution_status == "queued"
+            execute_approved(db, queued_approval)
+            db.commit()
+            assert queued_approval.execution_status == "succeeded"
+            original = db.scalar(select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{blocked_id}"
+            ))
+            assert original.state == "ambiguous" and original.attempts == 1
 
         print(
-            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, immutable idempotent/conflicting reconciliations, and repeated execution."
+            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, immutable reconciliation follow-ups, concurrent blocker resolution/requeue, and repeated execution."
         )
     finally:
         settings.shopify_webhook_secret = old_secret

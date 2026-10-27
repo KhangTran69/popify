@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func, text, exists
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 from app.config import settings
 from app.integrations import verify_shopify, generate_support_content
 from app.models import (
@@ -501,16 +501,42 @@ def prior_terminal_execution(db, approval):
     ).all()
     if not revision_ids:
         return None
+    latest_reconciliation = aliased(ExecutionReconciliation)
+    successor = aliased(ExecutionReconciliation)
+    confirmed_nonexecution = exists(
+        select(1).select_from(latest_reconciliation).where(
+            latest_reconciliation.action_execution_id == ActionExecution.id,
+            latest_reconciliation.outcome == "confirmed_not_executed",
+            ~exists(select(1).select_from(successor).where(
+                successor.previous_reconciliation_id == latest_reconciliation.id
+            )),
+        )
+    )
     return db.scalar(
         select(ActionExecution).where(
             ActionExecution.idempotency_key.in_([f"approval:{item}" for item in revision_ids]),
             ActionExecution.state.in_(["started", "succeeded", "ambiguous"]),
-            ~exists(select(ExecutionReconciliation.id).where(
-                ExecutionReconciliation.action_execution_id == ActionExecution.id,
-                ExecutionReconciliation.outcome == "confirmed_not_executed",
-            )),
+            ~confirmed_nonexecution,
         ).order_by(ActionExecution.id.desc())
     )
+
+
+def execution_reconciliation_history(db, execution_id, page=1):
+    """Return a bounded history page and its total for one execution."""
+    total = db.scalar(select(func.count()).select_from(ExecutionReconciliation).where(
+        ExecutionReconciliation.action_execution_id == execution_id
+    )) or 0
+    pages = max(1, (total + 19) // 20)
+    page = min(max(1, int(page or 1)), pages)
+    rows = db.scalars(
+        select(ExecutionReconciliation)
+        .where(ExecutionReconciliation.action_execution_id == execution_id)
+        .order_by(ExecutionReconciliation.revision.desc(), ExecutionReconciliation.id.desc())
+        .offset((page - 1) * 20)
+        .limit(20)
+    ).all()
+    rows.reverse()
+    return rows, total, page, pages
 
 
 def approval_freshness_differences(db, approval):
@@ -834,8 +860,9 @@ def queue_approval_retry(db, approval_id, actor):
     approval = lock_approval_lifecycle(db, approval_id)
     if approval.replacement_approval_id:
         raise ValueError("This approval was replaced and cannot be retried")
+    is_resolved_block = approval.execution_status == "blocked_prior_outcome"
     if approval.status != "approved" or approval.execution_status not in (
-        "failed", "retryable", "exhausted",
+        "failed", "retryable", "exhausted", "blocked_prior_outcome",
     ):
         raise ValueError("Action is not retryable; ambiguous outcomes require reconciliation")
     current_execution = db.scalar(
@@ -847,10 +874,31 @@ def queue_approval_retry(db, approval_id, actor):
         raise ValueError("The recorded execution may have completed; reconcile it before retrying")
     if prior_terminal_execution(db, approval):
         raise ValueError("Another approval revision has a terminal or uncertain outcome; reconcile it before retrying")
+    if is_resolved_block:
+        lock_approval_sources(db, approval)
+        differences = approval_freshness_differences(db, approval)
+        if differences:
+            approval.execution_status = "evidence_changed"
+            approval.failure_detail = "The earlier execution was confirmed not executed, but this approval's evidence is stale. Review current facts before creating a fresh approval."
+            audit(db, "approval", approval.id, "resolved_block_stale_evidence", actor,
+                  details={"differences": differences},
+                  correlation_id=(approval.supporting_facts or {}).get("correlation_id"))
+            db.commit()
+            return approval
+        if (approval.kind, approval.subject_type, approval.proposed_action) not in ACTION_CONTRACTS:
+            approval.execution_status = "invalid_action"
+            approval.failure_detail = "Execution blocked: the approved action has no registered mock adapter."
+            audit(db, "approval", approval.id, "action_execution_invalid_action", actor,
+                  details={"action": approval.proposed_action},
+                  correlation_id=(approval.supporting_facts or {}).get("correlation_id"))
+            db.commit()
+            return approval
     approval.execution_status = "queued"
+    approval.failure_detail = None
     if approval.next_attempt_at is None:
         approval.next_attempt_at = utcnow()
-    audit(db, "approval", approval.id, "manual_retry_queued", actor)
+    audit(db, "approval", approval.id,
+          "prior_outcome_resolved_requeued" if is_resolved_block else "manual_retry_queued", actor)
     db.commit()
     return approval
 
@@ -858,11 +906,7 @@ def queue_approval_retry(db, approval_id, actor):
 def reconcile_approval_execution(
     db, approval_id, outcome, explanation, reference, actor, synthetic=False
 ):
-    """Record one operator assertion about an ambiguous action outcome.
-
-    This never changes the original ActionExecution state or reruns the action.
-    A confirmed non-execution only allows a separately reviewed approval revision.
-    """
+    """Append an operator assertion without changing the original execution."""
     outcomes = {"confirmed_completed", "confirmed_not_executed", "still_unknown"}
     if outcome not in outcomes:
         raise ValueError("Choose a valid reconciliation outcome")
@@ -883,30 +927,62 @@ def reconcile_approval_execution(
     )
     if not execution:
         raise ValueError("No persisted execution is available to reconcile")
-    existing = db.scalar(
-        select(ExecutionReconciliation).where(
-            ExecutionReconciliation.action_execution_id == execution.id
-        )
+    latest = db.scalar(
+        select(ExecutionReconciliation)
+        .where(ExecutionReconciliation.action_execution_id == execution.id)
+        .order_by(ExecutionReconciliation.revision.desc(), ExecutionReconciliation.id.desc())
+        .limit(1)
     )
-    if existing:
+    asserted_outcome = outcome
+    if latest:
         same_request = (
-            existing.outcome == outcome
-            and existing.explanation == explanation
-            and existing.reference == reference
-            and existing.actor == actor
-            and existing.synthetic == bool(synthetic)
+            (latest.asserted_outcome or latest.outcome) == outcome
+            and latest.explanation == explanation
+            and latest.reference == reference
+            and latest.actor == actor
+            and latest.synthetic == bool(synthetic)
         )
         if same_request:
-            return existing
-        raise ValueError("This execution already has a reconciliation record")
-    if approval.status != "approved" or approval.execution_status != "ambiguous" or execution.state != "ambiguous":
-        raise ValueError("Only an unresolved ambiguous execution can be reconciled")
+            return latest
+        if approval.replacement_approval_id:
+            raise ValueError(
+                "This outcome has a replacement approval. Record new evidence on the current approval revision."
+            )
+    if approval.status != "approved" or execution.state != "ambiguous":
+        raise ValueError("Only an approved ambiguous execution can be reconciled")
+    if approval.execution_status not in (
+        "ambiguous", "disputed", "reconciled_completed", "reconciled_not_executed"
+    ):
+        raise ValueError("This approval is not in a state that supports reconciliation")
+
+    prior_definitive = db.scalar(
+        select(ExecutionReconciliation)
+        .where(
+            ExecutionReconciliation.action_execution_id == execution.id,
+            ExecutionReconciliation.outcome.in_(("confirmed_completed", "confirmed_not_executed")),
+        )
+        .order_by(ExecutionReconciliation.revision.desc(), ExecutionReconciliation.id.desc())
+        .limit(1)
+    )
+    conflict = bool(
+        latest
+        and latest.outcome != "conflicting_evidence"
+        and prior_definitive
+        and prior_definitive.outcome != outcome
+    )
+    if conflict:
+        asserted_outcome = outcome
+        outcome = "conflicting_evidence"
+    revision = (latest.revision + 1) if latest else 1
 
     correlation_id = (approval.supporting_facts or {}).get("correlation_id") or f"approval:{approval.id}"
     reconciliation = ExecutionReconciliation(
         action_execution_id=execution.id,
         approval_id=approval.id,
+        revision=revision,
+        previous_reconciliation_id=latest.id if latest else None,
         outcome=outcome,
+        asserted_outcome=asserted_outcome if conflict else None,
         explanation=explanation,
         reference=reference,
         actor=actor,
@@ -918,12 +994,15 @@ def reconcile_approval_execution(
         "confirmed_completed": "reconciled_completed",
         "confirmed_not_executed": "reconciled_not_executed",
         "still_unknown": "ambiguous",
+        "conflicting_evidence": "disputed",
     }[outcome]
     approval.failure_detail = (
         "Operator recorded the outcome as completed; the original execution remains ambiguous and no provider was queried."
         if outcome == "confirmed_completed"
         else "Operator recorded that no execution occurred; a new human approval is required before another mock action."
         if outcome == "confirmed_not_executed"
+        else f"Conflicting evidence: previous conclusion was {prior_definitive.outcome}; the new assertion is {asserted_outcome}. Keep action recovery blocked until a new supported conclusion is recorded."
+        if outcome == "conflicting_evidence"
         else "The outcome remains unknown; retries and replacement approvals remain blocked."
     )
     audit(
@@ -935,6 +1014,9 @@ def reconcile_approval_execution(
         details={
             "execution_id": execution.id,
             "outcome": outcome,
+            "asserted_outcome": asserted_outcome if conflict else None,
+            "revision": revision,
+            "previous_reconciliation_id": latest.id if latest else None,
             "explanation": explanation,
             "reference": reference,
             "original_execution_state": execution.state,
@@ -953,7 +1035,7 @@ def execute_approved(db, approval, mock_outcome=None):
         raise PermissionError("operator approval is required")
     if approval.replacement_approval_id:
         if approval.execution_status in (
-            "succeeded", "ambiguous", "reconciled_completed", "reconciled_not_executed"
+            "succeeded", "ambiguous", "disputed", "reconciled_completed", "reconciled_not_executed"
         ):
             return
         approval.execution_status = "superseded"
@@ -989,7 +1071,7 @@ def execute_approved(db, approval, mock_outcome=None):
         db.flush()
         return
     if execution and execution.state in ("succeeded", "ambiguous"):
-        if approval.execution_status not in ("reconciled_completed", "reconciled_not_executed"):
+        if approval.execution_status not in ("disputed", "reconciled_completed", "reconciled_not_executed"):
             approval.execution_status = execution.state
         return
     prior_execution = prior_terminal_execution(db, approval)

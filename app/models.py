@@ -165,23 +165,35 @@ class ActionExecution(Base):
 class ExecutionReconciliation(Base):
     __tablename__ = "execution_reconciliations"
     __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_reconciliation_revision"),
         CheckConstraint(
-            "outcome IN ('confirmed_completed', 'confirmed_not_executed', 'still_unknown')",
+            "outcome IN ('confirmed_completed', 'confirmed_not_executed', 'still_unknown', 'conflicting_evidence')",
             name="ck_reconciliation_outcome",
         ),
         CheckConstraint(
-            "outcome = 'still_unknown' OR reference IS NOT NULL",
+            "outcome IN ('still_unknown', 'conflicting_evidence') OR reference IS NOT NULL",
             name="ck_reconciliation_reference",
         ),
+        CheckConstraint(
+            "(outcome = 'conflicting_evidence' AND asserted_outcome IN ('confirmed_completed', 'confirmed_not_executed', 'still_unknown')) OR (outcome != 'conflicting_evidence' AND asserted_outcome IS NULL)",
+            name="ck_reconciliation_asserted_outcome",
+        ),
+        UniqueConstraint("action_execution_id", "revision", name="uq_reconciliation_execution_revision"),
+        UniqueConstraint("previous_reconciliation_id", name="uq_reconciliation_previous"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     action_execution_id: Mapped[int] = mapped_column(
-        ForeignKey("action_executions.id", ondelete="RESTRICT"), nullable=False, unique=True
+        ForeignKey("action_executions.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     approval_id: Mapped[int] = mapped_column(
-        ForeignKey("approvals.id", ondelete="RESTRICT"), nullable=False, unique=True
+        ForeignKey("approvals.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    previous_reconciliation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("execution_reconciliations.id", ondelete="RESTRICT"), nullable=True
     )
     outcome: Mapped[str] = mapped_column(String(32))
+    asserted_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
     explanation: Mapped[str] = mapped_column(Text)
     reference: Mapped[str | None] = mapped_column(String(240), nullable=True)
     actor: Mapped[str] = mapped_column(String(120))
