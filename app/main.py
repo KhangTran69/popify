@@ -16,10 +16,16 @@ import httpx
 from sqlalchemy.orm import Session, selectinload
 from app.db import Base, engine, get_db
 from app.config import settings
-from app.models import Order, Delivery, Case, Approval, Audit, ActionExecution, utcnow
+from app.models import (
+    Order, Delivery, Case, Approval, Audit, ActionExecution,
+    ExecutionReconciliation, utcnow,
+)
 from app.presentation import record_navigation, retry_guidance, snapshot_utc
 from app.recovery import RECOVERY_CATEGORIES, recovery_counts, recovery_page
-from app.preview_scenarios import SCENARIOS, create_preview_scenario
+from app.preview_scenarios import (
+    SCENARIOS, create_preview_scenario, load_preview_scenario,
+    preview_scenario_contains,
+)
 from app.services import (
     verify_shopify,
     process_delivery,
@@ -29,6 +35,7 @@ from app.services import (
     approval_freshness_comparison,
     prior_terminal_execution,
     queue_approval_retry,
+    reconcile_approval_execution,
     ACTION_CONTRACTS,
     ApprovalEvidenceStale,
     queue_support,
@@ -392,10 +399,25 @@ def guided_demo_home(
     request: Request, actor=Depends(operator), db: Session = Depends(get_db)
 ):
     preview_examples = (
-        db.scalars(select(Approval).order_by(Approval.id.desc()).limit(50)).all()
+        db.scalars(
+            select(Approval)
+            .where(Approval.replacement_approval_id.is_(None))
+            .order_by(Approval.id.desc())
+            .limit(50)
+        ).all()
         if settings.preview_mode
         else []
     )
+    preview_reconciliations = {}
+    if preview_examples:
+        preview_reconciliations = {
+            item.approval_id: item
+            for item in db.scalars(
+                select(ExecutionReconciliation)
+                .where(ExecutionReconciliation.approval_id.in_([item.id for item in preview_examples]))
+                .limit(50)
+            )
+        }
     return templates.TemplateResponse(
         request,
         "demo_preview.html" if settings.preview_mode else "demo.html",
@@ -407,6 +429,7 @@ def guided_demo_home(
             "delivery": None,
             "delay_hours": settings.order_delay_hours,
             "preview_examples": preview_examples,
+            "preview_reconciliations": preview_reconciliations,
             "preview_scenarios": SCENARIOS,
         },
     )
@@ -427,7 +450,88 @@ def preview_scenario_create(
         approval = create_preview_scenario(db, scenario, actor)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    return RedirectResponse(f"/approvals/{approval.id}", status_code=303)
+    return RedirectResponse(f"/demo/scenarios/{approval.id}", status_code=303)
+
+
+@app.get("/demo/scenarios/{approval_id}", response_class=HTMLResponse)
+def preview_scenario_detail(
+    approval_id: int,
+    request: Request,
+    actor=Depends(operator),
+    db: Session = Depends(get_db),
+):
+    if not settings.preview_mode:
+        raise HTTPException(404)
+    scenario = load_preview_scenario(db, approval_id)
+    if not scenario:
+        raise HTTPException(404, "Synthetic scenario not found")
+    current = scenario["current"]
+    execution = scenario["executions"].get(f"approval:{current.id}")
+    reconciliation = scenario["reconciliations"].get(current.id)
+    status = current.execution_status
+    if current.status == "pending":
+        next_step = "Review the evidence and approve or reject the pending decision."
+    elif current.status == "rejected":
+        next_step = "This scenario is complete; the rejected action has no execution record."
+    elif status == "succeeded":
+        next_step = "This scenario is complete; inspect the persisted mock execution and audit events."
+    elif status == "ambiguous" and reconciliation is None:
+        next_step = "Record what is known about the ambiguous outcome. No provider lookup is performed."
+    elif status == "ambiguous" and reconciliation and reconciliation.outcome == "still_unknown":
+        next_step = "The outcome remains uncertain. Keep retries and replacement approvals blocked."
+    elif status == "reconciled_completed":
+        next_step = "This scenario is complete by operator assertion; the original execution remains ambiguous."
+    elif status == "reconciled_not_executed":
+        next_step = "Create a fresh pending approval before any new mock action."
+    elif status == "retryable" and current.next_attempt_at and as_utc(current.next_attempt_at) > utcnow():
+        next_step = f"Wait for the recorded retry deadline: {current.next_attempt_at.strftime('%d %b %Y · %H:%M UTC')}."
+    elif status == "retryable":
+        next_step = "Open the approval and run one explicit local mock recovery attempt."
+    elif status == "exhausted":
+        next_step = "Review the attempt history, then explicitly queue a manual recovery attempt."
+    elif status == "evidence_changed":
+        next_step = "Compare reviewed and current facts before creating a replacement approval."
+    else:
+        next_step = "Open the approval to review its supported recovery action."
+
+    automation_complete = bool(scenario["case"].draft and scenario["case"].status != "queued")
+    decision_complete = current.status in ("approved", "rejected")
+    result_complete = current.status == "rejected" or status in (
+        "succeeded", "reconciled_completed", "reconciled_not_executed"
+    )
+    stages = [
+        {"name": "Trigger", "state": "complete" if scenario["order"] and scenario["case"] else "blocked",
+         "detail": "Synthetic order and customer inquiry are saved.",
+         "href": f"/orders/{scenario['order'].id}?from_scenario={scenario['scenario_id']}" if scenario["order"] else ""},
+        {"name": "Automation", "state": "complete" if automation_complete else "waiting",
+         "detail": f"Support draft is {scenario['case'].status.replace('_', ' ')}.",
+         "href": f"/cases/{scenario['case'].id}?from_scenario={scenario['scenario_id']}"},
+        {"name": "Human decision", "state": "complete" if decision_complete else "current",
+         "detail": f"{current.status}{' by ' + current.actor if current.actor else ''}.",
+         "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
+        {"name": "Persisted outcome", "state": "complete" if result_complete else "attention",
+         "detail": f"{status.replace('_', ' ')} · {current.attempts} attempts.",
+         "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
+    ]
+    return templates.TemplateResponse(
+        request,
+        "demo_scenario.html",
+        {
+            "request": request,
+            "actor": actor,
+            "csrf": csrf(request),
+            "title": f"Scenario · {scenario['name'].title()}",
+            "scenario": scenario,
+            "current": current,
+            "execution": execution,
+            "reconciliation": reconciliation,
+            "next_step": next_step,
+            "stages": stages,
+            "approvals": scenario["approvals"],
+            "events": scenario["events"],
+            "reconciliable": bool(execution and execution.state == "ambiguous" and reconciliation is None),
+        },
+    )
 
 
 @app.post("/demo/start")
@@ -844,6 +948,16 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
         else f"{kind.title()} #{entity.id}"
     )
     detail_query, back_url = record_navigation(request.query_params, kind)
+    scenario_context = request.query_params.get("from_scenario", "")
+    scenario_id = None
+    if scenario_context:
+        if preview_scenario_contains(db, scenario_context, kind, record_id):
+            scenario_id = int(scenario_context)
+        else:
+            detail_query, back_url = record_navigation(
+                {key: value for key, value in request.query_params.items() if key != "from_scenario"},
+                kind,
+            )
     subject = None
     current_order = None
     freshness_differences = []
@@ -851,6 +965,8 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
     approval_revision_rows = []
     prior_approval = None
     refresh_blocked_by_execution = False
+    reconciliation = None
+    ambiguous_execution = None
     if kind == "approval":
         subject = db.get(Order if entity.subject_type == "order" else Case, entity.subject_id)
         current_order = subject if entity.subject_type == "order" else subject.order if subject else None
@@ -860,8 +976,16 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
                 ActionExecution.idempotency_key == f"approval:{entity.id}"
             )
         )
+        if prior_execution and prior_execution.state == "ambiguous":
+            ambiguous_execution = prior_execution
+            reconciliation = db.scalar(
+                select(ExecutionReconciliation).where(
+                    ExecutionReconciliation.action_execution_id == prior_execution.id
+                )
+            )
         refresh_blocked_by_execution = bool(
             prior_execution and prior_execution.state in ("started", "succeeded", "ambiguous")
+            and not (reconciliation and reconciliation.outcome == "confirmed_not_executed")
         )
         refresh_blocked_by_execution = refresh_blocked_by_execution or bool(
             prior_terminal_execution(db, entity)
@@ -929,6 +1053,9 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "approval_revision_rows": approval_revision_rows,
             "prior_approval": prior_approval,
             "refresh_blocked_by_execution": refresh_blocked_by_execution,
+            "reconciliation": reconciliation,
+            "ambiguous_execution": ambiguous_execution,
+            "scenario_id": scenario_id,
             "refresh_supported": kind == "approval"
             and (entity.kind, entity.subject_type, entity.proposed_action) in ACTION_CONTRACTS
             and not refresh_blocked_by_execution,
@@ -1054,8 +1181,48 @@ def refresh_approval_route(
         raise HTTPException(404)
     except ValueError as exc:
         raise HTTPException(409, str(exc))
+    candidate = request.query_params.get("from_scenario")
+    if (
+        settings.preview_mode and candidate
+        and preview_scenario_contains(db, candidate, "approval", replacement.id)
+    ):
+        scenario = load_preview_scenario(db, candidate)
+        return RedirectResponse(f"/demo/scenarios/{scenario['scenario_id']}", status_code=303)
     suffix, _ = record_navigation(request.query_params, "approval")
     return RedirectResponse(f"/approvals/{replacement.id}{suffix}", status_code=303)
+
+
+@app.post("/approvals/{approval_id}/reconcile")
+def reconcile_approval_route(
+    approval_id: int,
+    request: Request,
+    outcome: str = Form(...),
+    explanation: str = Form(...),
+    reference: str = Form(""),
+    scenario_id: int | None = Form(None),
+    csrf_token: str = Form(...),
+    actor=Depends(operator),
+    db: Session = Depends(get_db),
+):
+    verify_csrf(request, csrf_token)
+    try:
+        reconcile_approval_execution(
+            db, approval_id, outcome, explanation, reference, actor,
+            synthetic=settings.preview_mode,
+        )
+    except LookupError:
+        raise HTTPException(404)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    candidate = request.query_params.get("from_scenario") or scenario_id
+    if (
+        settings.preview_mode and candidate
+        and preview_scenario_contains(db, candidate, "approval", approval_id)
+    ):
+        scenario = load_preview_scenario(db, candidate)
+        return RedirectResponse(f"/demo/scenarios/{scenario['scenario_id']}", status_code=303)
+    suffix, _ = record_navigation(request.query_params, "approval")
+    return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 
 
 @app.post("/approvals/{approval_id}/retry")
@@ -1100,6 +1267,10 @@ def preview_run(
     execute_approved(db, approval)
     audit(db, "approval", approval.id, "preview_mock_attempt_requested", actor)
     db.commit()
+    scenario_id = request.query_params.get("from_scenario")
+    if scenario_id and preview_scenario_contains(db, scenario_id, "approval", approval_id):
+        scenario = load_preview_scenario(db, scenario_id)
+        return RedirectResponse(f"/demo/scenarios/{scenario['scenario_id']}", status_code=303)
     suffix, _ = record_navigation(request.query_params, "approval")
     return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 

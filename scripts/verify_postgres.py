@@ -15,7 +15,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 from app import main
 from app.config import settings
 from app.db import Base, engine, get_db
-from app.models import Order, Delivery, Case, Approval, ActionExecution, utcnow
+from app.models import Order, Delivery, Case, Approval, ActionExecution, ExecutionReconciliation, utcnow
 from app.services import (
     process_delivery,
     create_approval,
@@ -26,6 +26,7 @@ from app.services import (
     SupportRequestKeyConflict,
     refresh_approval,
     queue_approval_retry,
+    reconcile_approval_execution,
 )
 import app.services as services
 
@@ -463,8 +464,90 @@ def run():
             assert db.scalar(select(ActionExecution.attempts).where(
                 ActionExecution.idempotency_key == f"approval:{aid}"
             )) == 1
+        # Concurrent duplicate assertions are idempotent; conflicting claims
+        # serialize and leave exactly one immutable operator record.
+        def ambiguous_case(correlation):
+            with sessions() as db:
+                case = Case(
+                    message="Synthetic ambiguous outcome", category="order_status",
+                    confidence=80, draft="Reviewed draft", status="needs_review",
+                    missing_info="Verified order reference",
+                    correlation_id=correlation,
+                )
+                db.add(case)
+                db.flush()
+                approval = create_approval(
+                    db, "support", "case", case.id, "send_reply",
+                    {
+                        "order_number": None, "order_id": None, "customer_email": None,
+                        "case_order_ref": None, "order_email": None,
+                        "customer_message": case.message, "category": case.category,
+                        "confidence": case.confidence, "draft": case.draft,
+                        "policy": settings.store_policies[case.category],
+                        "order_fulfillment_status": None, "order_financial_status": None,
+                        "order_total": None, "order_source_updated_at": None,
+                        "missing_info": "Verified order reference",
+                        "case_status": case.status, "correlation_id": case.correlation_id,
+                    },
+                )
+                decide_approval(db, approval.id, "approved", "test-operator")
+                execute_approved(db, approval, mock_outcome="ambiguous")
+                db.commit()
+                return approval.id
+
+        def reconciliation_request(approval_id, outcome, explanation, reference):
+            with sessions() as db:
+                try:
+                    result = reconcile_approval_execution(
+                        db, approval_id, outcome, explanation, reference,
+                        "test-operator", synthetic=True,
+                    )
+                    return ("ok", result.outcome)
+                except ValueError:
+                    db.rollback()
+                    return ("conflict", None)
+
+        identical_id = ambiguous_case("concurrent-identical-reconciliation")
+        identical = (
+            identical_id, "confirmed_not_executed",
+            "Concurrent review confirms the synthetic action did not execute.",
+            "SYNTH-CONCURRENT-IDENTICAL",
+        )
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            outcomes = list(pool.map(lambda _: reconciliation_request(*identical), range(6)))
+        assert outcomes == [("ok", "confirmed_not_executed")] * 6, outcomes
+        with sessions() as db:
+            original = db.scalar(select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{identical_id}"
+            ))
+            assert original.state == "ambiguous" and original.attempts == 1
+            assert db.scalar(select(func.count(ExecutionReconciliation.id)).where(
+                ExecutionReconciliation.approval_id == identical_id
+            )) == 1
+
+        conflicting_id = ambiguous_case("concurrent-conflicting-reconciliation")
+        def conflicting_request(outcome):
+            return reconciliation_request(
+                conflicting_id, outcome,
+                "Concurrent review records one supported operator conclusion.",
+                f"SYNTH-CONCURRENT-{conflicting_id}",
+            )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(conflicting_request,
+                                     ["confirmed_completed", "confirmed_not_executed"]))
+        assert sum(result[0] == "ok" for result in outcomes) == 1, outcomes
+        with sessions() as db:
+            persisted = db.scalar(select(ExecutionReconciliation).where(
+                ExecutionReconciliation.approval_id == conflicting_id
+            ))
+            assert persisted.outcome in ("confirmed_completed", "confirmed_not_executed")
+            assert db.get(Approval, conflicting_id).execution_status == (
+                "reconciled_completed" if persisted.outcome == "confirmed_completed"
+                else "reconciled_not_executed"
+            )
+
         print(
-            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, and repeated execution (6 workers per repeated scenario)."
+            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, immutable idempotent/conflicting reconciliations, and repeated execution."
         )
     finally:
         settings.shopify_webhook_secret = old_secret

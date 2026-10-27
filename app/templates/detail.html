@@ -57,7 +57,7 @@
           <dt>Decision</dt><dd><span class="pill {{ 'warn' if entity.status == 'pending' else 'good' if entity.status == 'approved' else 'bad' if entity.status == 'superseded' else '' }}">{{ entity.status }}</span>{% if entity.revision > 1 %}<small>Revision {{ entity.revision }}</small>{% endif %}</dd>
           <dt>Decided by</dt><dd>{{ entity.actor or 'Awaiting operator' }}</dd>
           <dt>Decision time</dt><dd>{{ entity.decision_at|utc }}</dd>
-          <dt>Execution</dt><dd><span class="pill {{ 'good' if entity.execution_status == 'succeeded' else 'bad' if entity.execution_status in ['ambiguous', 'exhausted', 'evidence_changed', 'invalid_action'] else 'warn' }}">{{ entity.execution_status.replace('_', ' ') }}</span></dd>
+          <dt>Execution</dt><dd><span class="pill {{ 'good' if entity.execution_status in ['succeeded', 'reconciled_completed'] else 'bad' if entity.execution_status in ['ambiguous', 'exhausted', 'evidence_changed', 'invalid_action'] else 'warn' }}">{{ entity.execution_status.replace('_', ' ') }}</span></dd>
           <dt>Attempts</dt><dd>{{ entity.attempts }}</dd>
           <dt>Next attempt</dt><dd>{{ entity.next_attempt_at|utc }}</dd>
         </dl>
@@ -115,7 +115,7 @@
         {% if entity.kind == 'support' or entity.subject_type == 'case' %}{% set known = known + ['policy', 'category', 'confidence', 'draft', 'missing_info'] %}{% endif %}
         {% if entity.subject_type == 'order' %}{% set known = known + ['created_at', 'hours_threshold'] %}{% endif %}
         {% for key, value in facts.items() if key not in known %}<div class="fact"><strong>{{ key.replace('_', ' ').capitalize() }}</strong><div>{{ value }}</div></div>{% endfor %}
-        {% if entity.failure_detail %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
+        {% if entity.failure_detail and entity.execution_status == 'ambiguous' and reconciliation %}<div class="notice warn">{{ entity.failure_detail }}</div>{% elif entity.failure_detail and not (reconciliation or entity.execution_status in ['reconciled_completed', 'reconciled_not_executed']) %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
         {% if entity.status == 'pending' %}
           <div class="decision"><p>{% if preview_mode %}Approve to run the local mock adapter and save its result in the disposable database. Reject to close this request without running it. Workflow execution is disabled in preview.{% else %}Approving queues this mock action for n8n. Rejecting closes this request without executing it.{% endif %}</p>
             <form method="post" action="/approvals/{{ entity.id }}/decision{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}">{% if refresh_supported and not freshness_differences %}<button name="decision" value="approved">Approve mock action</button>{% else %}<span class="field-help">Approval is disabled until the evidence and action can be verified.</span>{% endif %} <button class="secondary" name="decision" value="rejected">Reject</button></form>
@@ -127,8 +127,41 @@
         {% elif entity.status == 'approved' and entity.execution_status in ['failed', 'retryable', 'exhausted', 'queued'] %}
           <div class="notice warn"><strong>{% if entity.execution_status == 'exhausted' %}Automatic retry budget used{% elif entity.execution_status == 'queued' %}Recovery attempt queued{% else %}Action needs another attempt{% endif %}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
           {% if preview_mode and preview_run_due %}<form method="post" action="/approvals/{{ entity.id }}/preview-run{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Run due local mock attempt</button></form>{% elif preview_mode and entity.execution_status == 'queued' %}<p class="field-help">The attempt remains queued until its recorded retry deadline.</p>{% elif entity.execution_status in ['failed', 'exhausted'] %}<form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue action retry</button></form>{% endif %}
-        {% elif entity.execution_status == 'ambiguous' %}
-          <div class="notice warn">Outcome uncertain. Automatic retry is blocked. Reconcile the recorded mock result using approval:{{ entity.id }} before taking further action.</div>
+        {% elif entity.execution_status in ['ambiguous', 'reconciled_completed', 'reconciled_not_executed'] %}
+          {% if reconciliation %}
+            <div class="notice {{ 'good' if reconciliation.outcome == 'confirmed_completed' else 'warn' }} reconciliation-result">
+            <strong>{% if reconciliation.outcome == 'confirmed_completed' %}Operator recorded completed{% elif reconciliation.outcome == 'confirmed_not_executed' %}Operator recorded not executed{% else %}Outcome remains unknown{% endif %}</strong>
+              <p>The original execution record remains <strong>ambiguous</strong>. This is an operator assertion; no provider was queried and no action was retried. {{ entity.failure_detail }}</p>
+              <dl class="facts"><dt>Recorded by</dt><dd>{{ reconciliation.actor }}</dd><dt>Recorded at</dt><dd>{{ reconciliation.created_at|utc }}</dd><dt>Explanation</dt><dd>{{ reconciliation.explanation }}</dd><dt>Supporting reference</dt><dd>{{ reconciliation.reference or 'Not provided for an unknown outcome' }}</dd></dl>
+              {% if reconciliation.synthetic %}<span class="mode">Synthetic preview assertion</span>{% endif %}
+              {% if reconciliation.outcome == 'confirmed_not_executed' and not entity.replacement_approval_id and refresh_supported %}
+                <p>A new action still requires a separate human review.</p>
+                <form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh pending approval</button></form>
+              {% elif entity.replacement_approval_id %}<p>Fresh review: <a href="/approvals/{{ entity.replacement_approval_id }}{{ detail_query }}">Open replacement approval #{{ entity.replacement_approval_id }} ↗</a></p>{% endif %}
+            </div>
+          {% elif ambiguous_execution %}
+            <div class="notice warn"><strong>Outcome uncertain · retry blocked</strong><p>Record what the operator can support. A definite outcome requires a reference. Submitting this form does not query a provider, change the original execution result, or retry the action.</p></div>
+            <form class="reconciliation-form" method="post" action="/approvals/{{ entity.id }}/reconcile{{ detail_query }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              {% if scenario_id %}<input type="hidden" name="scenario_id" value="{{ scenario_id }}">{% endif %}
+              <label for="reconcile-outcome">Operator's conclusion</label>
+              <select id="reconcile-outcome" name="outcome" required><option value="still_unknown">Still unknown · keep recovery blocked</option><option value="confirmed_completed">Confirmed completed · close recovery</option><option value="confirmed_not_executed">Confirmed not executed · require a fresh approval</option></select>
+              <label for="reconcile-explanation">Explanation</label><textarea id="reconcile-explanation" name="explanation" minlength="10" maxlength="2000" required aria-describedby="reconcile-help"></textarea>
+              <label for="reconcile-reference">Supporting reference</label><input id="reconcile-reference" name="reference" maxlength="240" aria-describedby="reconcile-help">
+              <p id="reconcile-help" class="field-help">Required for either definite conclusion. For example, enter the synthetic case note or review reference. This value is recorded as supplied and is not verified externally.</p>
+              <button>Record reconciliation</button>
+            </form>
+          {% else %}
+            <div class="notice error"><strong>Outcome uncertain · retry blocked</strong><p>No ambiguous execution record exists to reconcile. A maintainer must inspect the audit history; do not create a replacement or retry.</p></div>
+          {% endif %}
+        {% elif entity.execution_status in ['reconciled_completed', 'reconciled_not_executed'] and reconciliation %}
+          <div class="notice {{ 'good' if entity.execution_status == 'reconciled_completed' else 'warn' }}">
+            <strong>{{ 'Operator recorded completion' if entity.execution_status == 'reconciled_completed' else 'Operator recorded non-execution' }}</strong>
+            <p>The original ActionExecution state is still ambiguous. No provider was queried and no action was retried.</p>
+            <p>{{ reconciliation.explanation }}{% if reconciliation.reference %} · Reference: {{ reconciliation.reference }}{% endif %}</p>
+            <small>{{ reconciliation.actor }} · {{ reconciliation.created_at|utc }}{% if reconciliation.synthetic %} · Synthetic preview assertion{% endif %}</small>
+            {% if entity.execution_status == 'reconciled_not_executed' and not entity.replacement_approval_id and refresh_supported %}<form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh pending approval</button></form>{% endif %}
+          </div>
         {% elif entity.execution_status == 'evidence_changed' %}
           <div class="notice error"><strong>Execution blocked.</strong><p>{% if refresh_blocked_by_execution %}The prior execution may have completed or has an uncertain outcome. Reconcile its persisted result before any replacement or retry.{% elif freshness_differences %}Review the current facts above and create a fresh pending approval before any further mock execution.{% else %}The stored execution contract does not match the reviewed action. A maintainer must reconcile the persisted execution before any replacement or retry.{% endif %}</p></div>
         {% elif entity.execution_status == 'invalid_action' %}

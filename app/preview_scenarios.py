@@ -2,9 +2,12 @@
 
 import uuid
 from datetime import timedelta
+from sqlalchemy import select
 
 from app.config import settings
-from app.models import ActionExecution, Case, Order, utcnow
+from app.models import (
+    ActionExecution, Approval, Audit, Case, ExecutionReconciliation, Order, utcnow,
+)
 from app.services import audit, create_approval, decide_approval, execute_approved
 
 
@@ -35,6 +38,11 @@ def create_preview_scenario(db, name, actor="preview"):
     )
     db.add(record)
     db.flush()
+    audit(
+        db, "order", order.id, "preview_order_context_attached", actor,
+        details={"synthetic": True, "scenario": name},
+        correlation_id=record.correlation_id,
+    )
     audit(db, "case", record.id, "preview_scenario_created", actor,
           details={"scenario": name, "synthetic": True}, correlation_id=record.correlation_id)
     approval = create_approval(db, "support", "case", record.id, "send_reply", {
@@ -87,3 +95,79 @@ def create_preview_scenario(db, name, actor="preview"):
         execute_approved(db, approval, mock_outcome=None if name == "success" else name)
     db.commit()
     return approval
+
+
+def load_preview_scenario(db, approval_id):
+    """Load one bounded, correlated synthetic scenario for its guided record page."""
+    if not settings.preview_mode:
+        return None
+    selected = db.get(Approval, approval_id)
+    if not selected or selected.subject_type != "case":
+        return None
+    case = db.get(Case, selected.subject_id)
+    if not case or not (case.correlation_id or "").startswith("preview:"):
+        return None
+    order = db.get(Order, case.order_id) if case.order_id else None
+    approvals = db.scalars(
+        select(Approval)
+        .where(
+            Approval.subject_type == "case",
+            Approval.subject_id == case.id,
+        )
+        .order_by(Approval.revision, Approval.id)
+        .limit(20)
+    ).all()
+    leaf_approvals = [item for item in approvals if item.replacement_approval_id is None]
+    current = leaf_approvals[-1] if leaf_approvals else approvals[-1]
+    approval_ids = [item.id for item in approvals]
+    executions = db.scalars(
+        select(ActionExecution)
+        .where(ActionExecution.idempotency_key.in_([f"approval:{item}" for item in approval_ids]))
+        .order_by(ActionExecution.id)
+        .limit(20)
+    ).all() if approval_ids else []
+    reconciliations = db.scalars(
+        select(ExecutionReconciliation)
+        .where(ExecutionReconciliation.approval_id.in_(approval_ids))
+        .order_by(ExecutionReconciliation.created_at, ExecutionReconciliation.id)
+        .limit(20)
+    ).all() if approval_ids else []
+    events = db.scalars(
+        select(Audit)
+        .where(Audit.correlation_id == case.correlation_id)
+        .order_by(Audit.created_at.desc(), Audit.id.desc())
+        .limit(100)
+    ).all()
+    segments = case.correlation_id.split(":")
+    name = segments[1].replace("-", " ") if len(segments) > 1 else "scenario"
+    return {
+        "name": name,
+        "correlation_id": case.correlation_id,
+        "order": order,
+        "case": case,
+        "approvals": approvals,
+        "current": current,
+        "executions": {item.idempotency_key: item for item in executions},
+        "reconciliations": {item.approval_id: item for item in reconciliations},
+        "events": list(reversed(events)),
+        "scenario_id": current.id,
+    }
+
+
+def preview_scenario_contains(db, scenario_id, kind, record_id):
+    """Check record membership before accepting a scenario return destination."""
+    try:
+        scenario_id = int(scenario_id)
+        record_id = int(record_id)
+    except (TypeError, ValueError):
+        return False
+    scenario = load_preview_scenario(db, scenario_id)
+    if not scenario:
+        return False
+    if kind == "approval":
+        return any(item.id == record_id for item in scenario["approvals"])
+    if kind == "case":
+        return scenario["case"].id == record_id
+    if kind == "order":
+        return bool(scenario["order"] and scenario["order"].id == record_id)
+    return False

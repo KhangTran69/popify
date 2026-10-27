@@ -33,6 +33,10 @@ DEFAULT_QUEUE = {
 
 def record_navigation(query, kind=None):
     """Return safe detail URL suffix and a local back URL."""
+    scenario_id = query.get("from_scenario", "")
+    if len(scenario_id) <= 10 and scenario_id.isascii() and scenario_id.isdecimal() and 0 < int(scenario_id) < 2**31:
+        suffix = "?" + urlencode({"from_scenario": str(int(scenario_id))})
+        return suffix, f"/demo/scenarios/{int(scenario_id)}"
     demo_id = query.get("from_demo", "")
     if len(demo_id) <= 10 and demo_id.isascii() and demo_id.isdecimal() and 0 < int(demo_id) < 2**31:
         suffix = "?" + urlencode({"from_demo": demo_id})

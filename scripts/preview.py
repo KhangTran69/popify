@@ -58,6 +58,11 @@ def run():
                 db.add(record)
                 db.flush()
                 audit(
+                    db, "order", order.id, "preview_order_context_attached", "preview",
+                    details={"synthetic": True, "scenario": label},
+                    correlation_id=record.correlation_id,
+                )
+                audit(
                     db,
                     "case",
                     record.id,
