@@ -1,7 +1,7 @@
 import hashlib, logging, uuid
 import json
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select, func, text, exists
+from sqlalchemy import select, func, text, exists, literal, cast, String
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 from app.config import settings
@@ -491,16 +491,15 @@ def lock_approval_lifecycle(db, approval_id):
     return next(item for item in revisions if item.id == approval_id)
 
 
+def subject_execution_keys(subject_type, subject_id, excluding=None):
+    """Select execution keys in SQL without loading every subject revision."""
+    query = select(literal("approval:") + cast(Approval.id, String)).where(
+        Approval.subject_type == subject_type, Approval.subject_id == subject_id,
+    )
+    return query.where(Approval.id != excluding) if excluding is not None else query
+
+
 def prior_terminal_execution(db, approval):
-    revision_ids = db.scalars(
-        select(Approval.id).where(
-            Approval.subject_type == approval.subject_type,
-            Approval.subject_id == approval.subject_id,
-            Approval.id != approval.id,
-        )
-    ).all()
-    if not revision_ids:
-        return None
     latest_reconciliation = aliased(ExecutionReconciliation)
     successor = aliased(ExecutionReconciliation)
     confirmed_nonexecution = exists(
@@ -514,7 +513,9 @@ def prior_terminal_execution(db, approval):
     )
     return db.scalar(
         select(ActionExecution).where(
-            ActionExecution.idempotency_key.in_([f"approval:{item}" for item in revision_ids]),
+            ActionExecution.idempotency_key.in_(subject_execution_keys(
+                approval.subject_type, approval.subject_id, excluding=approval.id
+            )),
             ActionExecution.state.in_(["started", "succeeded", "ambiguous"]),
             ~confirmed_nonexecution,
         ).order_by(ActionExecution.id.desc())
@@ -747,7 +748,7 @@ def refresh_approval(db, approval_id, actor):
         )
     if prior_execution and prior_execution.state in ("started", "succeeded", "ambiguous"):
         raise ValueError(
-            "The prior execution may have completed; reconcile its outcome before creating a replacement."
+            "A prior execution is completed, started, or uncertain; inspect its outcome before creating a replacement."
         )
     differences = approval_freshness_differences(db, approval)
     if not differences and not reconciled_not_executed:
@@ -796,7 +797,7 @@ def refresh_approval(db, approval_id, actor):
     return replacement
 
 
-def decide_approval(db, approval_id, decision, actor):
+def decide_approval(db, approval_id, decision, actor, on_approved=None):
     if decision not in ("approved", "rejected"):
         raise ValueError("invalid decision")
     approval = lock_approval_lifecycle(db, approval_id)
@@ -843,6 +844,8 @@ def decide_approval(db, approval_id, decision, actor):
     if decision == "approved":
         approval.execution_status = "queued"
         approval.next_attempt_at = utcnow()
+        if on_approved:
+            on_approved(db, approval, actor)
     db.commit()
     return approval
 
@@ -871,9 +874,9 @@ def queue_approval_retry(db, approval_id, actor):
         )
     )
     if current_execution and current_execution.state in ("started", "succeeded", "ambiguous"):
-        raise ValueError("The recorded execution may have completed; reconcile it before retrying")
+        raise ValueError("The recorded execution may have completed; inspect its outcome before retrying")
     if prior_terminal_execution(db, approval):
-        raise ValueError("Another approval revision has a terminal or uncertain outcome; reconcile it before retrying")
+        raise ValueError("Another approval revision has a terminal or uncertain outcome; inspect it before retrying")
     if is_resolved_block:
         lock_approval_sources(db, approval)
         differences = approval_freshness_differences(db, approval)
@@ -944,10 +947,6 @@ def reconcile_approval_execution(
         )
         if same_request:
             return latest
-        if approval.replacement_approval_id:
-            raise ValueError(
-                "This outcome has a replacement approval. Record new evidence on the current approval revision."
-            )
     if approval.status != "approved" or execution.state != "ambiguous":
         raise ValueError("Only an approved ambiguous execution can be reconciled")
     if approval.execution_status not in (
@@ -1079,7 +1078,7 @@ def execute_approved(db, approval, mock_outcome=None):
         approval.execution_status = "blocked_prior_outcome"
         approval.failure_detail = (
             "Execution blocked: another approval revision has a started, successful, "
-            "or ambiguous outcome that must be reconciled first."
+            "or ambiguous outcome. Inspect that execution before taking further action."
         )
         audit(
             db, "approval", approval.id, "action_execution_blocked_prior_outcome",

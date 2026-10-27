@@ -29,6 +29,8 @@ from app.services import (
     reconcile_approval_execution,
 )
 import app.services as services
+from app.preview_scenarios import latest_reconciliations, unresolved_related_approvals, related_approval_ids
+from app.recovery import recovery_counts, recovery_page
 
 
 def run():
@@ -558,6 +560,94 @@ def run():
             assert original.state == "ambiguous" and original.attempts == 1
             assert disputed.execution_status == "reconciled_not_executed"
 
+        # Later evidence on the original execution and a replacement worker
+        # serialize on the subject lock. Either the worker completes first, or
+        # the contradictory evidence blocks it; neither order loses evidence.
+        later_evidence_id = ambiguous_case("concurrent-replaced-evidence")
+        with sessions() as db:
+            reconcile_approval_execution(
+                db, later_evidence_id, "confirmed_not_executed",
+                "The first isolated review found no completed action.",
+                "SYNTH-INITIAL-NO-ACTION", "test-operator", synthetic=True,
+            )
+            replacement = refresh_approval(db, later_evidence_id, "test-operator")
+            later_replacement_id = replacement.id
+            decide_approval(db, later_replacement_id, "approved", "test-operator")
+
+        def append_later_evidence():
+            with sessions() as db:
+                return reconcile_approval_execution(
+                    db, later_evidence_id, "confirmed_completed",
+                    "Later independent evidence suggests the first action completed.",
+                    "SYNTH-LATER-COMPLETION", "test-operator", synthetic=True,
+                ).outcome
+
+        def run_replacement():
+            with sessions() as db:
+                execute_approved(db, db.get(Approval, later_replacement_id))
+                db.commit()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            evidence_future = pool.submit(append_later_evidence)
+            worker_future = pool.submit(run_replacement)
+            assert evidence_future.result(timeout=10) == "conflicting_evidence"
+            worker_future.result(timeout=10)
+        with sessions() as db:
+            original = db.get(Approval, later_evidence_id)
+            replacement = db.get(Approval, later_replacement_id)
+            assert original.execution_status == "disputed"
+            assert latest_reconciliations(db, [later_evidence_id])[later_evidence_id].outcome == "conflicting_evidence"
+            assert unresolved_related_approvals(db, [later_replacement_id])[later_replacement_id] == later_evidence_id
+            rows, _, _, _ = recovery_page(db, category="uncertain", q=f"Approval #{later_evidence_id}")
+            assert recovery_counts(db)["uncertain"] >= 1
+            assert any(item["record_id"] == later_evidence_id for item in rows)
+            recorded = db.scalar(select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{later_replacement_id}"
+            ))
+            assert ((replacement.execution_status == "succeeded" and recorded and recorded.attempts == 1)
+                    or (replacement.execution_status == "blocked_prior_outcome" and recorded is None))
+            original_execution = db.scalar(select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{later_evidence_id}"
+            ))
+            assert original_execution.state == "ambiguous" and original_execution.attempts == 1
+            reconcile_approval_execution(
+                db, later_evidence_id, "confirmed_completed",
+                "A final independent review supports the completion conclusion.",
+                "SYNTH-FINAL-COMPLETION", "test-operator", synthetic=True,
+            )
+            assert related_approval_ids(db, [later_replacement_id], ("succeeded", "reconciled_completed"))[later_replacement_id] == later_evidence_id
+            execute_approved(db, replacement)
+            db.commit()
+            assert ((replacement.execution_status == "succeeded" and recorded and recorded.attempts == 1)
+                    or (replacement.execution_status == "blocked_prior_outcome" and recorded is None))
+
+        decision_replay_id = ambiguous_case("concurrent-preview-decision-replay")
+        with sessions() as db:
+            reconcile_approval_execution(
+                db, decision_replay_id, "confirmed_not_executed",
+                "The earlier action was not completed according to the isolated ledger.",
+                "SYNTH-DECISION-REPLAY", "test-operator", synthetic=True,
+            )
+            replay_replacement_id = refresh_approval(db, decision_replay_id, "test-operator").id
+
+        def decide_with_attempt(_):
+            with sessions() as db:
+                return decide_approval(
+                    db, replay_replacement_id, "approved", "test-operator",
+                    on_approved=lambda session, approval, actor: execute_approved(
+                        session, approval, mock_outcome="retryable"
+                    ),
+                ).execution_status
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            replay_states = list(pool.map(decide_with_attempt, range(6)))
+        assert replay_states == ["retryable"] * 6, replay_states
+        with sessions() as db:
+            replay_execution = db.scalar(select(ActionExecution).where(
+                ActionExecution.idempotency_key == f"approval:{replay_replacement_id}"
+            ))
+            assert replay_execution.state == "retryable" and replay_execution.attempts == 1
+
         blocked_id = ambiguous_case("concurrent-blocker-release")
         with sessions() as db:
             blocker = db.get(Approval, blocked_id)
@@ -604,7 +694,7 @@ def run():
             assert original.state == "ambiguous" and original.attempts == 1
 
         print(
-            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, immutable reconciliation follow-ups, concurrent blocker resolution/requeue, and repeated execution."
+            "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, immutable reconciliation follow-ups, later evidence racing replacement execution, duplicate decision callbacks, concurrent blocker resolution/requeue, and repeated execution."
         )
     finally:
         settings.shopify_webhook_secret = old_secret

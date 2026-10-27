@@ -80,6 +80,8 @@ For an interview walkthrough on the full local stack, open [Guided demo](http://
 
 Each isolated scenario stage names the saved customer inquiry, linked synthetic order and draft, human decision and actor, and persisted execution or rejection. The stage text is derived from the current records, so a retry or reconciliation is reflected after the operator acts. Stale approval form submissions are idempotent: replaying an old approval after rejection cannot change the saved decision or create an execution.
 
+The exhaustion run records one actual mock attempt at a time. Wait for each stored backoff deadline and run the next due attempt until the budget is used; then inspect the record and explicitly queue a recovery attempt. A replacement approval in an ambiguity run does not inject a second synthetic timeout. Earlier executions retain their own reconciliation history even after replacement: record later evidence on the original approval. Conflicting evidence returns that record to the uncertain recovery queue and blocks further related actions, while an already completed action remains recorded.
+
 The five stages shown in the walkthrough are:
 
 1. **Order intake:** a synthetic order event is persisted in PostgreSQL and processed by workflow 01.
@@ -110,7 +112,7 @@ Then wait for the order workflow or trigger it manually. A configured real Shopi
 
 ## Operator interface
 
-The overview, approval, and recovery screenshots below are retained captures from earlier isolated-preview reviews; none are evidence of live n8n execution. The scenario reconciliation desktop and mobile captures were refreshed from the current disposable SQLite preview on 27 October 2026 at 1280×813 and 390×844. They show synthetic records and do not verify n8n execution.
+The overview, approval, recovery, and earlier scenario screenshots below are retained captures from previous isolated-preview reviews. The later-evidence scenario captures show the current disposable SQLite preview at 1280×813 and 390×844, with a completed replacement and a link to the original disputed execution. All captures show synthetic records and do not verify n8n execution.
 
 ![Operator overview with recovery priority](docs/screenshots/overview-preview.jpg)
 ![Approval request, policy, order facts, and persisted retry recovery](docs/screenshots/approval-preview.png)
@@ -121,9 +123,11 @@ The overview, approval, and recovery screenshots below are retained captures fro
 ![Current isolated recovery workspace at mobile width](docs/screenshots/recovery-mobile-preview.png)
 ![Stale approval with reviewed and current evidence side by side](docs/screenshots/approval-freshness-preview.png)
 ![Guided ambiguous-outcome scenario and operator reconciliation at desktop width](docs/screenshots/scenario-reconciliation-desktop.jpg)
-![Guided scenario mobile layout with visible keyboard focus](docs/screenshots/scenario-reconciliation-mobile.jpg)
+![Earlier guided scenario mobile layout](docs/screenshots/scenario-reconciliation-mobile.jpg)
+![Later evidence on an earlier execution, desktop](docs/screenshots/scenario-later-evidence-desktop.jpg)
+![Later evidence on an earlier execution, mobile](docs/screenshots/scenario-later-evidence-mobile.jpg)
 
-The console includes overview metrics, order/support/approval/delivery queues, and one recovery workspace spanning pending decisions, waiting and eligible retries, exhausted attempts, stale evidence, uncertain outcomes, and blocked contracts. Dashboard totals and workspace rows share the same bounded query rules. Each state has a direct filter link; replaced approval revisions remain in history but are excluded from active recovery totals. Search, filters, and pagination are preserved through record navigation and decisions. Approval pages show source facts, revision lineage, and an audit timeline correlated to the support case or order. Delay review records retain threshold and timing evidence. Failed support cases and deliveries offer recovery controls; action failures explain retry timing and block blind retry of ambiguous results. Browser mutations require authenticated sessions and CSRF tokens.
+The console includes overview metrics, order/support/approval/delivery queues, and one recovery workspace spanning pending decisions, waiting and eligible retries, exhausted attempts, stale evidence, uncertain outcomes, and blocked contracts. Dashboard totals and workspace rows share the same bounded query rules. Each state has a direct filter link; replaced revisions leave active recovery totals unless later evidence makes their execution uncertain again. Search, filters, and pagination are preserved through record navigation and decisions. Approval pages show source facts, revision lineage, and an audit timeline correlated to the support case or order. Delay review records retain threshold and timing evidence. Failed support cases and deliveries offer recovery controls; action failures explain retry timing and block blind retry of ambiguous results. Browser mutations require authenticated sessions and CSRF tokens.
 
 Queued records offer a refresh control. POST buttons display a working state and disable duplicate submissions; server constraints and transactions provide the actual safety. Missing records, authentication failures, validation problems, and empty search results have readable states. No external font or image dependency is required.
 
@@ -132,7 +136,7 @@ Queued records offer a refresh control. POST buttons display a working state and
 - **Orders processed:** count of persisted order records, including historical synthetic fixtures.
 - **Pending approvals/open exceptions:** current pending tasks, not lifetime incident totals.
 - **Mock actions completed:** unique successful execution records.
-- **Recovery count:** active failed, retryable, exhausted, ambiguous, evidence-changed, or unsupported action records plus failed/exhausted deliveries and support cases. Replaced approval revisions are excluded. Each overview count links to the queue containing those records.
+- **Recovery count:** active failed, retryable, exhausted, ambiguous, evidence-changed, or unsupported action records plus failed/exhausted deliveries and support cases. Replaced approval revisions return to the uncertain count when later evidence disputes their execution. Each overview count links to the queue containing those records.
 - **Receipt to persistence:** mean duration across the latest 500 processed deliveries, with sample count. This includes queue wait and is not pure API latency.
 - **Automation activity:** actual authenticated worker calls. Older than three minutes is shown as no recent activity; this is not a claim that the n8n process is down. Last completed work is shown separately from idle polls.
 - **Worker failures:** a failed business attempt is recorded separately from idle polls and completed business work. A guided trigger request alone does not count as a worker call.
@@ -181,13 +185,13 @@ For authenticated integration intake, POST a JSON inquiry to `/api/support` with
 
 ```sh
 python -m pip install -r requirements-test.lock && python -m pip install --no-deps -e .
-python -m pytest -q
-python -m scripts.validate_workflows
-docker compose exec -T api python -m scripts.verify_migrations
-python -m scripts.preview --port 8002
-docker compose exec -T api python -m scripts.verify_postgres
-docker compose exec -T api python -m scripts.demo
+python -m scripts.verify local                 # behavior suite and workflow exports
+python -m scripts.verify preview --port 8002   # disposable UI; stop with Ctrl+C
+python -m scripts.verify postgres              # fresh/upgrade migrations and concurrency
+python -m scripts.verify demo                  # real local n8n workflow demonstration
 ```
+
+Run `postgres` and `demo` after starting the local Compose stack. The command reports an unavailable Docker daemon or missing required services with exit status 2; a failed check returns its error and stops subsequent checks. It never silently skips a requested check. PostgreSQL checks create and remove only their own disposable schemas. For a separately provisioned disposable PostgreSQL server, set `DATABASE_URL` to that server and run `python -m scripts.verify_migrations` and `python -m scripts.verify_postgres` directly.
 
 The behavior suite uses isolated SQLite, resets state between tests, and tests approval gating, reviewed-action/evidence binding, signature validation, stale events including subsecond source timestamps, grounding, missing flags, CSRF, authentication, pagination, revision-aware recovery filters, exact recovery links, bounded retries, delayed eligibility, exhaustion, append-only ambiguous reconciliation, conflicting evidence, prohibited transitions, scenario replay, history pagination, and requeue after a prior blocker is confirmed not executed. `scripts.verify_migrations` validates a fresh schema and a populated 0007 upgrade with an existing reconciliation; `scripts.verify_postgres.py` covers source-row locking, concurrent replacement, duplicate reconciliation, competing assertions, follow-up resolution, and concurrent blocker-resolution/requeue ordering. Both PostgreSQL verifiers use disposable schemas and never clear application tables.
 

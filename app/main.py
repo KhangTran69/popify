@@ -23,8 +23,9 @@ from app.models import (
 from app.presentation import record_navigation, retry_guidance, snapshot_utc
 from app.recovery import RECOVERY_CATEGORIES, recovery_counts, recovery_page
 from app.preview_scenarios import (
-    SCENARIOS, create_preview_scenario, start_preview_scenario,
-    execute_preview_approval, load_preview_scenario,
+    SCENARIOS, SCENARIO_GUIDANCE, create_preview_scenario, start_preview_scenario,
+    execute_preview_approval, load_preview_scenario, latest_reconciliations,
+    unresolved_related_approvals, related_approval_ids,
     preview_scenario_contains,
 )
 from app.services import (
@@ -410,16 +411,11 @@ def guided_demo_home(
         if settings.preview_mode
         else []
     )
-    preview_reconciliations = {}
-    if preview_examples:
-        preview_reconciliations = {
-            item.approval_id: item
-            for item in db.scalars(
-                select(ExecutionReconciliation)
-                .where(ExecutionReconciliation.approval_id.in_([item.id for item in preview_examples]))
-                .limit(50)
-            )
-        }
+    preview_reconciliations = latest_reconciliations(db, [item.id for item in preview_examples])
+    preview_related_uncertain = unresolved_related_approvals(db, [item.id for item in preview_examples])
+    preview_related_completed = related_approval_ids(
+        db, [item.id for item in preview_examples], ("succeeded", "reconciled_completed")
+    )
     return templates.TemplateResponse(
         request,
         "demo_preview.html" if settings.preview_mode else "demo.html",
@@ -432,17 +428,10 @@ def guided_demo_home(
             "delay_hours": settings.order_delay_hours,
             "preview_examples": preview_examples,
             "preview_reconciliations": preview_reconciliations,
+            "preview_related_uncertain": preview_related_uncertain,
+            "preview_related_completed": preview_related_completed,
             "preview_scenarios": SCENARIOS,
-            "preview_scenario_descriptions": {
-                "pending": "review and decide",
-                "success": "approve to save a successful mock result",
-                "rejected": "reject with no execution created",
-                "retryable": "observe a transient failure, then retry after backoff",
-                "exhausted": "inspect exhausted attempts and queue recovery",
-                "stale": "compare changed facts and create a replacement",
-                "ambiguous": "reconcile uncertain execution without blind retry",
-                "blocked": "review a blocked action contract without execution",
-            },
+            "preview_scenario_descriptions": SCENARIO_GUIDANCE,
         },
     )
 
@@ -488,9 +477,20 @@ def preview_scenario_detail(
     current = scenario["current"]
     execution = scenario["executions"].get(f"approval:{current.id}")
     reconciliation = scenario["reconciliations"].get(current.id)
+    blocker_id = unresolved_related_approvals(db, [current.id]).get(current.id)
+    if not blocker_id:
+        related_execution = prior_terminal_execution(db, current)
+        if related_execution and related_execution.idempotency_key.startswith("approval:"):
+            related_id = related_execution.idempotency_key.removeprefix("approval:")
+            blocker_id = int(related_id) if related_id.isdigit() else None
+    blocking_approval = db.get(Approval, blocker_id) if blocker_id else None
     status = current.execution_status
     freshness_differences = approval_freshness_differences(db, current)
-    if current.status == "pending" and freshness_differences:
+    if blocking_approval and blocking_approval.execution_status in ("ambiguous", "disputed"):
+        next_step = "A related execution has unresolved evidence. Review its original approval; any completed result remains recorded."
+    elif blocking_approval:
+        next_step = "A related execution is recorded as completed or still in progress. Inspect its approval before taking further action."
+    elif current.status == "pending" and freshness_differences:
         next_step = "The reviewed evidence is stale. Compare the saved snapshot with current facts before creating a replacement approval."
     elif current.status == "pending":
         next_step = "Review the evidence and approve or reject the pending decision."
@@ -528,8 +528,8 @@ def preview_scenario_detail(
         outcome_detail = "Rejected by the operator; no action execution was created."
     elif execution:
         outcome_detail = (
-            f"Mock execution is {execution.state.replace('_', ' ')} after "
-            f"{execution.attempts} attempt(s). {execution.detail or ''}"
+            f"Mock execution: {execution.state.replace('_', ' ')} after "
+            f"{execution.attempts} attempt{'s' if execution.attempts != 1 else ''}. {execution.detail or ''}"
         ).strip()
     elif status == "reconciled_completed":
         outcome_detail = "Operator recorded completion; the saved execution remains ambiguous."
@@ -577,9 +577,12 @@ def preview_scenario_detail(
             "csrf": csrf(request),
             "title": f"Scenario · {scenario['name'].title()}",
             "scenario": scenario,
+            "scenario_objective": SCENARIO_GUIDANCE[scenario["scenario_key"]],
             "current": current,
             "execution": execution,
             "reconciliation": reconciliation,
+            "blocking_approval": blocking_approval,
+            "preview_waiting": bool(current.next_attempt_at and as_utc(current.next_attempt_at) > utcnow()),
             "next_step": next_step,
             "stages": stages,
             "approvals": scenario["approvals"],
@@ -1181,6 +1184,11 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "prior_approval": prior_approval,
             "prior_blocking_approval": prior_blocking_approval,
             "prior_outcome_pending": bool(prior_blocking_execution),
+            "prior_blocking_state": (
+                "reconciled_completed" if prior_blocking_approval
+                and prior_blocking_approval.execution_status == "reconciled_completed"
+                else prior_blocking_execution.state if prior_blocking_execution else None
+            ),
             "refresh_blocked_by_execution": refresh_blocked_by_execution,
             "reconciliation": reconciliation,
             "previous_reconciliation": previous_reconciliation,
@@ -1194,6 +1202,10 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "refresh_supported": kind == "approval"
             and (entity.kind, entity.subject_type, entity.proposed_action) in ACTION_CONTRACTS
             and not refresh_blocked_by_execution,
+            "preview_can_demonstrate_blocked": settings.preview_mode
+            and kind == "approval" and entity.status == "pending"
+            and (entity.kind, entity.subject_type, entity.proposed_action) not in ACTION_CONTRACTS
+            and not entity.replacement_approval_id and not refresh_blocked_by_execution,
             "timeline_limited": len(timeline) == 100,
             "related_cases_limited": related_cases_limited,
         },
@@ -1285,14 +1297,10 @@ def approval_decision(
     if decision not in ("approved", "rejected"):
         raise HTTPException(422, "invalid decision")
     try:
-        approval = decide_approval(db, approval_id, decision, actor)
-        if (
-            settings.preview_mode
-            and approval.status == "approved"
-            and approval.execution_status in ("queued", "retryable")
-        ):
-            execute_preview_approval(db, approval, actor)
-            db.commit()
+        approval = decide_approval(
+            db, approval_id, decision, actor,
+            on_approved=execute_preview_approval if settings.preview_mode else None,
+        )
     except LookupError:
         raise HTTPException(404)
     except ApprovalEvidenceStale:

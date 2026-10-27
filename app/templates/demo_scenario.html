@@ -6,7 +6,7 @@
     <div>
       <div class="eyebrow">GUIDED SCENARIO · ISOLATED PREVIEW</div>
       <h1>{{ scenario.name|title }}</h1>
-      <p class="sub">Follow this synthetic journey from its trigger through a human decision and persisted result. A new run starts pending; approving applies its named mock outcome.</p>
+      <p class="sub">{{ scenario_objective }} Follow this synthetic journey from its trigger through the human decision and persisted result.</p>
     </div>
     <span class="mode"><i></i> Synthetic data · local mock only</span>
   </div>
@@ -14,6 +14,7 @@
   <section class="scenario-next notice warn" aria-labelledby="scenario-next-title">
     <div><span class="eyebrow">NEXT STEP · BASED ON SAVED RECORDS</span><h2 id="scenario-next-title">{{ next_step }}</h2>
       <p>Every action here affects only the temporary preview database. It does not call n8n, a provider, or an external service.</p>
+      {% if blocking_approval %}<p><a href="/approvals/{{ blocking_approval.id }}?from_scenario={{ scenario.scenario_id }}">Review related approval #{{ blocking_approval.id }} and its evidence ↗</a></p>{% endif %}
     </div>
   </section>
 
@@ -60,9 +61,12 @@
     <section class="box" aria-labelledby="scenario-action-title">
       <div class="panelhead"><div><h2 id="scenario-action-title">Continue this scenario</h2><p>Choose the action supported by the current persisted state. Starting another run preserves this one.</p></div></div>
       <form method="post" action="/demo/preview/scenarios" class="inline-actions"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="{{ scenario.scenario_key }}"><button class="secondary">Start another {{ scenario.name }} run</button></form>
-      {% if current.status == 'pending' %}
+      {% if blocking_approval %}
+        <div class="notice warn"><strong>Related outcome needs review</strong><p>Current approval: {{ current.status }} · {{ current.execution_status.replace('_', ' ') }}. Inspect the related execution before taking further action; completed results remain recorded.</p></div>
+        <a class="button" href="/approvals/{{ blocking_approval.id }}?from_scenario={{ scenario.scenario_id }}">Review related approval #{{ blocking_approval.id }} ↗</a>
+      {% elif current.status == 'pending' %}
         {% if freshness_differences %}<div class="notice warn"><strong>Evidence changed after this approval was created.</strong><p>Review the captured facts against the current order and inquiry before refreshing the approval.</p></div><a class="button" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Compare evidence and review replacement ↗</a>
-        {% else %}<a class="button" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Review pending decision ↗</a><p class="field-help">Approval executes one local mock action. Rejection records the decision without creating an execution.</p>{% endif %}
+        {% else %}<a class="button" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Review pending decision ↗</a><p class="field-help">{% if scenario.scenario_key == 'blocked' %}Approval records the decision and demonstrates the unsupported-action block; no execution is created.{% else %}Approval runs one local mock attempt. Rejection records the decision without creating an execution.{% endif %}</p>{% endif %}
       {% elif reconciliable %}
         {% if reconciliation %}<div class="notice {{ 'good' if reconciliation.outcome == 'confirmed_completed' else 'warn' }}"><strong>{% if reconciliation.outcome == 'conflicting_evidence' %}Conflicting evidence · recovery remains blocked{% elif reconciliation.outcome == 'still_unknown' %}Outcome remains unknown{% else %}Current conclusion · {{ reconciliation.outcome.replace('_', ' ') }}{% endif %}</strong><p>The original execution remains ambiguous. This is an operator assertion; no provider was queried. {% if reconciliation.outcome in ['still_unknown', 'conflicting_evidence'] %}Append newly supported evidence below; do not retry while the outcome is uncertain.{% endif %} {{ reconciliation.explanation }}</p></div>
         {% else %}<div class="notice warn"><strong>Outcome uncertain · no automatic retry</strong><p>A timeout alone cannot establish whether the action completed. Record an operator conclusion and a reference for either definite outcome. No provider is queried.</p></div>{% endif %}
@@ -77,7 +81,7 @@
         {% if current.execution_status == 'reconciled_not_executed' and not current.replacement_approval_id %}<form method="post" action="/approvals/{{ current.id }}/refresh?from_scenario={{ scenario.scenario_id }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="secondary">Create a fresh pending approval</button></form>{% endif %}
       {% elif current.execution_status in ['ambiguous', 'disputed', 'reconciled_completed', 'reconciled_not_executed'] and reconciliation %}
         <div class="notice warn"><strong>Recovery is blocked</strong><p>A supported action is unavailable for this approval. Inspect the recorded evidence and approval revision history.</p></div>
-      {% elif current.execution_status in ['queued', 'retryable'] and current.next_attempt_at and current.next_attempt_at > now %}
+      {% elif current.execution_status in ['queued', 'retryable'] and preview_waiting %}
         <div class="notice warn"><strong>Waiting for backoff</strong><p>Next eligible attempt: {{ current.next_attempt_at|utc }}. Preview does not run background workers.</p></div>
         <a class="record-link" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Inspect retry details ↗</a>
       {% elif current.execution_status in ['queued', 'retryable'] %}

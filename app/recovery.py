@@ -72,17 +72,19 @@ def recovery_union(now=None):
     approvals = select(
         literal("approval").label("source"), Approval.id.label("record_id"),
         (literal("Approval #") + cast(Approval.id, String) + literal(" · ") + Approval.proposed_action).label("label"),
-        func.coalesce(
-            Approval.failure_detail,
-            case((has_prior_terminal, "A prior approval outcome must be reconciled before this revision can act."),
-                 else_=literal("Human decision or action recovery required")),
+        case(
+            (Approval.execution_status.in_(["ambiguous", "disputed"]),
+             func.coalesce(Approval.failure_detail, literal("The execution outcome needs review"))),
+            (has_prior_terminal, literal("A related execution prevents this revision from acting; inspect its record.")),
+            else_=func.coalesce(Approval.failure_detail, literal("Human decision or action recovery required")),
         ).label("reason"),
         Approval.execution_status.label("raw_state"), Approval.attempts.label("attempts"),
         Approval.next_attempt_at.label("next_attempt_at"), Approval.created_at.label("occurred_at"),
         _approval_category(now, has_prior_terminal).label("category"),
         has_prior_terminal.label("prior_terminal"),
     ).where(
-        Approval.replacement_approval_id.is_(None),
+        or_(Approval.replacement_approval_id.is_(None),
+            Approval.execution_status.in_(["ambiguous", "disputed"])),
         or_(
             Approval.status == "pending",
             Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "disputed", "evidence_changed", "invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]),
@@ -146,8 +148,8 @@ def recovery_item(row):
     source = row["source"]
     row["url"] = f"/{'approvals' if source == 'approval' else 'cases' if source == 'case' else 'deliveries'}/{row['record_id']}"
     row["next_action"] = (
-        "Reconcile the prior approval outcome; this revision cannot act"
-        if row.get("prior_terminal")
+        "Inspect the related execution; this revision cannot act"
+        if row.get("prior_terminal") and row["category"] != "uncertain"
         else {
         "pending": "Review evidence and decide",
         "waiting": "Wait for the recorded retry deadline",
