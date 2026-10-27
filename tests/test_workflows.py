@@ -593,6 +593,10 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
     assert "Correlated audit history" in page.text
     assert "Append operator reconciliation" in page.text
     assert f"from_scenario={approval_id}" in page.text
+    assert "Customer inquiry: Synthetic ambiguous support request" in page.text
+    assert "automation saved an order status reply draft. Preview does not run n8n." in page.text
+    assert "Approved · send reply by operator" in page.text
+    assert "Mock execution is ambiguous after 1 attempt(s)." in page.text
     result = client.post(
         f"/approvals/{approval_id}/reconcile?from_scenario={approval_id}",
         data={"csrf_token": token, "scenario_id": approval_id,
@@ -631,6 +635,65 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
     assert replacement.headers["location"].startswith("/demo/scenarios/")
     replacement_page = client.get(replacement.headers["location"])
     assert "Review the evidence and approve or reject the pending decision." in replacement_page.text
+
+
+def test_stale_preview_approval_submission_after_rejection_is_idempotent(monkeypatch):
+    from app.preview_scenarios import start_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    token = sign_in()
+    with TestingSession() as db:
+        approval = start_preview_scenario(db, "pending", "operator")
+        approval_id = approval.id
+
+    rejected = client.post(
+        f"/approvals/{approval_id}/decision",
+        data={"csrf_token": token, "decision": "rejected"},
+        follow_redirects=False,
+    )
+    assert rejected.status_code == 303
+    replayed = client.post(
+        f"/approvals/{approval_id}/decision",
+        data={"csrf_token": token, "decision": "approved"},
+        follow_redirects=False,
+    )
+    assert replayed.status_code == 303
+    with TestingSession() as db:
+        approval = db.get(Approval, approval_id)
+        assert approval.status == "rejected"
+        assert db.scalar(select(ActionExecution)) is None
+
+
+def test_preview_scenario_approval_revision_pager_labels_match_direction(monkeypatch):
+    from app.preview_scenarios import start_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    sign_in()
+    with TestingSession() as db:
+        previous = start_preview_scenario(db, "pending", "operator")
+        original_id = previous.id
+        for revision in range(2, 22):
+            previous.status = "superseded"
+            replacement = service_create_approval(
+                db,
+                previous.kind,
+                previous.subject_type,
+                previous.subject_id,
+                previous.proposed_action,
+                previous.supporting_facts,
+                revision=revision,
+            )
+            previous.replacement_approval_id = replacement.id
+            previous = replacement
+        db.commit()
+
+    first_page = client.get(f"/demo/scenarios/{original_id}?revision_page=1")
+    older_page = client.get(f"/demo/scenarios/{original_id}?revision_page=2")
+    assert 'href="?revision_page=2&amp;reconciliation_page=1&amp;audit_page=1">Older revisions</a>' in first_page.text
+    assert 'href="?revision_page=1&amp;reconciliation_page=1&amp;audit_page=1">Newer revisions</a>' in older_page.text
+    assert f"Current approval #{previous.id}" in older_page.text
 
 
 def test_execution_is_bound_to_reviewed_action_and_evidence():
