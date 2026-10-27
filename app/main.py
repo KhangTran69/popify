@@ -22,6 +22,7 @@ from app.models import (
 )
 from app.presentation import record_navigation, retry_guidance, snapshot_utc
 from app.recovery import RECOVERY_CATEGORIES, recovery_counts, recovery_page
+from app.scenario_view import build_scenario_view
 from app.preview_scenarios import (
     SCENARIOS, SCENARIO_GUIDANCE, create_preview_scenario, start_preview_scenario,
     execute_preview_approval, load_preview_scenario, latest_reconciliations,
@@ -399,14 +400,25 @@ def recovery_workspace(
 
 @app.get("/demo", response_class=HTMLResponse)
 def guided_demo_home(
-    request: Request, actor=Depends(operator), db: Session = Depends(get_db)
+    request: Request, page: int = Query(1, ge=1),
+    actor=Depends(operator), db: Session = Depends(get_db)
 ):
+    preview_scenarios_query = (
+        select(Approval)
+        .join(Case, (Approval.subject_type == "case") & (Approval.subject_id == Case.id))
+        .where(Approval.replacement_approval_id.is_(None), Case.correlation_id.like("preview:%"))
+    )
+    preview_total = (
+        db.scalar(select(func.count()).select_from(preview_scenarios_query.subquery())) or 0
+    ) if settings.preview_mode else 0
+    preview_pages = max(1, ceil(preview_total / 12))
+    page = min(page, preview_pages)
     preview_examples = (
         db.scalars(
-            select(Approval)
-            .where(Approval.replacement_approval_id.is_(None))
+            preview_scenarios_query
             .order_by(Approval.id.desc())
-            .limit(50)
+            .offset((page - 1) * 12)
+            .limit(12)
         ).all()
         if settings.preview_mode
         else []
@@ -432,6 +444,9 @@ def guided_demo_home(
             "preview_related_completed": preview_related_completed,
             "preview_scenarios": SCENARIOS,
             "preview_scenario_descriptions": SCENARIO_GUIDANCE,
+            "preview_total": preview_total,
+            "preview_page": page,
+            "preview_pages": preview_pages,
         },
     )
 
@@ -474,134 +489,13 @@ def preview_scenario_detail(
     )
     if not scenario:
         raise HTTPException(404, "Synthetic scenario not found")
-    current = scenario["current"]
-    execution = scenario["executions"].get(f"approval:{current.id}")
-    reconciliation = scenario["reconciliations"].get(current.id)
-    blocker_id = unresolved_related_approvals(db, [current.id]).get(current.id)
-    if not blocker_id:
-        related_execution = prior_terminal_execution(db, current)
-        if related_execution and related_execution.idempotency_key.startswith("approval:"):
-            related_id = related_execution.idempotency_key.removeprefix("approval:")
-            blocker_id = int(related_id) if related_id.isdigit() else None
-    blocking_approval = db.get(Approval, blocker_id) if blocker_id else None
-    status = current.execution_status
-    freshness_differences = approval_freshness_differences(db, current)
-    if blocking_approval and blocking_approval.execution_status in ("ambiguous", "disputed"):
-        next_step = "A related execution has unresolved evidence. Review its original approval; any completed result remains recorded."
-    elif blocking_approval:
-        next_step = "A related execution is recorded as completed or still in progress. Inspect its approval before taking further action."
-    elif current.status == "pending" and freshness_differences:
-        next_step = "The reviewed evidence is stale. Compare the saved snapshot with current facts before creating a replacement approval."
-    elif current.status == "pending":
-        next_step = "Review the evidence and approve or reject the pending decision."
-    elif current.status == "rejected":
-        next_step = "This scenario is complete; the rejected action has no execution record."
-    elif status == "succeeded":
-        next_step = "This scenario is complete; inspect the persisted mock execution and audit events."
-    elif status == "ambiguous" and reconciliation is None:
-        next_step = "Record what is known about the ambiguous outcome. No provider lookup is performed."
-    elif status in ("ambiguous", "disputed") and reconciliation and reconciliation.outcome in ("still_unknown", "conflicting_evidence"):
-        next_step = "The outcome remains uncertain. Append new supporting evidence; retries and replacement approvals stay blocked."
-    elif status == "reconciled_completed":
-        next_step = "This scenario is complete by operator assertion; the original execution remains ambiguous."
-    elif status == "reconciled_not_executed":
-        next_step = "Create a fresh pending approval before any new mock action."
-    elif status == "retryable" and current.next_attempt_at and as_utc(current.next_attempt_at) > utcnow():
-        next_step = f"Wait for the recorded retry deadline: {current.next_attempt_at.strftime('%d %b %Y · %H:%M UTC')}."
-    elif status == "retryable":
-        next_step = "Open the approval and run one explicit local mock recovery attempt."
-    elif status == "exhausted":
-        next_step = "Review the attempt history, then explicitly queue a manual recovery attempt."
-    elif status == "evidence_changed":
-        next_step = "Compare reviewed and current facts before creating a replacement approval."
-    elif status == "invalid_action":
-        next_step = "This action has no registered mock adapter. Inspect the blocked approval contract; no execution or retry is available."
-    else:
-        next_step = "Open the approval to review its supported recovery action."
-
-    automation_complete = bool(scenario["case"].draft and scenario["case"].status != "queued")
-    decision_complete = current.status in ("approved", "rejected")
-    result_complete = current.status == "rejected" or status in (
-        "succeeded", "reconciled_completed", "reconciled_not_executed"
-    )
-    if current.status == "rejected":
-        outcome_detail = "Rejected by the operator; no action execution was created."
-    elif execution:
-        outcome_detail = (
-            f"Mock execution: {execution.state.replace('_', ' ')} after "
-            f"{execution.attempts} attempt{'s' if execution.attempts != 1 else ''}. {execution.detail or ''}"
-        ).strip()
-    elif status == "reconciled_completed":
-        outcome_detail = "Operator recorded completion; the saved execution remains ambiguous."
-    elif status == "reconciled_not_executed":
-        outcome_detail = "Operator recorded non-execution; a new approval is required before acting."
-    else:
-        outcome_detail = f"{status.replace('_', ' ')} · {current.attempts} attempts."
-    trigger_detail = (
-        f"Customer inquiry: {scenario['case'].message}"
-        if scenario["case"]
-        else "Synthetic customer inquiry is unavailable."
-    )
-    automation_detail = (
-        f"Synthetic order {scenario['order'].order_number} was linked; automation "
-        f"saved an {scenario['case'].category.replace('_', ' ')} reply draft. "
-        "Preview does not run n8n."
-        if scenario["order"] and scenario["case"]
-        else f"Support draft is {scenario['case'].status.replace('_', ' ')}."
-    )
-    decision_detail = (
-        f"{current.status.capitalize()} · {current.proposed_action.replace('_', ' ')}"
-        + (f" by {current.actor} at {current.decision_at.strftime('%d %b %Y %H:%M UTC')}"
-           if current.actor and current.decision_at else " · awaiting operator review")
-    )
-    stages = [
-        {"name": "Trigger", "state": "complete" if scenario["order"] and scenario["case"] else "blocked",
-         "detail": trigger_detail,
-         "href": f"/orders/{scenario['order'].id}?from_scenario={scenario['scenario_id']}" if scenario["order"] else ""},
-        {"name": "Automation", "state": "complete" if automation_complete else "waiting",
-         "detail": automation_detail,
-         "href": f"/cases/{scenario['case'].id}?from_scenario={scenario['scenario_id']}"},
-        {"name": "Human decision", "state": "complete" if decision_complete else "attention" if freshness_differences else "current",
-         "detail": "Evidence changed after this approval was created; review current facts before deciding." if freshness_differences else decision_detail,
-         "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
-        {"name": "Persisted outcome", "state": "complete" if result_complete else "attention",
-         "detail": outcome_detail,
-         "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
-    ]
+    view = build_scenario_view(db, scenario)
     return templates.TemplateResponse(
-        request,
-        "demo_scenario.html",
-        {
-            "request": request,
-            "actor": actor,
-            "csrf": csrf(request),
-            "title": f"Scenario · {scenario['name'].title()}",
-            "scenario": scenario,
-            "scenario_objective": SCENARIO_GUIDANCE[scenario["scenario_key"]],
-            "current": current,
-            "execution": execution,
-            "reconciliation": reconciliation,
-            "blocking_approval": blocking_approval,
-            "preview_waiting": bool(current.next_attempt_at and as_utc(current.next_attempt_at) > utcnow()),
-            "next_step": next_step,
-            "stages": stages,
-            "approvals": scenario["approvals"],
-            "events": scenario["events"],
-            "reconciliable": bool(execution and execution.state == "ambiguous"
-                                   and not current.replacement_approval_id
-                                   and current.execution_status in ("ambiguous", "disputed", "reconciled_completed", "reconciled_not_executed")),
-            "reconciliation_history": scenario["reconciliation_history"],
-            "reconciliation_page": scenario["reconciliation_page"],
-            "reconciliation_pages": scenario["reconciliation_pages"],
-            "approval_history": scenario["approval_history"],
-            "approval_page": scenario["approval_page"],
-            "approval_pages": scenario["approval_pages"],
-            "audit_page": scenario["audit_page"],
-            "audit_pages": scenario["audit_pages"],
-            "freshness_differences": freshness_differences,
-        },
+        request, "demo_scenario.html",
+        {"request": request, "actor": actor, "csrf": csrf(request),
+         "title": f"Scenario · {scenario['name'].title()}", "scenario": scenario,
+         **view},
     )
-
 
 @app.post("/demo/start")
 def guided_demo_start(

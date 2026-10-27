@@ -6,7 +6,7 @@
     <div>
       <div class="eyebrow">GUIDED SCENARIO · ISOLATED PREVIEW</div>
       <h1>{{ scenario.name|title }}</h1>
-      <p class="sub">{{ scenario_objective }} Follow this synthetic journey from its trigger through the human decision and persisted result.</p>
+      <p class="sub">{{ scenario_objective }} Follow the saved trigger, automation, human decision, and outcome below. The journey history links each change to its original record.</p>
     </div>
     <span class="mode"><i></i> Synthetic data · local mock only</span>
   </div>
@@ -118,8 +118,8 @@
   </div>
 
   <section class="box scenario-audit" aria-labelledby="scenario-audit-title">
-    <div class="panelhead"><div><h2 id="scenario-audit-title">Correlated audit history</h2><p class="mono">{{ scenario.correlation_id }} · {{ scenario.audit_total }} events</p></div><span class="count">{{ events|length }}</span></div>
-    <div class="timeline">{% for event in events %}<article class="event"><strong>{{ event.event.replace('_', ' ').capitalize() }}</strong><small>{{ event.created_at|utc }} · {{ event.actor }}</small><small>{{ event.entity_type }} #{{ event.entity_id }}</small>{% if event.entity_type in ['order', 'case', 'approval'] %}<a href="/{{ 'orders' if event.entity_type == 'order' else 'cases' if event.entity_type == 'case' else 'approvals' }}/{{ event.entity_id }}?from_scenario={{ scenario.scenario_id }}">Open event record ↗</a>{% endif %}{% if event.details %}<details><summary>Event details</summary><pre>{{ event.details|tojson(indent=2) }}</pre></details>{% endif %}</article>{% else %}<div class="empty">No audit events have been recorded for this scenario.</div>{% endfor %}</div>
+    <div class="panelhead"><div><h2 id="scenario-audit-title">Journey history</h2><p>Saved events across the request, approval revisions, attempts, and operator conclusions. Page {{ audit_page }} of {{ audit_pages }} · latest page first.</p><p class="mono">{{ scenario.correlation_id }} · {{ scenario.audit_total }} events</p></div><span class="count">{{ journey_events|length }}</span></div>
+    <ol class="journey-history">{% for row in journey_events %}{% set event = row.event %}<li class="journey-entry"><div><strong>{{ row.title }}</strong><small>{{ event.created_at|utc }} · {{ event.actor }}</small></div>{% if row.explanation %}<p>{{ row.explanation }}</p>{% endif %}<small>{{ event.entity_type }} #{{ event.entity_id }}</small>{% if row.href %}<a href="{{ row.href }}">Open saved record ↗</a>{% endif %}{% if event.details %}<details><summary>Saved event evidence</summary><pre>{{ event.details|tojson(indent=2) }}</pre></details>{% endif %}</li>{% else %}<li class="empty">No saved events for this scenario.</li>{% endfor %}</ol>
     {% if audit_pages > 1 %}<nav class="pagination" aria-label="Audit history pages">{% if audit_page > 1 %}<a href="?audit_page={{ audit_page - 1 }}&amp;revision_page={{ approval_page }}&amp;reconciliation_page={{ reconciliation_page }}">Newer events</a>{% endif %}<span>Page {{ audit_page }} of {{ audit_pages }}</span>{% if audit_page < audit_pages %}<a href="?audit_page={{ audit_page + 1 }}&amp;revision_page={{ approval_page }}&amp;reconciliation_page={{ reconciliation_page }}">Older events</a>{% endif %}</nav>{% endif %}
   </section>
 </main>

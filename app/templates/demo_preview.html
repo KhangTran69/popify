@@ -32,8 +32,16 @@
       <div><b>04</b><span>Persisted result · mock outcome and audit history</span></div>
     </div>
   </section>
+  <section class="panel reviewer-path" aria-labelledby="reviewer-path-title">
+    <div class="panelhead"><div><h2 id="reviewer-path-title">Five-minute reviewer path</h2><p>Run these two synthetic scenarios in order. Each begins with an operator decision and keeps its own saved records.</p></div></div>
+    <div class="reviewer-path-grid">
+      <article><span class="preview-step">01 · Successful action</span><h3>Approve a grounded reply</h3><p>Open the saved inquiry and order facts, approve the draft, then inspect the mock execution and audit history.</p><form method="post" action="/demo/preview/scenarios"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="success"><button>Start success run</button></form></article>
+      <article><span class="preview-step">02 · Human recovery</span><h3>Resolve an uncertain outcome</h3><p>Approve once to create a simulated timeout. Review the original execution, record a supported conclusion, and see why blind retry stays blocked.</p><form method="post" action="/demo/preview/scenarios"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="ambiguous"><button class="secondary">Start recovery run</button></form></article>
+    </div>
+    <p class="field-help">These actions use the temporary SQLite preview. The real n8n walkthrough is available only in the local Docker stack.</p>
+  </section>
   <section class="panel">
-    <div class="panelhead"><div><h2>Scenario workspace</h2><p>Saved examples show historical outcomes. Creating a run starts at a real pending human decision; the selected outcome is applied only after you approve or reject it.</p></div></div>
+    <div class="panelhead"><div><h2>Scenario workspace</h2><p>{{ preview_total }} saved scenarios · newest first. Saved examples show historical outcomes. Creating a run starts at a pending human decision.</p></div></div>
     <form method="post" action="/demo/preview/scenarios" class="inline-actions">
       <input type="hidden" name="csrf_token" value="{{ csrf }}">
       <label for="scenario">Start a new guided run (pending human decision)</label>
@@ -54,6 +62,7 @@
       </article>
       {% else %}<div class="empty">No synthetic scenarios yet. Create one above to begin a guided walkthrough.</div>{% endfor %}
     </div>
+    {% if preview_pages > 1 %}<nav class="pagination" aria-label="Saved scenario pages">{% if preview_page > 1 %}<a href="?page={{ preview_page - 1 }}">Newer scenarios</a>{% endif %}<span>Page {{ preview_page }} of {{ preview_pages }}</span>{% if preview_page < preview_pages %}<a href="?page={{ preview_page + 1 }}">Older scenarios</a>{% endif %}</nav>{% endif %}
     <div class="inline-actions">
       <a class="record-link" href="/recovery">Open the unified recovery workspace ↗</a>
     </div>
