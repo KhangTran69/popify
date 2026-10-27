@@ -524,18 +524,48 @@ def preview_scenario_detail(
     result_complete = current.status == "rejected" or status in (
         "succeeded", "reconciled_completed", "reconciled_not_executed"
     )
+    if current.status == "rejected":
+        outcome_detail = "Rejected by the operator; no action execution was created."
+    elif execution:
+        outcome_detail = (
+            f"Mock execution is {execution.state.replace('_', ' ')} after "
+            f"{execution.attempts} attempt(s). {execution.detail or ''}"
+        ).strip()
+    elif status == "reconciled_completed":
+        outcome_detail = "Operator recorded completion; the saved execution remains ambiguous."
+    elif status == "reconciled_not_executed":
+        outcome_detail = "Operator recorded non-execution; a new approval is required before acting."
+    else:
+        outcome_detail = f"{status.replace('_', ' ')} · {current.attempts} attempts."
+    trigger_detail = (
+        f"Customer inquiry: {scenario['case'].message}"
+        if scenario["case"]
+        else "Synthetic customer inquiry is unavailable."
+    )
+    automation_detail = (
+        f"Synthetic order {scenario['order'].order_number} was linked; automation "
+        f"saved an {scenario['case'].category.replace('_', ' ')} reply draft. "
+        "Preview does not run n8n."
+        if scenario["order"] and scenario["case"]
+        else f"Support draft is {scenario['case'].status.replace('_', ' ')}."
+    )
+    decision_detail = (
+        f"{current.status.capitalize()} · {current.proposed_action.replace('_', ' ')}"
+        + (f" by {current.actor} at {current.decision_at.strftime('%d %b %Y %H:%M UTC')}"
+           if current.actor and current.decision_at else " · awaiting operator review")
+    )
     stages = [
         {"name": "Trigger", "state": "complete" if scenario["order"] and scenario["case"] else "blocked",
-         "detail": "Synthetic order and customer inquiry are saved.",
+         "detail": trigger_detail,
          "href": f"/orders/{scenario['order'].id}?from_scenario={scenario['scenario_id']}" if scenario["order"] else ""},
         {"name": "Automation", "state": "complete" if automation_complete else "waiting",
-         "detail": f"Support draft is {scenario['case'].status.replace('_', ' ')}.",
+         "detail": automation_detail,
          "href": f"/cases/{scenario['case'].id}?from_scenario={scenario['scenario_id']}"},
         {"name": "Human decision", "state": "complete" if decision_complete else "attention" if freshness_differences else "current",
-         "detail": "Evidence changed after this approval was created." if freshness_differences else f"{current.status}{' by ' + current.actor if current.actor else ''}.",
+         "detail": "Evidence changed after this approval was created; review current facts before deciding." if freshness_differences else decision_detail,
          "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
         {"name": "Persisted outcome", "state": "complete" if result_complete else "attention",
-         "detail": f"{status.replace('_', ' ')} · {current.attempts} attempts.",
+         "detail": outcome_detail,
          "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
     ]
     return templates.TemplateResponse(
@@ -1256,7 +1286,11 @@ def approval_decision(
         raise HTTPException(422, "invalid decision")
     try:
         approval = decide_approval(db, approval_id, decision, actor)
-        if settings.preview_mode and decision == "approved":
+        if (
+            settings.preview_mode
+            and approval.status == "approved"
+            and approval.execution_status in ("queued", "retryable")
+        ):
             execute_preview_approval(db, approval, actor)
             db.commit()
     except LookupError:

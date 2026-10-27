@@ -78,6 +78,8 @@ It adds a fresh synthetic order aged 72 hours, invokes all three **real local n8
 
 For an interview walkthrough on the full local stack, open [Guided demo](http://localhost:8001/demo), click **Start guided demo**, and follow the linked records from the same page. It refreshes while queued work is active. Each “run now” control calls the actual published n8n webhook; the scheduled workers remain the normal path. The demo inserts only synthetic records and never sends messages or performs real financial actions. In the isolated preview, `/demo` instead lists persisted synthetic examples; it does not start the workflow walkthrough.
 
+Each isolated scenario stage names the saved customer inquiry, linked synthetic order and draft, human decision and actor, and persisted execution or rejection. The stage text is derived from the current records, so a retry or reconciliation is reflected after the operator acts. Stale approval form submissions are idempotent: replaying an old approval after rejection cannot change the saved decision or create an execution.
+
 The five stages shown in the walkthrough are:
 
 1. **Order intake:** a synthetic order event is persisted in PostgreSQL and processed by workflow 01.
@@ -108,7 +110,7 @@ Then wait for the order workflow or trigger it manually. A configured real Shopi
 
 ## Operator interface
 
-The repository screenshots below are retained captures from earlier isolated-preview reviews; none are evidence of live n8n execution. During this change, the current stale-evidence and scenario pages were inspected at desktop and mobile widths, with the browser captures shown in the accompanying work report.
+The overview, approval, and recovery screenshots below are retained captures from earlier isolated-preview reviews; none are evidence of live n8n execution. The scenario reconciliation desktop and mobile captures were refreshed from the current disposable SQLite preview on 27 October 2026 at 1280×813 and 390×844. They show synthetic records and do not verify n8n execution.
 
 ![Operator overview with recovery priority](docs/screenshots/overview-preview.jpg)
 ![Approval request, policy, order facts, and persisted retry recovery](docs/screenshots/approval-preview.png)

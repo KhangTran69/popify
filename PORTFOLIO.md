@@ -63,6 +63,23 @@ Acceptance criteria implemented:
 - **Visual inspection:** inspected the current isolated scenario runner and stale-evidence page at the browser's default desktop viewport, then at 390×844. Checked scenario stage wrapping, long message wrapping, form sizing, keyboard focus, and the current reconciliation in the page summary. The captured browser view is included with this work report; the existing repository screenshots remain historical and are not represented as screenshots of this change.
 - **Live n8n:** not run because Docker was unavailable (`docker info` failed and no local n8n endpoint was active). Workflow-export validation is not n8n execution evidence. Earlier real-workflow checks listed below are historical and were not repeated.
 
+## Follow-up assessment and verification — 27 October 2026
+
+After PR #10 merged (`68857d5`), review found that the scenario revision history in `app/templates/demo_scenario.html` reversed the older/newer pager labels. The approval route in `app/main.py` also attempted preview execution for a replayed approve POST even when `decide_approval` had returned an already rejected approval. That produced an internal error on a stale form submission. The guided stages in `app/main.py` exposed only terse state strings, leaving the trigger, actual human decision, and persisted execution detail hard to follow.
+
+Implemented acceptance criteria:
+
+- Preview approval submissions execute only a currently approved, queued or retryable record. Replaying an approval after rejection redirects safely, leaves the rejection intact, and creates no execution.
+- Scenario revision links agree with their page direction, and the current approval remains visible while inspecting older revisions.
+- Guided stages show the customer inquiry, linked synthetic order and saved draft, decision action/actor/time, and persisted execution state, attempt count, and detail. Rejected decisions explicitly show that no execution exists. Preview copy states that n8n did not run.
+
+Verification performed for this follow-up:
+
+- **Behavior suite:** `pytest -q --tb=short` passed: **81 tests**, including stale approval replay, both pager directions, and trigger/decision/execution stage detail.
+- **Workflow exports:** `python -m scripts.validate_workflows` passed for all three JSON workflow exports.
+- **CI on merged baseline:** PR #10's latest unit/workflow and PostgreSQL concurrency checks both passed. This follow-up changes no schema or PostgreSQL lifecycle rules; PostgreSQL concurrency and live n8n were not rerun.
+- **Browser inspection:** signed into the disposable preview, created and approved an ambiguous run, and checked the persisted execution and audit history. Captured and visually inspected the current scenario at 1280×813 and 390×844; mobile `scrollWidth` equaled its 390 px viewport. Refreshed `docs/screenshots/scenario-reconciliation-desktop.jpg` and `docs/screenshots/scenario-reconciliation-mobile.jpg`. These images show synthetic preview data only.
+
 ## Historical verification — 24 October 2026, Manila time
 
 - **36 automated behavior tests passed** on 24 October 2026 using isolated SQLite, including guided demo authentication/CSRF, failed triage presentation, worker outcome metrics, conflicting support request keys, approval gating, retry eligibility, exhaustion, ambiguous outcomes, and queue context preservation.
