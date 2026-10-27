@@ -62,8 +62,10 @@
           <dt>Next attempt</dt><dd>{{ entity.next_attempt_at|utc }}</dd>
         </dl>
         {% if freshness_differences %}
-          <div class="notice error evidence-status"><strong>{{ 'This approval is historical' if entity.execution_status == 'succeeded' else 'Current facts differ from the reviewed snapshot' }}</strong><ul>{% for difference in freshness_differences %}<li>{{ difference }}</li>{% endfor %}</ul></div>
-          {% if refresh_supported and (entity.status == 'pending' or entity.execution_status == 'evidence_changed') and not entity.replacement_approval_id %}
+          <div class="notice error evidence-status"><strong>{{ 'This approval is historical' if entity.execution_status == 'succeeded' else 'Current facts differ from the reviewed snapshot' }}</strong>
+            <div class="evidence-comparison">{% for difference in freshness_comparison %}<article><strong>{{ difference.field }}</strong><small>{{ difference.reason }}</small><dl><dt>Reviewed</dt><dd>{{ difference.reviewed }}</dd><dt>Current</dt><dd>{{ difference.current }}</dd></dl></article>{% endfor %}</div>
+          </div>
+          {% if refresh_supported and (entity.status == 'pending' or entity.execution_status == 'evidence_changed') and not entity.replacement_approval_id and not refresh_blocked_by_execution %}
             <form method="post" action="/approvals/{{ entity.id }}/refresh{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Create a fresh approval from current facts</button></form>
           {% endif %}
         {% elif entity.status == 'superseded' %}
@@ -122,9 +124,9 @@
           <div class="notice">No decision was recorded for this revision. Use the linked replacement to review current facts.</div>
         {% elif entity.status == 'rejected' %}
           <div class="notice">Rejected by {{ entity.actor or 'operator' }}. No mock action will run for this approval.</div>
-        {% elif entity.status == 'approved' and entity.execution_status in ['failed', 'retryable', 'exhausted'] %}
-          <div class="notice warn"><strong>{{ 'Recovery required' if entity.execution_status == 'exhausted' else 'Action needs another attempt' }}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
-          {% if preview_mode and preview_run_due %}<form method="post" action="/approvals/{{ entity.id }}/preview-run{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Run due local mock attempt</button></form>{% elif entity.execution_status in ['failed', 'exhausted'] %}<form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue action retry</button></form>{% endif %}
+        {% elif entity.status == 'approved' and entity.execution_status in ['failed', 'retryable', 'exhausted', 'queued'] %}
+          <div class="notice warn"><strong>{% if entity.execution_status == 'exhausted' %}Automatic retry budget used{% elif entity.execution_status == 'queued' %}Recovery attempt queued{% else %}Action needs another attempt{% endif %}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
+          {% if preview_mode and preview_run_due %}<form method="post" action="/approvals/{{ entity.id }}/preview-run{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Run due local mock attempt</button></form>{% elif preview_mode and entity.execution_status == 'queued' %}<p class="field-help">The attempt remains queued until its recorded retry deadline.</p>{% elif entity.execution_status in ['failed', 'exhausted'] %}<form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue action retry</button></form>{% endif %}
         {% elif entity.execution_status == 'ambiguous' %}
           <div class="notice warn">Outcome uncertain. Automatic retry is blocked. Reconcile the recorded mock result using approval:{{ entity.id }} before taking further action.</div>
         {% elif entity.execution_status == 'evidence_changed' %}
@@ -133,6 +135,8 @@
           <div class="notice error"><strong>Execution blocked.</strong><p>This action has no registered mock adapter. No retry or replacement can be created here; a maintainer must correct the action contract before the source item is reprocessed.</p></div>
         {% elif entity.execution_status == 'blocked_prior_outcome' %}
           <div class="notice error"><strong>Another revision may already have acted.</strong><p>Reconcile the prior started, successful, or ambiguous execution. This revision cannot execute or retry until that persisted outcome is resolved.</p></div>
+        {% elif entity.execution_status == 'superseded' %}
+          <div class="notice error"><strong>This approval has been replaced.</strong><p>Its evidence remains in the audit history, but it cannot execute. Open the replacement approval to review the current facts.</p></div>
         {% elif entity.execution_status == 'succeeded' %}
           <div class="notice">Mock action completed. The timeline records the decision and execution.</div>
         {% elif entity.status == 'approved' %}
@@ -143,7 +147,7 @@
         <div class="related"><a href="/demo/{{ entity.supporting_facts.get('correlation_id').split(':')[-1] }}">← Back to guided run</a></div>
       {% endif %}
       {% if prior_approval %}<div class="notice">Revision {{ entity.revision }} replaces <a href="/approvals/{{ prior_approval.id }}{{ detail_query }}">approval #{{ prior_approval.id }} · revision {{ prior_approval.revision }} ↗</a>. Its decision and attempts remain in the audit history.</div>{% endif %}
-      {% if approval_history %}<div class="related"><h3>Related approval history</h3>{% for a in approval_history %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · revision {{ a.revision }} · {{ a.proposed_action.replace('_', ' ') }} <span>{{ a.status }} · {{ a.execution_status }}{% if a.replacement_approval_id %} → #{{ a.replacement_approval_id }}{% endif %}</span></a>{% endfor %}</div>{% endif %}
+      {% if approval_revision_rows|length > 1 %}<div class="related revision-history"><h3>Approval revision history</h3>{% for row in approval_revision_rows %}{% set a = row.approval %}<article><a href="/approvals/{{ a.id }}{{ detail_query }}">Revision {{ a.revision }} · {{ a.proposed_action.replace('_', ' ') }} ↗</a><span>{{ a.status }} · {{ a.execution_status }} · {{ a.attempts }} attempts</span><small>Decision: {{ a.actor or 'Not decided' }} · {{ a.decision_at|utc }}</small>{% if row.replaced_from %}<small>Replaces revision of approval #{{ row.replaced_from }}</small>{% endif %}{% if row.replacement_event %}<small>Replacement reason: {{ row.replacement_event.details.get('differences', [])|join('; ') or 'Evidence was refreshed' }} · {{ row.replacement_event.actor }} · {{ row.replacement_event.created_at|utc }}</small>{% endif %}{% if a.replacement_approval_id %}<small>Replaced by approval #{{ a.replacement_approval_id }}</small>{% endif %}</article>{% endfor %}</div>{% endif %}
       {% if related %}<div class="related"><h3>Related approvals</h3>{% for a in related %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · {{ a.proposed_action.replace('_', ' ') }} <span>{{ a.status }} →</span></a>{% endfor %}</div>{% endif %}
     </section>
     <section class="box"><div class="panelhead timeline-heading"><h2>Event timeline</h2><span class="count">{{ timeline|length }}</span></div>{% if timeline_limited or related_cases_limited %}<p class="field-help">Showing at most the latest 100 related events{% if related_cases_limited %} across the 100 most recent related support cases{% endif %}.</p>{% endif %}

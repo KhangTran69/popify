@@ -21,6 +21,8 @@ from app.services import (
     refresh_approval,
     ApprovalEvidenceStale,
     approval_freshness_differences,
+    approval_freshness_comparison,
+    queue_approval_retry,
 )
 
 engine = create_engine(
@@ -706,7 +708,7 @@ def test_replaced_stale_revision_leaves_actionable_recovery_queue_and_counts():
     assert "Stale evidence 0" in dashboard.text
     record = client.get(f"/approvals/{replacement_id}")
     assert f"approval #{original_id}" in record.text
-    assert "Related approval history" in record.text
+    assert "Approval revision history" in record.text
 
 
 def test_action_recovery_filters_separate_scheduled_stale_and_uncertain_states():
@@ -1607,6 +1609,48 @@ def test_recovery_workspace_preserves_category_search_and_page_context():
     assert 'href="/recovery?q=Distinct&amp;page=1&amp;category=eligible"' in detail.text
 
 
+def test_recovery_workspace_prioritizes_uncertain_pending_then_oldest_actionable():
+    from app.recovery import recovery_page
+
+    now = utcnow()
+    with TestingSession() as db:
+        db.add_all([
+            Approval(kind="support", subject_type="case", subject_id=701,
+                     proposed_action="send_reply", status="approved", execution_status="ambiguous",
+                     created_at=now - timedelta(days=1)),
+            Approval(kind="support", subject_type="case", subject_id=702,
+                     proposed_action="send_reply", status="pending", execution_status="not_started",
+                     created_at=now - timedelta(days=4)),
+            Case(message="waiting older", status="failed", attempts=1,
+                 next_attempt_at=now + timedelta(minutes=4), created_at=now - timedelta(days=10)),
+        ])
+        db.commit()
+        rows, total, _, _ = recovery_page(db, now=now)
+    assert total == 3
+    assert [row["category"] for row in rows] == ["uncertain", "pending", "waiting"]
+    assert "Reconcile the outcome" in rows[0]["next_action"]
+
+
+def test_recovery_marks_new_revision_blocked_when_prior_action_is_ambiguous():
+    from app.recovery import recovery_page
+
+    with TestingSession() as db:
+        prior = Approval(kind="support", subject_type="case", subject_id=704,
+                         proposed_action="send_reply", revision=1, status="approved",
+                         execution_status="ambiguous")
+        db.add(prior)
+        db.flush()
+        db.add(ActionExecution(idempotency_key=f"approval:{prior.id}", state="ambiguous", attempts=1))
+        db.add(Approval(kind="exception", subject_type="case", subject_id=704,
+                        proposed_action="review_refund_request", revision=2, status="pending"))
+        db.commit()
+        rows, _, _, _ = recovery_page(db, category="blocked")
+    blocked = next(row for row in rows if row["label"].startswith("Approval #"))
+    assert blocked["category"] == "blocked"
+    assert blocked["prior_terminal"] is True
+    assert "cannot act" in blocked["next_action"]
+
+
 def test_preview_scenario_uses_request_scoped_outcome_without_mutating_settings(monkeypatch):
     from app.preview_scenarios import create_preview_scenario
 
@@ -1616,6 +1660,128 @@ def test_preview_scenario_uses_request_scoped_outcome_without_mutating_settings(
         approval = create_preview_scenario(db, "ambiguous")
         assert approval.execution_status == "ambiguous"
     assert before == (settings.mock_action_failures, settings.mock_action_ambiguous, settings.max_action_attempts)
+
+
+def test_preview_exhaustion_recovery_runs_one_explicit_attempt_and_persists_result(monkeypatch):
+    from app.preview_scenarios import create_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    monkeypatch.setattr(settings, "mock_action_failures", 0)
+    monkeypatch.setattr(settings, "mock_action_ambiguous", False)
+    token = sign_in()
+    with TestingSession() as db:
+        approval = create_preview_scenario(db, "exhausted")
+        approval_id = approval.id
+        budget = settings.max_action_attempts
+        execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        ))
+        assert approval.attempts == budget
+        assert execution.state == "exhausted" and execution.attempts == budget
+        assert db.scalar(select(func.count()).select_from(main.Audit).where(
+            main.Audit.entity_type == "approval", main.Audit.entity_id == approval_id,
+            main.Audit.event == "action_execution_attempt_exhausted",
+        )) == budget
+    detail = client.get(f"/approvals/{approval_id}")
+    assert "Queue action retry" in detail.text
+    queued = client.post(f"/approvals/{approval_id}/retry", data={"csrf_token": token}, follow_redirects=False)
+    assert queued.status_code == 303
+    detail = client.get(queued.headers["location"])
+    assert "Run due local mock attempt" in detail.text
+    result = client.post(f"/approvals/{approval_id}/preview-run", data={"csrf_token": token}, follow_redirects=False)
+    assert result.status_code == 303
+    with TestingSession() as db:
+        approval = db.get(Approval, approval_id)
+        execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        ))
+        assert approval.execution_status == "succeeded"
+        assert approval.attempts == budget + 1
+        assert execution.state == "succeeded" and execution.attempts == budget + 1
+
+
+def test_preview_retry_rejects_attempt_before_persisted_backoff_deadline(monkeypatch):
+    from app.preview_scenarios import create_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    token = sign_in()
+    with TestingSession() as db:
+        approval = create_preview_scenario(db, "retryable")
+        approval_id = approval.id
+        execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        ))
+        assert approval.next_attempt_at is not None
+        before_attempts = execution.attempts
+    queued = client.post(f"/approvals/{approval_id}/retry", data={"csrf_token": token}, follow_redirects=False)
+    assert queued.status_code == 303
+    early = client.post(f"/approvals/{approval_id}/preview-run", data={"csrf_token": token}, follow_redirects=False)
+    assert early.status_code == 409
+    with TestingSession() as db:
+        approval = db.get(Approval, approval_id)
+        execution = db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{approval_id}"
+        ))
+        assert approval.execution_status == "queued"
+        assert execution.state == "retryable" and execution.attempts == before_attempts
+
+
+def test_freshness_comparison_shows_reviewed_and_current_draft_values():
+    with TestingSession() as db:
+        approval = create_approval(db, "support", "case", 991, "send_reply", {"draft": "Original reply"})
+        case = db.get(Case, 991)
+        case.draft = "Updated reply with current policy"
+        db.flush()
+        comparison = next(item for item in approval_freshness_comparison(db, approval) if item["field"] == "Draft")
+        assert comparison["reviewed"] == "Original reply"
+        assert comparison["current"] == "Updated reply with current policy"
+
+
+def test_replaced_approval_cannot_execute_even_if_original_evidence_returns():
+    with TestingSession() as db:
+        original = create_approval(db, "support", "case", 992, "send_reply", {"draft": "Original"})
+        original.status = "approved"
+        original.execution_status = "evidence_changed"
+        case = db.get(Case, original.subject_id)
+        case.draft = "Changed after review"
+        db.flush()
+        replacement = refresh_approval(db, original.id, "operator")
+        case.draft = "Original"
+        db.flush()
+        with pytest.raises(ValueError, match="replaced"):
+            queue_approval_retry(db, original.id, "operator")
+        execute_approved(db, original)
+        db.commit()
+        assert original.replacement_approval_id == replacement.id
+        assert original.execution_status == "superseded"
+        assert db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{original.id}"
+        )) is None
+
+
+def test_terminal_execution_blocks_different_approval_kind_for_same_case():
+    with TestingSession() as db:
+        original = create_approval(db, "support", "case", 993, "send_reply", {
+            "draft": "first", "category": "refund",
+        })
+        decide_approval(db, original.id, "approved", "operator")
+        execute_approved(db, original, mock_outcome="ambiguous")
+        case = db.get(Case, original.subject_id)
+        alternate = Approval(
+            kind="exception", subject_type="case", subject_id=case.id,
+            proposed_action="review_refund_request", status="approved",
+            execution_status="queued", supporting_facts={},
+        )
+        db.add(alternate)
+        db.flush()
+        execute_approved(db, alternate)
+        db.commit()
+        assert alternate.execution_status == "blocked_prior_outcome"
+        assert db.scalar(select(ActionExecution).where(
+            ActionExecution.idempotency_key == f"approval:{alternate.id}"
+        )) is None
 
 
 def test_terminal_execution_on_prior_revision_blocks_new_revision():

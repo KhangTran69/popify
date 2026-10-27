@@ -23,7 +23,7 @@ def run():
         from app.db import Base, SessionLocal, engine
         from app.main import app
         from app.config import settings
-        from app.models import Case, Delivery, Order, utcnow
+        from app.models import ActionExecution, Case, Delivery, Order, utcnow
         from app.services import audit, create_approval, decide_approval, execute_approved
 
         Base.metadata.create_all(engine)
@@ -119,7 +119,25 @@ def run():
 
             exhausted = scenario_approval("exhausted")
             decide_approval(db, exhausted.id, "approved", "preview")
-            execute_approved(db, exhausted, mock_outcome="exhausted")
+            attempt_budget = settings.max_action_attempts
+            failure = "Synthetic automatic retry budget exhausted; no external request was made."
+            db.add(ActionExecution(
+                idempotency_key=f"approval:{exhausted.id}",
+                proposed_action=exhausted.proposed_action,
+                evidence_hash=exhausted.evidence_hash,
+                state="exhausted",
+                attempts=attempt_budget,
+                detail=failure,
+            ))
+            exhausted.attempts = attempt_budget
+            exhausted.execution_status = "exhausted"
+            exhausted.failure_detail = failure
+            for attempt in range(1, attempt_budget + 1):
+                audit(
+                    db, "approval", exhausted.id, "action_execution_attempt_exhausted", "preview",
+                    details={"attempt": attempt, "automatic_attempt_budget": attempt_budget, "synthetic": True},
+                    correlation_id=exhausted.supporting_facts.get("correlation_id"),
+                )
 
             db.add(Delivery(
                 webhook_id="preview-exhausted-delivery", topic="orders/create",

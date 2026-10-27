@@ -33,16 +33,19 @@ Store operations combine repeatable work with decisions that need human judgment
 - Unified approval, support, and delivery recovery into one searchable, paginated workspace whose dashboard counts use the same query and whose record links preserve their originating context.
 - Added subject-level approval lifecycle locking with stable revision ordering and blocked a new revision when another revision has a started, successful, or ambiguous execution.
 - Made the isolated preview scenario-driven: reviewers can create fresh outcomes and run a due local retry without mutating global failure, ambiguity, or retry settings.
+- Prioritized recovery by urgency before age, included earlier terminal executions across approval types when blocking newer revisions, and surfaced a precise next step for invalid action contracts.
+- Added serialized subject-level manual retry queuing. Replaced approvals cannot be requeued or directly executed; queued local preview retries enforce their persisted backoff deadline.
+- Added a reviewed/current per-field evidence comparison and complete replacement lineage (decision actor/time, attempt count, replacement reason, and linked revisions) to approval detail pages.
+- Made both preview seed paths record exhausted approvals with an attempt count and audit trail matching the configured automatic retry budget; added coverage that an early preview retry changes no execution state.
 
-## Current verification — 26 October 2026, Manila time
+## Current verification — 27 October 2026, Manila time
 
-- **Behavior suite:** `python -m pytest -q` passed: **61 tests**. New coverage includes unified recovery navigation, request-scoped preview outcomes, and cross-revision terminal-outcome blocking.
+- **Behavior suite:** `python -m pytest -q` passed: **68 tests**. This run includes recovery priority, cross-kind terminal-outcome blocking, consistent exhausted preview history, retry backoff enforcement, and reviewed/current evidence comparison.
 - **Workflow exports:** all three JSON workflow files passed `python -m scripts.validate_workflows`.
-- **Schema upgrade:** no migration was required. Fresh-schema and upgrade checks were not run because no PostgreSQL server was reachable.
-- **PostgreSQL concurrency:** could not run because Docker Desktop had no daemon/socket. The lifecycle advisory-lock path therefore has SQLite regression coverage but no fresh PostgreSQL race result in this change.
-- **Synthetic preview:** started from `python -m scripts.preview`; the browser created a fresh retryable scenario, showed its reviewed evidence and due recovery control, ran the explicit local mock attempt, and persisted `succeeded` with attempt 2 and correlated audit events. Preview remained visibly isolated from n8n and integrations.
-- **Visual inspection:** inspected overview, unified recovery, interactive demo, approval evidence, retry recovery, long recovery content, and keyboard skip-link focus in the available 491 px in-app browser viewport. Current PNG captures are checked in. A separate desktop-width capture was unavailable in this environment and is not claimed.
-- **Live n8n:** not run because Docker's daemon was unavailable. Workflow-export validation is not n8n execution evidence.
+- **Schema upgrade and PostgreSQL concurrency:** could not run; the verifier's connection to localhost:5432 was refused. No migration was added. The PostgreSQL-only concurrency checks have no fresh result in this change.
+- **Synthetic preview:** restarted with `python -m scripts.preview --port 8002` and inspected isolated records. Confirmed the exhausted approval and delivery counts match their configured attempt budgets, the recovery queue shows all eight records in priority order, and stale approval detail separates reviewed from current customer-message evidence. Preview is temporary SQLite and does not exercise n8n.
+- **Visual inspection:** inspected the recovery workspace and stale-approval evidence page at 1440×900 and recovery at 390×844. The mobile screenshot shows a visible keyboard focus outline on the skip link and readable, wrapping queue controls. Current captures are checked in: desktop recovery, mobile recovery, and approval freshness comparison.
+- **Live n8n:** not run because the local PostgreSQL-backed Docker stack was unavailable. Workflow-export validation is not n8n execution evidence.
 
 ## Historical verification — 24 October 2026, Manila time
 
