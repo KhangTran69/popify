@@ -1,4 +1,4 @@
-import json, logging, secrets, uuid, time
+import json, logging, os, secrets, uuid, time
 from math import ceil
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
@@ -63,6 +63,21 @@ templates.env.globals["preview_mode"] = settings.preview_mode
 
 @asynccontextmanager
 async def lifespan(app):
+    if (
+        not settings.preview_mode
+        and os.environ.get("POPIFY_ENV", "production").lower() == "production"
+    ):
+        required = {
+            "APP_SECRET": settings.app_secret,
+            "OPERATOR_PASSWORD": settings.operator_password,
+            "N8N_WEBHOOK_SECRET": settings.n8n_webhook_secret,
+        }
+        placeholders = {"local-development-secret-change-me", "demo-change-me", "local-demo-secret"}
+        missing = [name for name, value in required.items() if not value or value in placeholders]
+        if missing:
+            raise RuntimeError("Production requires non-placeholder values for: " + ", ".join(missing))
+        if os.environ.get("COOKIE_SECURE", "false").lower() != "true":
+            raise RuntimeError("COOKIE_SECURE=true is required in production.")
     with engine.connect() as connection:
         connection.execute(select(1))
     yield
@@ -70,7 +85,10 @@ async def lifespan(app):
 
 app = FastAPI(title="CommerceOps", lifespan=lifespan)
 app.add_middleware(
-    SessionMiddleware, secret_key=settings.app_secret, same_site="lax", https_only=False
+    SessionMiddleware,
+    secret_key=settings.app_secret,
+    same_site="lax",
+    https_only=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
 )
 
 
@@ -118,7 +136,10 @@ def health(db: Session = Depends(get_db)):
         "mode": "isolated_preview" if settings.preview_mode else "mock_actions",
         "llm": (
             "openai"
-            if settings.llm_mode == "openai" and settings.openai_api_key
+            if (
+                settings.llm_mode == "openai"
+                and settings.openai_api_key
+            )
             else "mock"
         ),
     }

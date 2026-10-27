@@ -253,7 +253,10 @@ def create_support_case(
     policies = settings.store_policies
     draft = f"Thanks for contacting us. {facts} {policies[category]}"
     missing = ""
-    if settings.llm_mode == "openai" and settings.openai_api_key:
+    if (
+        settings.llm_mode == "openai"
+        and settings.openai_api_key
+    ):
         try:
             category, confidence, draft, missing = generate_support_content(
                 message, facts, policies

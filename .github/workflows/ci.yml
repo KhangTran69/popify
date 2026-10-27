@@ -10,6 +10,8 @@ permissions:
 jobs:
   unit-and-workflow-checks:
     runs-on: ubuntu-latest
+    env:
+      POPIFY_ENV: development
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
@@ -39,6 +41,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      POPIFY_ENV: development
       DATABASE_URL: postgresql+psycopg://commerceops:commerceops@localhost:5432/commerceops
       APP_SECRET: ci-only-secret
       OPERATOR_USERNAME: operator
