@@ -9,7 +9,7 @@ from app import main
 from app.db import Base, get_db
 from app.config import settings
 from app.models import (
-    Order, Delivery, Approval, ActionExecution, ExecutionReconciliation, Case, utcnow,
+    Order, Delivery, Approval, ActionExecution, ExecutionReconciliation, Case, Audit, utcnow,
 )
 from app.services import (
     process_delivery,
@@ -635,6 +635,57 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
     assert replacement.headers["location"].startswith("/demo/scenarios/")
     replacement_page = client.get(replacement.headers["location"])
     assert "Review the evidence and approve or reject the pending decision." in replacement_page.text
+    replacement_id = int(replacement.headers["location"].rsplit("/", 1)[1])
+    completed = client.post(
+        f"/approvals/{replacement_id}/decision?from_scenario={replacement_id}",
+        data={"csrf_token": token, "decision": "approved"}, follow_redirects=False,
+    )
+    assert completed.status_code == 303
+    result_page = client.get(completed.headers["location"])
+    assert "Recovery completed through a fresh approval" in result_page.text
+    assert f"Approval #{confirmed_id} has a persisted ambiguous execution" in result_page.text
+    assert f"Approval #{replacement_id} then captured fresh evidence" in result_page.text
+    assert "No provider or live workflow was called" not in result_page.text
+    assert f"Original ambiguous approval #{confirmed_id}" in result_page.text
+    assert f"Fresh approval #{replacement_id}" in result_page.text
+
+    # New contradictory evidence on the original attempt supersedes the earlier
+    # non-execution assertion. The fresh execution stays persisted, but the
+    # reviewer must no longer see the overall recovery as cleanly complete.
+    disputed = client.post(
+        f"/approvals/{confirmed_id}/reconcile?from_scenario={replacement_id}",
+        data={"csrf_token": token, "scenario_id": replacement_id,
+              "outcome": "confirmed_completed",
+              "explanation": "Later synthetic evidence contradicts the earlier assertion.",
+              "reference": "SYNTH-CONFLICT"},
+        follow_redirects=False,
+    )
+    assert disputed.status_code == 303
+    disputed_page = client.get(disputed.headers["location"])
+    assert "Recovery blocked by unresolved earlier evidence" in disputed_page.text
+    assert f"Review blocking approval #{confirmed_id}" in disputed_page.text
+    assert "execution remains separately persisted as succeeded" in disputed_page.text
+
+
+def test_preview_reviewer_never_claims_success_without_persisted_execution(monkeypatch):
+    from app.preview_scenarios import create_preview_scenario
+
+    monkeypatch.setattr(settings, "preview_mode", True)
+    monkeypatch.setitem(main.templates.env.globals, "preview_mode", True)
+    sign_in()
+    with TestingSession() as db:
+        approval = create_preview_scenario(db, "pending", actor="operator")
+        approval.status = "approved"
+        approval.execution_status = "succeeded"
+        approval.attempts = 1
+        approval_id = approval.id
+        db.commit()
+
+    page = client.get(f"/demo/scenarios/{approval_id}")
+    assert page.status_code == 200
+    assert "Successful execution record missing" in page.text
+    assert "no successful persisted execution record exists" in page.text
+    assert "Local mock outcome persisted" not in page.text
 
 
 def test_stale_preview_approval_submission_after_rejection_is_idempotent(monkeypatch):
@@ -1195,7 +1246,7 @@ def test_authenticated_dashboard_and_failed_delivery_detail_render():
         "Receipt to persistence" in dashboard.text
         and "visible-failure" in client.get("/queues/deliveries?status=exhausted").text
     )
-    assert detail.status_code == 200 and "Retry delivery" in detail.text
+    assert detail.status_code == 200 and "Queue delivery retry" in detail.text
 
 
 def sign_in():
@@ -1518,6 +1569,32 @@ def test_navigation_survives_decision_retry_and_related_links():
     assert 'href="/queues/failures?q=review&amp;status=evidence_changed&amp;page=1"' in changed_page
     invalid = client.get(f"/approvals/{approval_id}?from_queue=//evil.test&status=exhausted&page=-1").text
     assert 'href="/queues/approvals"' in invalid
+
+
+def test_record_journey_is_readable_paginated_and_preserves_queue_context():
+    sign_in()
+    with TestingSession() as db:
+        order = Order(external_id="journey-1", order_number="#JOURNEY-1", payload={})
+        db.add(order)
+        db.flush()
+        for index in range(45):
+            db.add(Audit(
+                correlation_id="journey:1", entity_type="order", entity_id=order.id,
+                event="approval_requested" if index == 44 else "order_updated",
+                actor="worker", details={"sequence": index},
+            ))
+        db.commit()
+        order_id = order.id
+    context = "from_queue=orders&q=JOURNEY&status=unfulfilled&page=2"
+    first = client.get(f"/orders/{order_id}?{context}")
+    assert first.status_code == 200
+    assert "Operational journey" in first.text
+    assert "Human review requested" in first.text
+    assert "CURRENT STATE" in first.text and "Next supported action" in first.text
+    assert f"?{context.replace('&', '&amp;')}&amp;journey_page=2" in first.text
+    older = client.get(f"/orders/{order_id}?{context}&journey_page=2")
+    assert "Page 2 of 2" in older.text
+    assert f'/orders/{order_id}?{context.replace("&", "&amp;")}' in older.text
 
 
 def test_guided_rejection_stops_outcome_and_links_back_to_run():

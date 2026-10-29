@@ -21,6 +21,7 @@ from app.models import (
     ExecutionReconciliation, utcnow,
 )
 from app.presentation import record_navigation, retry_guidance, snapshot_utc
+from app.record_journey import load_record_journey, record_guidance
 from app.recovery import RECOVERY_CATEGORIES, recovery_counts, recovery_page
 from app.scenario_view import build_scenario_view
 from app.preview_scenarios import (
@@ -881,51 +882,6 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
     entity = db.get(model, record_id)
     if not entity:
         raise HTTPException(404, "Record not found")
-    related = []
-    related_cases_limited = False
-    conditions = [(Audit.entity_type == kind) & (Audit.entity_id == record_id)]
-    if kind == "approval":
-        correlation_id = (entity.supporting_facts or {}).get("correlation_id")
-        if correlation_id:
-            conditions.append(Audit.correlation_id == correlation_id)
-    if kind in ("order", "case"):
-        subjects = [record_id]
-        approval_condition = (Approval.subject_type == kind) & (
-            Approval.subject_id == record_id
-        )
-        if kind == "order":
-            case_ids = list(db.scalars(
-                select(Case.id)
-                .where(Case.order_id == record_id)
-                .order_by(Case.id.desc())
-                .limit(101)
-            ))
-            related_cases_limited = len(case_ids) > 100
-            case_ids = case_ids[:100]
-            approval_condition = or_(
-                approval_condition,
-                (Approval.subject_type == "case") & Approval.subject_id.in_(case_ids),
-            )
-            conditions.append(
-                (Audit.entity_type == "case") & Audit.entity_id.in_(case_ids)
-            )
-        related = db.scalars(
-            select(Approval).where(approval_condition).order_by(Approval.id.desc()).limit(50)
-        ).all()
-        conditions.append(
-            (Audit.entity_type == "approval")
-            & Audit.entity_id.in_([a.id for a in related])
-        )
-    timeline = list(
-        reversed(
-            db.scalars(
-                select(Audit)
-                .where(or_(*conditions))
-                .order_by(Audit.created_at.desc(), Audit.id.desc())
-                .limit(100)
-            ).all()
-        )
-    )
     title = (
         f"Order {entity.order_number}"
         if kind == "order"
@@ -942,6 +898,19 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
                 {key: value for key, value in request.query_params.items() if key != "from_scenario"},
                 kind,
             )
+    try:
+        journey_page = max(1, int(request.query_params.get("journey_page", "1")))
+    except ValueError:
+        journey_page = 1
+    try:
+        related_page = max(1, int(request.query_params.get("related_page", "1")))
+    except ValueError:
+        related_page = 1
+    journey = load_record_journey(
+        db, kind, entity, query=detail_query, page=journey_page,
+        related_page=related_page,
+    )
+    related = journey["related"]
     subject = None
     current_order = None
     freshness_differences = []
@@ -963,6 +932,7 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
     reconciliation_history_pages = 1
     reconciliation_page_url = ""
     ambiguous_execution = None
+    own_action_execution = None
     if kind == "approval":
         subject = db.get(Order if entity.subject_type == "order" else Case, entity.subject_id)
         current_order = subject if entity.subject_type == "order" else subject.order if subject else None
@@ -972,6 +942,7 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
                 ActionExecution.idempotency_key == f"approval:{entity.id}"
             )
         )
+        own_action_execution = prior_execution
         if prior_execution and prior_execution.state == "ambiguous":
             ambiguous_execution = prior_execution
             try:
@@ -1067,6 +1038,32 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             }
             for revision in revisions
         ]
+    refresh_supported = bool(
+        kind == "approval"
+        and (entity.kind, entity.subject_type, entity.proposed_action) in ACTION_CONTRACTS
+        and not refresh_blocked_by_execution
+    )
+    preview_run_due = bool(
+        kind == "approval"
+        and entity.execution_status in ("queued", "retryable")
+        and (not entity.next_attempt_at or as_utc(entity.next_attempt_at) <= utcnow())
+    )
+    guidance = record_guidance(
+        kind,
+        entity,
+        freshness_differences=freshness_differences,
+        reconciliation=reconciliation,
+        now=utcnow(),
+        detail_query=detail_query,
+        blocking_approval=prior_blocking_approval,
+        blocking_execution=prior_blocking_execution if kind == "approval" else None,
+        refresh_supported=refresh_supported,
+        refresh_blocked=refresh_blocked_by_execution,
+        related_total=journey["related_total"],
+        action_execution=own_action_execution,
+        preview_mode=settings.preview_mode,
+        retry_due=preview_run_due,
+    )
     return templates.TemplateResponse(
         request,
         "detail.html",
@@ -1077,15 +1074,19 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "title": title,
             "entity": entity,
             "kind": kind,
-            "timeline": timeline,
+            "journey_events": journey["events"],
+            "journey_total": journey["total"],
+            "journey_page": journey["page"],
+            "journey_pages": journey["pages"],
             "related": related,
+            "related_total": journey["related_total"],
+            "related_page": journey["related_page"],
+            "related_pages": journey["related_pages"],
             "back_url": back_url,
             "detail_query": detail_query,
             "retry_guidance": retry_guidance,
             "now": utcnow(),
-            "preview_run_due": kind == "approval"
-            and entity.execution_status in ("queued", "retryable")
-            and (not entity.next_attempt_at or as_utc(entity.next_attempt_at) <= utcnow()),
+            "preview_run_due": preview_run_due,
             "subject": subject,
             "current_order": current_order,
             "freshness_differences": freshness_differences,
@@ -1113,16 +1114,13 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "reconciliation_history_pages": reconciliation_history_pages,
             "reconciliation_page_url": reconciliation_page_url,
             "ambiguous_execution": ambiguous_execution,
+            "record_guidance": guidance,
             "scenario_id": scenario_id,
-            "refresh_supported": kind == "approval"
-            and (entity.kind, entity.subject_type, entity.proposed_action) in ACTION_CONTRACTS
-            and not refresh_blocked_by_execution,
+            "refresh_supported": refresh_supported,
             "preview_can_demonstrate_blocked": settings.preview_mode
             and kind == "approval" and entity.status == "pending"
             and (entity.kind, entity.subject_type, entity.proposed_action) not in ACTION_CONTRACTS
             and not entity.replacement_approval_id and not refresh_blocked_by_execution,
-            "timeline_limited": len(timeline) == 100,
-            "related_cases_limited": related_cases_limited,
         },
         status_code=status_code,
     )

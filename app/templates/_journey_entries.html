@@ -1,0 +1,15 @@
+<ol class="journey-history" aria-label="Saved operational history">
+  {% for row in journey_events %}
+    {% set event = row.event %}
+    <li class="journey-entry">
+      <div><strong>{{ row.title }}</strong><small>{{ event.created_at|utc }} · {{ event.actor }}</small></div>
+      {% if row.explanation %}<p>{{ row.explanation }}</p>{% endif %}
+      <small>{{ event.entity_type }} #{{ event.entity_id }}</small>
+      {% if row.href %}<a href="{{ row.href }}">Open saved record ↗</a>{% endif %}
+      {% if event.details %}<details><summary>Saved event evidence</summary><pre>{{ event.details|tojson(indent=2) }}</pre></details>{% endif %}
+      <small class="mono">{{ event.correlation_id }}</small>
+    </li>
+  {% else %}
+    <li class="empty">No events recorded yet.</li>
+  {% endfor %}
+</ol>

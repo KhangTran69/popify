@@ -7,49 +7,7 @@ persisted-state interpretation. This module never mutates an approval.
 from app.models import Approval, utcnow
 from app.services import approval_freshness_differences, as_utc, prior_terminal_execution
 from app.preview_scenarios import SCENARIO_GUIDANCE, unresolved_related_approvals
-
-
-def _journey_event(event, scenario_id):
-    """Turn a saved audit event into a concise, linked operator history row."""
-    details = event.details or {}
-    event_name = event.event
-    title = event_name.replace("_", " ").capitalize()
-    explanation = ""
-    if event_name == "preview_order_context_attached":
-        title, explanation = "Synthetic order linked", "The saved order supplies context for this inquiry."
-    elif event_name in ("preview_scenario_created", "inquiry_queued"):
-        title, explanation = "Customer request saved", "A synthetic inquiry started this isolated scenario."
-    elif event_name in ("preview_triage_completed", "draft_created"):
-        title, explanation = "Automation prepared a draft", "Review the saved support case and its order facts."
-    elif event_name == "approval_requested":
-        title, explanation = "Human review requested", "The proposed action and evidence were saved for an operator decision."
-    elif event_name in ("approval_approved", "approval_rejected"):
-        title = "Operator approved" if event_name == "approval_approved" else "Operator rejected"
-        explanation = "The decision is recorded; approval alone does not prove an action completed." if event_name == "approval_approved" else "The action did not execute."
-    elif event_name.startswith("action_execution_"):
-        state = event_name.removeprefix("action_execution_").replace("_", " ")
-        title = f"Mock action: {state}"
-        attempt = details.get("attempt")
-        explanation = f"Attempt {attempt}. " if isinstance(attempt, int) else ""
-        explanation += "The saved execution and retry state determine the next action."
-    elif event_name == "execution_outcome_reconciled":
-        title = "Operator reconciled uncertain outcome"
-        explanation = f"Conclusion: {str(details.get('outcome') or 'unknown').replace('_', ' ')}. The original execution remains recorded."
-    elif event_name == "approval_replaced_with_fresh_evidence":
-        title = "Approval replaced after evidence review"
-        explanation = f"New approval #{details.get('replacement_approval_id')}; the original decision and attempts remain in history."
-    elif event_name == "approval_refreshed_from_previous_revision":
-        title = "Fresh approval requested"
-        explanation = f"Replaces approval #{details.get('previous_approval_id')}."
-    elif event_name == "support_draft_refreshed_for_approval":
-        title, explanation = "Draft refreshed for new review", "The fresh proposal uses current source facts."
-    elif event_name == "preview_source_changed_after_approval":
-        title, explanation = "Source facts changed", "Compare the reviewed snapshot with the current request before deciding again."
-    route = {"order": "orders", "case": "cases", "approval": "approvals"}.get(event.entity_type)
-    return {
-        "event": event, "title": title, "explanation": explanation,
-        "href": f"/{route}/{event.entity_id}?from_scenario={scenario_id}" if route else None,
-    }
+from app.record_journey import journey_event
 
 
 def build_scenario_view(db, scenario):
@@ -100,19 +58,32 @@ def build_scenario_view(db, scenario):
 
     automation_complete = bool(scenario["case"].draft and scenario["case"].status != "queued")
     decision_complete = current.status in ("approved", "rejected")
-    result_complete = not blocking_approval and (current.status == "rejected" or status in (
-        "succeeded", "reconciled_completed"
-    ))
+    execution_persisted_success = bool(execution and execution.state == "succeeded")
+    assertion_persisted_complete = bool(
+        status == "reconciled_completed" and reconciliation
+        and reconciliation.outcome == "confirmed_completed"
+    )
+    result_complete = not blocking_approval and (
+        (current.status == "rejected" and execution is None)
+        or (status == "succeeded" and execution_persisted_success)
+        or assertion_persisted_complete
+    )
     if blocking_approval and blocking_approval.execution_status in ("ambiguous", "disputed"):
         outcome_detail = f"Related approval #{blocking_approval.id} has unresolved execution evidence. Inspect its original record."
     elif blocking_approval:
         outcome_detail = f"Related approval #{blocking_approval.id} has a prior execution. Inspect that outcome before acting."
     elif current.status == "rejected":
-        outcome_detail = "Rejected by the operator; no action execution was created."
+        outcome_detail = (
+            "Rejected by the operator; no action execution was created."
+            if execution is None
+            else "The approval is rejected but an execution record also exists. Ask a maintainer to investigate this inconsistent state."
+        )
     elif status == "reconciled_not_executed":
         outcome_detail = "Operator confirmed non-execution; the original attempt remains ambiguous. Create a fresh approval before acting."
     elif status == "reconciled_completed":
         outcome_detail = "Operator recorded completion; the original execution remains ambiguous and no provider was queried."
+    elif status == "succeeded" and not execution_persisted_success:
+        outcome_detail = "Approval status says succeeded, but no successful persisted execution record exists."
     elif execution:
         outcome_detail = (
             f"Mock execution: {execution.state.replace('_', ' ')} after "
@@ -151,6 +122,65 @@ def build_scenario_view(db, scenario):
          "detail": outcome_detail,
          "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
     ]
+    provenance = scenario.get("recovery_provenance")
+    prior_recovery, prior_execution, prior_reconciliation = provenance or (None, None, None)
+    if blocking_approval and blocking_approval.execution_status in ("ambiguous", "disputed"):
+        reviewer_result = {
+            "tone": "bad",
+            "title": "Recovery blocked by unresolved earlier evidence",
+            "summary": (
+                f"Approval #{blocking_approval.id} has {blocking_approval.execution_status.replace('_', ' ')} evidence. "
+                + (f"The current approval's execution remains separately persisted as {execution.state}. " if execution else "")
+                + "Review the earlier approval before treating this journey as complete."
+            ),
+            "proof": f"Current approval #{current.id} · earlier approval #{blocking_approval.id}",
+            "links": [{"label": f"Review blocking approval #{blocking_approval.id}", "href": f"/approvals/{blocking_approval.id}?from_scenario={scenario['scenario_id']}"}],
+        }
+    elif current.execution_status == "succeeded" and not execution_persisted_success:
+        reviewer_result = {
+            "tone": "bad",
+            "title": "Successful execution record missing",
+            "summary": "The approval state says succeeded, but the persisted ActionExecution record is missing or has another state. Investigate this inconsistency before reporting completion.",
+            "proof": f"Approval #{current.id} · execution state unavailable",
+            "links": [{"label": f"Inspect approval #{current.id}", "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"}],
+        }
+    elif current.execution_status == "succeeded" and prior_recovery and prior_execution and prior_reconciliation and execution_persisted_success:
+        reviewer_result = {
+            "tone": "good",
+            "title": "Recovery completed through a fresh approval",
+            "summary": (
+                f"Approval #{prior_recovery.id} has a persisted ambiguous execution and the operator's "
+                f"{prior_reconciliation.outcome.replace('_', ' ')} assertion ({prior_reconciliation.actor}, "
+                f"{prior_reconciliation.created_at.strftime('%d %b %Y %H:%M UTC')}, reference "
+                f"{prior_reconciliation.reference or 'none'}). Approval #{current.id} then captured fresh evidence, "
+                "received a separate human decision, and persisted a successful local mock execution."
+            ),
+            "proof": f"Decision by {current.actor or 'unknown'} at {current.decision_at.strftime('%d %b %Y %H:%M UTC') if current.decision_at else 'time not recorded'} · approval revision {current.revision} · execution #{execution.id}, {execution.attempts} attempt{'s' if execution.attempts != 1 else ''} · {prior_reconciliation.correlation_id}",
+            "links": [
+                {"label": f"Original ambiguous approval #{prior_recovery.id}", "href": f"/approvals/{prior_recovery.id}?from_scenario={scenario['scenario_id']}"},
+                {"label": f"Fresh approval #{current.id}", "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
+            ],
+        }
+    elif current.execution_status == "succeeded" and execution_persisted_success:
+        reviewer_result = {
+            "tone": "good", "title": "Local mock outcome persisted",
+            "summary": "The approval decision and successful ActionExecution are persisted in the disposable preview database. No provider or live workflow was called.",
+            "proof": f"Approval #{current.id} · revision {current.revision} · execution #{execution.id} · {execution.attempts} attempt{'s' if execution.attempts != 1 else ''} · decision by {current.actor or 'unknown'}",
+            "links": [{"label": f"Inspect approval and execution #{current.id}", "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"}],
+        }
+    elif current.status == "rejected":
+        rejected_has_execution = bool(execution)
+        reviewer_result = {
+            "tone": "bad" if rejected_has_execution else "good",
+            "title": "Rejected decision has an execution record" if rejected_has_execution else "Rejection persisted",
+            "summary": "The saved approval is rejected but an ActionExecution also exists; investigate before describing this as a clean rejection." if rejected_has_execution else "The human decision is saved and no execution record was created.",
+            "proof": f"Approval #{current.id} · {current.actor or 'operator not recorded'} · {current.decision_at.strftime('%d %b %Y %H:%M UTC') if current.decision_at else 'time not recorded'}",
+            "links": [{"label": f"Inspect approval #{current.id}", "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"}],
+        }
+    elif current.execution_status == "reconciled_completed":
+        reviewer_result = {"tone": "warn", "title": "Closed by operator assertion", "summary": "The original execution remains ambiguous. This conclusion is persisted evidence supplied by an operator, not provider verification.", "proof": f"Approval #{current.id} · no provider queried", "links": [{"label": "Review the operator assertion", "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"}]}
+    else:
+        reviewer_result = {"tone": "warn", "title": "Journey still requires attention", "summary": next_step, "proof": f"Approval #{current.id} · {current.status} · {current.execution_status.replace('_', ' ')}", "links": [{"label": "Open current approval", "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"}]}
     return {
             "scenario": scenario,
             "scenario_objective": SCENARIO_GUIDANCE[scenario["scenario_key"]],
@@ -161,9 +191,10 @@ def build_scenario_view(db, scenario):
             "preview_waiting": bool(current.next_attempt_at and as_utc(current.next_attempt_at) > utcnow()),
             "next_step": next_step,
             "stages": stages,
+            "reviewer_result": reviewer_result,
             "approvals": scenario["approvals"],
             "events": scenario["events"],
-            "journey_events": [_journey_event(item, scenario["scenario_id"])
+            "journey_events": [journey_event(item, scenario_id=scenario["scenario_id"])
                                for item in scenario["events"]],
             "reconciliable": bool(execution and execution.state == "ambiguous"
                                    and not current.replacement_approval_id

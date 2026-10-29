@@ -18,6 +18,14 @@
     </div>
   </section>
 
+  <section class="notice {{ reviewer_result.tone }} reviewer-result" aria-labelledby="reviewer-result-title">
+    <span class="eyebrow">REVIEWER RESULT · DERIVED FROM SAVED RECORDS</span>
+    <h2 id="reviewer-result-title">{{ reviewer_result.title }}</h2>
+    <p>{{ reviewer_result.summary }}</p>
+    <small>{{ reviewer_result.proof }}</small>
+    {% if reviewer_result.links %}<nav class="reviewer-result-links" aria-label="Evidence for reviewer result">{% for link in reviewer_result.links %}<a href="{{ link.href }}">{{ link.label }} ↗</a>{% endfor %}</nav>{% endif %}
+  </section>
+
   <section class="scenario-stages" aria-label="Scenario progress">
     {% for stage in stages %}
       <article class="scenario-stage {{ stage.state }}">
@@ -119,7 +127,7 @@
 
   <section class="box scenario-audit" aria-labelledby="scenario-audit-title">
     <div class="panelhead"><div><h2 id="scenario-audit-title">Journey history</h2><p>Saved events across the request, approval revisions, attempts, and operator conclusions. Page {{ audit_page }} of {{ audit_pages }} · latest page first.</p><p class="mono">{{ scenario.correlation_id }} · {{ scenario.audit_total }} events</p></div><span class="count">{{ journey_events|length }}</span></div>
-    <ol class="journey-history">{% for row in journey_events %}{% set event = row.event %}<li class="journey-entry"><div><strong>{{ row.title }}</strong><small>{{ event.created_at|utc }} · {{ event.actor }}</small></div>{% if row.explanation %}<p>{{ row.explanation }}</p>{% endif %}<small>{{ event.entity_type }} #{{ event.entity_id }}</small>{% if row.href %}<a href="{{ row.href }}">Open saved record ↗</a>{% endif %}{% if event.details %}<details><summary>Saved event evidence</summary><pre>{{ event.details|tojson(indent=2) }}</pre></details>{% endif %}</li>{% else %}<li class="empty">No saved events for this scenario.</li>{% endfor %}</ol>
+    {% include '_journey_entries.html' %}
     {% if audit_pages > 1 %}<nav class="pagination" aria-label="Audit history pages">{% if audit_page > 1 %}<a href="?audit_page={{ audit_page - 1 }}&amp;revision_page={{ approval_page }}&amp;reconciliation_page={{ reconciliation_page }}">Newer events</a>{% endif %}<span>Page {{ audit_page }} of {{ audit_pages }}</span>{% if audit_page < audit_pages %}<a href="?audit_page={{ audit_page + 1 }}&amp;revision_page={{ approval_page }}&amp;reconciliation_page={{ reconciliation_page }}">Older events</a>{% endif %}</nav>{% endif %}
   </section>
 </main>
