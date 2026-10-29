@@ -27,6 +27,7 @@ from app.services import (
     queue_approval_retry,
     reconcile_approval_execution,
 )
+from app.action_provider import ActionRequest, ActionResult
 
 engine = create_engine(
     "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -366,6 +367,188 @@ def test_transient_action_failure_and_safe_retry(monkeypatch):
             )
         ).all()
         assert len(rows) == 1 and rows[0].attempts == 2
+
+
+def test_provider_neutral_adapter_receives_reviewed_action_and_stable_key():
+    class RecordingAdapter:
+        def __init__(self):
+            self.requests = []
+
+        def execute(self, request):
+            self.requests.append(request)
+            state = "retryable" if len(self.requests) == 1 else "succeeded"
+            return ActionResult(state, "safe adapter detail")
+
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "exception", "order", 123, "review_delayed_order", {"order_number": "#123"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        adapter = RecordingAdapter()
+        execute_approved(db, approval, adapter=adapter)
+        assert approval.execution_status == "retryable"
+        first_request = adapter.requests[0]
+        assert first_request.idempotency_key == f"approval:{approval.id}"
+        assert first_request.action == ("exception", "order", "review_delayed_order")
+        assert first_request.subject_id == approval.subject_id
+        assert first_request.evidence_hash == approval.evidence_hash
+        assert first_request.reviewed_evidence["order_number"] == "#123"
+        approval.next_attempt_at = utcnow() - timedelta(seconds=1)
+        execute_approved(db, approval, adapter=adapter)
+        rows = db.scalars(select(ActionExecution)).all()
+        assert len(rows) == 1 and rows[0].attempts == 2
+        assert [request.idempotency_key for request in adapter.requests] == [
+            f"approval:{approval.id}", f"approval:{approval.id}"
+        ]
+        assert approval.execution_status == "succeeded"
+
+
+@pytest.mark.parametrize("adapter_behavior", ["exception", "malformed", "unhashable-state"])
+def test_adapter_uncertainty_fails_closed_as_ambiguous(adapter_behavior):
+    class UncertainAdapter:
+        def execute(self, request):
+            if adapter_behavior == "exception":
+                raise TimeoutError("sensitive raw transport detail")
+            if adapter_behavior == "unhashable-state":
+                return ActionResult(["succeeded"], "unsafe state")
+            return {"state": "succeeded"}
+
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "exception", "order", 123, "review_delayed_order", {"order_number": "#123"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        execute_approved(db, approval, adapter=UncertainAdapter())
+        execution = db.scalar(select(ActionExecution))
+        assert approval.execution_status == "ambiguous"
+        assert execution.state == "ambiguous"
+        assert "sensitive raw transport detail" not in execution.detail
+        assert approval.attempts == 1
+
+
+def test_pending_approval_does_not_invoke_adapter():
+    class RecordingAdapter:
+        calls = 0
+
+        def execute(self, request):
+            self.calls += 1
+            return ActionResult("succeeded", "done")
+
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "exception", "order", 123, "review_delayed_order", {"order_number": "#123"}
+        )
+        adapter = RecordingAdapter()
+        with pytest.raises(PermissionError):
+            execute_approved(db, approval, adapter=adapter)
+        assert adapter.calls == 0
+
+
+@pytest.mark.parametrize("gate", ["not-due", "stale-evidence", "rejected"])
+def test_ineligible_approval_does_not_invoke_adapter(gate):
+    class RecordingAdapter:
+        calls = 0
+
+        def execute(self, request):
+            self.calls += 1
+            return ActionResult("succeeded", "done")
+
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 124, "send_reply", {"draft": "Reviewed"}
+        )
+        decision = "rejected" if gate == "rejected" else "approved"
+        decide_approval(db, approval.id, decision, "operator")
+        adapter = RecordingAdapter()
+        if gate == "not-due":
+            approval.execution_status = "retryable"
+            approval.next_attempt_at = utcnow() + timedelta(minutes=5)
+        elif gate == "stale-evidence":
+            db.get(Case, 124).draft = "Changed after approval"
+            db.flush()
+        if gate == "rejected":
+            with pytest.raises(PermissionError):
+                execute_approved(db, approval, adapter=adapter)
+        else:
+            execute_approved(db, approval, adapter=adapter)
+        assert adapter.calls == 0
+
+
+@pytest.mark.parametrize("gate", [
+    "replaced-approval", "prior-terminal-execution", "duplicate-terminal-execution",
+    "unsupported-action",
+])
+def test_terminal_and_contract_gates_do_not_invoke_adapter(gate):
+    class RecordingAdapter:
+        calls = 0
+
+        def execute(self, request):
+            self.calls += 1
+            return ActionResult("succeeded", "done")
+
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "support", "case", 125, "send_reply", {"draft": "Reviewed"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        adapter = RecordingAdapter()
+
+        if gate == "replaced-approval":
+            case = db.get(Case, approval.subject_id)
+            case.draft = "Changed after review"
+            db.flush()
+            execute_approved(db, approval, adapter=adapter)
+            assert approval.execution_status == "evidence_changed"
+            replacement = refresh_approval(db, approval.id, "operator")
+            case.draft = "Reviewed"
+            db.flush()
+            assert replacement.id == approval.replacement_approval_id
+            execute_approved(db, approval, adapter=adapter)
+            assert approval.execution_status == "superseded"
+        elif gate == "prior-terminal-execution":
+            execute_approved(db, approval, mock_outcome="ambiguous")
+            alternate = Approval(
+                kind="exception", subject_type="case", subject_id=approval.subject_id,
+                proposed_action="review_refund_request", status="approved",
+                execution_status="queued", supporting_facts={},
+            )
+            db.add(alternate)
+            db.flush()
+            execute_approved(db, alternate, adapter=adapter)
+            assert alternate.execution_status == "blocked_prior_outcome"
+        elif gate == "duplicate-terminal-execution":
+            execute_approved(db, approval, mock_outcome="succeeded")
+            execute_approved(db, approval, adapter=adapter)
+            assert approval.execution_status == "succeeded"
+            assert approval.attempts == 1
+        else:
+            approval.proposed_action = "unsupported_action"
+            approval.execution_status = "queued"
+            approval.evidence_hash = None
+            db.flush()
+            execute_approved(db, approval, adapter=adapter)
+            assert approval.execution_status == "invalid_action"
+
+        assert adapter.calls == 0
+
+
+def test_mock_action_adapter_contract_does_not_call_outbound_http(monkeypatch):
+    calls = []
+
+    def forbidden_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("action adapter attempted outbound HTTP")
+
+    monkeypatch.setattr("app.integrations.httpx.post", forbidden_post)
+    monkeypatch.setattr("app.main.httpx.post", forbidden_post)
+    with TestingSession() as db:
+        approval = create_approval(
+            db, "exception", "order", 123, "review_delayed_order", {"order_number": "#123"}
+        )
+        decide_approval(db, approval.id, "approved", "operator")
+        execute_approved(db, approval)
+        assert approval.execution_status == "succeeded"
+        assert calls == []
 
 
 def test_unapproved_action_cannot_execute():
