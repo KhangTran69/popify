@@ -10,6 +10,8 @@ A local e-commerce operations demonstration: receive an order, detect a delay, p
 - [n8n editor](http://localhost:5678): its owner account is separate from the operator account.
 - [API health](http://localhost:8001/health)
 
+For a concise walkthrough that separates the disposable preview from the local n8n run, see [Reviewer walkthrough](docs/REVIEWER_WALKTHROUGH.md).
+
 ## Setup
 
 Requires Docker Desktop with Compose. From the repository root:
