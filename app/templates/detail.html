@@ -128,7 +128,7 @@
         {% elif entity.status == 'superseded' %}
           <div class="notice">No decision was recorded for this revision. Use the linked replacement to review current facts.</div>
         {% elif entity.status == 'rejected' %}
-          <div class="notice">Rejected by {{ entity.actor or 'operator' }}. No mock action will run for this approval.</div>
+          {% if own_action_execution %}<div class="notice error">Rejected by {{ entity.actor or 'operator' }}, but execution #{{ own_action_execution.id }} is also recorded as {{ own_action_execution.state }}. Investigate this inconsistent outcome.</div>{% else %}<div class="notice">Rejected by {{ entity.actor or 'operator' }}. No mock action will run for this approval.</div>{% endif %}
         {% elif entity.status == 'approved' and entity.execution_status in ['failed', 'retryable', 'exhausted', 'queued'] %}
           <div class="notice warn"><strong>{% if entity.execution_status == 'exhausted' %}Automatic retry budget used{% elif entity.execution_status == 'queued' %}Recovery attempt queued{% else %}Action needs another attempt{% endif %}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
           {% if preview_mode and preview_run_due %}<form method="post" action="/approvals/{{ entity.id }}/preview-run{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Run due local mock attempt</button></form>{% elif preview_mode and entity.execution_status == 'queued' %}<p class="field-help">The attempt remains queued until its recorded retry deadline.</p>{% elif entity.execution_status in ['failed', 'exhausted'] %}<form method="post" action="/approvals/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue action retry</button></form>{% endif %}
@@ -170,7 +170,7 @@
         {% elif entity.execution_status == 'superseded' %}
           <div class="notice error"><strong>This approval has been replaced.</strong><p>Its evidence remains in the audit history, but it cannot execute. Open the replacement approval to review the current facts.</p></div>
         {% elif entity.execution_status == 'succeeded' %}
-          <div class="notice">Mock action completed. The timeline records the decision and execution.</div>
+          {% if own_action_execution and own_action_execution.state == 'succeeded' %}<div class="notice">Mock action completed. The operational journey records the decision and execution.</div>{% else %}<div class="notice error">Approval state says succeeded, but no matching successful execution is saved. Investigate before reporting completion.</div>{% endif %}
         {% elif entity.status == 'approved' %}
           <div class="notice">{% if preview_mode %}Decision recorded in the disposable preview. No workflow ran.{% else %}Approved and waiting for n8n to run the queued mock action.{% endif %}</div>
         {% endif %}

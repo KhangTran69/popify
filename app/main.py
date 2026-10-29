@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
-from sqlalchemy import select, func, or_, cast, String, exists
+from sqlalchemy import select, func, or_, cast, String, exists, literal
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, Field
 import httpx
@@ -269,7 +269,16 @@ def dashboard(request: Request, actor=Depends(operator), db: Session = Depends(g
             Approval, Approval.kind == "exception", Approval.status == "pending"
         ),
         "approvals": count(Approval, Approval.status == "pending"),
-        "success": count(ActionExecution, ActionExecution.state == "succeeded"),
+        "success": db.scalar(
+            select(func.count()).select_from(ActionExecution).join(
+                Approval,
+                ActionExecution.idempotency_key == literal("approval:") + cast(Approval.id, String),
+            ).where(
+                ActionExecution.state == "succeeded",
+                Approval.status == "approved",
+                Approval.execution_status == "succeeded",
+            )
+        ) or 0,
         "failures": recovery["total"] - recovery["pending"],
         "queued": count(Delivery, Delivery.status == "received")
         + count(Case, Case.status == "queued")
@@ -1114,6 +1123,7 @@ def detail_response(kind, record_id, request, actor, db, status_code=200):
             "reconciliation_history_pages": reconciliation_history_pages,
             "reconciliation_page_url": reconciliation_page_url,
             "ambiguous_execution": ambiguous_execution,
+            "own_action_execution": own_action_execution,
             "record_guidance": guidance,
             "scenario_id": scenario_id,
             "refresh_supported": refresh_supported,

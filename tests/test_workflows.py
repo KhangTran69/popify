@@ -646,8 +646,8 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
     assert f"Approval #{confirmed_id} has a persisted ambiguous execution" in result_page.text
     assert f"Approval #{replacement_id} then captured fresh evidence" in result_page.text
     assert "No provider or live workflow was called" not in result_page.text
-    assert f"Original ambiguous approval #{confirmed_id}" in result_page.text
-    assert f"Fresh approval #{replacement_id}" in result_page.text
+    assert f"Original ambiguous execution and assertion · approval #{confirmed_id}" in result_page.text
+    assert f"Fresh decision and saved result · approval #{replacement_id}" in result_page.text
 
     # New contradictory evidence on the original attempt supersedes the earlier
     # non-execution assertion. The fresh execution stays persisted, but the
@@ -1597,6 +1597,37 @@ def test_record_journey_is_readable_paginated_and_preserves_queue_context():
     assert f'/orders/{order_id}?{context.replace("&", "&amp;")}' in older.text
 
 
+def test_order_journey_reaches_cases_and_approvals_beyond_old_caps():
+    sign_in()
+    with TestingSession() as db:
+        order = Order(external_id="large-journey", order_number="#LARGE-JOURNEY", payload={})
+        db.add(order)
+        db.flush()
+        first_approval_id = None
+        for index in range(105):
+            support = Case(order_id=order.id, message=f"Synthetic request {index}", status="needs_review")
+            db.add(support)
+            db.flush()
+            approval = Approval(kind="support", subject_type="case", subject_id=support.id,
+                                proposed_action="send_reply", status="pending")
+            db.add(approval)
+            db.flush()
+            if index == 0:
+                first_approval_id = approval.id
+            db.add(Audit(correlation_id=f"large-journey:{index}", entity_type="case",
+                         entity_id=support.id, event="inquiry_queued", actor="system", details={}))
+        db.commit()
+        order_id = order.id
+
+    first = client.get(f"/orders/{order_id}?from_queue=orders&q=LARGE&page=2")
+    assert "Related approvals · 105 total" in first.text
+    assert "Page 1 of 6" in first.text
+    oldest = client.get(f"/orders/{order_id}?from_queue=orders&q=LARGE&page=2&related_page=6&journey_page=3")
+    assert f"/approvals/{first_approval_id}?from_queue=orders&amp;q=LARGE&amp;page=2" in oldest.text
+    assert "Page 6 of 6" in oldest.text
+    assert "Page 3 of 3" in oldest.text
+
+
 def test_guided_rejection_stops_outcome_and_links_back_to_run():
     from app.models import Case
 
@@ -1909,6 +1940,41 @@ def test_dashboard_recovery_counts_link_to_the_complete_matching_queues():
     assert f"Support case #{failed_case_id}" in recovery.text
     assert f"Support case #{exhausted_case_id}" in recovery.text
     assert "retry-delivery" in recovery.text and "exhausted-delivery" in recovery.text
+
+
+def test_inconsistent_terminal_outcomes_are_visible_and_not_counted_as_success():
+    from app.recovery import recovery_counts, recovery_page
+
+    sign_in()
+    with TestingSession() as db:
+        order = Order(external_id="inconsistent-outcomes", order_number="#INCONSISTENT", payload={})
+        db.add(order)
+        db.flush()
+        missing = Approval(kind="support", subject_type="order", subject_id=order.id,
+                           proposed_action="missing_execution", status="approved", execution_status="succeeded")
+        rejected = Approval(kind="support", subject_type="order", subject_id=order.id,
+                            proposed_action="rejected_execution", status="rejected", execution_status="not_started")
+        completed = Approval(kind="support", subject_type="order", subject_id=order.id,
+                             proposed_action="confirmed_execution", status="approved", execution_status="succeeded")
+        db.add_all([missing, rejected, completed])
+        db.flush()
+        db.add_all([
+            ActionExecution(idempotency_key=f"approval:{rejected.id}", state="succeeded", attempts=1),
+            ActionExecution(idempotency_key=f"approval:{completed.id}", state="succeeded", attempts=1),
+        ])
+        db.commit()
+        missing_id, rejected_id = missing.id, rejected.id
+        assert recovery_counts(db)["blocked"] == 2
+        rows, _, _, _ = recovery_page(db, category="blocked")
+        assert {row["record_id"] for row in rows} == {missing_id, rejected_id}
+        assert all("Investigate conflicting" in row["next_action"] for row in rows)
+
+    dashboard = client.get("/").text
+    assert "Mock actions completed</span><strong>1</strong>" in dashboard
+    for approval_id in (missing_id, rejected_id):
+        detail = client.get(f"/approvals/{approval_id}").text
+        assert "Persisted outcome inconsistent" in detail
+        assert "Inspect saved history" in detail
 
 
 def test_recovery_workspace_preserves_category_search_and_page_context():

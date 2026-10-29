@@ -6,6 +6,7 @@ from urllib.parse import urlencode
 from sqlalchemy import and_, func, or_, select
 
 from app.models import Approval, Audit, Case
+from app.outcome import approval_outcome_issue
 from app.services import as_utc
 
 
@@ -133,6 +134,9 @@ def record_guidance(
     freshness_differences = freshness_differences or []
     if kind == "approval":
         status = entity.execution_status
+        issue = approval_outcome_issue(entity, action_execution)
+        if issue:
+            return {"tone": "bad", "state": "Persisted outcome inconsistent", "action": "The decision and execution records disagree. Inspect their saved history and ask a maintainer to resolve the data before reporting an outcome.", "href": "#operational-journey", "link": "Inspect saved history"}
         if status in ("ambiguous", "disputed"):
             return {"tone": "bad", "state": "Outcome uncertain", "action": "Append supported evidence to this execution; retries and replacement remain blocked while its outcome is uncertain.", "href": "#approval-actions", "link": "Review reconciliation controls"}
         if blocking_execution:

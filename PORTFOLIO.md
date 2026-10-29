@@ -41,6 +41,16 @@ Store operations combine repeatable work with decisions that need human judgment
 - Added an interactive guided scenario detail page with linked order, inquiry, approval revisions, persisted execution, and correlated audit events. The scenario progress and next step derive from saved state; retry timing and reconciliation consequences are explicit.
 - Added a PostgreSQL migration for immutable execution reconciliations, including a verifier for fresh and populated 0001–0006 schemas. Extended concurrency coverage for repeated identical and competing reconciliation requests. Fixed a progress-card style collision that made the attention stage render horizontally.
 
+## Outcome consistency and recovery reachability — 29 October 2026
+
+The dashboard previously counted every successful execution row, even when its approval was rejected, while the recovery workspace omitted terminal records whose decision and execution disagreed. Record guidance identified some inconsistencies, but lower page copy and scenario stage text could still claim completion. The order journey query already used SQL-linked pagination, yet had no regression beyond its former 100-case limit.
+
+- Added a shared terminal-outcome check for record and scenario interpretation. The dashboard now counts only matching approved, succeeded approval/execution pairs. Contradictory terminal records appear in the blocked recovery queue with an investigation action, and approval detail copy agrees with its guidance.
+- Added regression fixtures for missing and contradictory executions and an order with 105 linked cases and approvals. The older records remain reachable through related-approval and journey pages.
+- Linked the ambiguity recovery result to the original assertion and fresh saved outcome. Refreshed synthetic recovery workspace captures at desktop and mobile widths.
+
+Verification performed for this change: `python -m scripts.verify local` passed **99 tests** and all three workflow exports validated. The PostgreSQL concurrency script passed on isolated schemas in a disposable local PostgreSQL 16 cluster. Browser inspection covered the blocked recovery page at 1440×900 and 390×844, record navigation and browser back, and visible 2 px keyboard focus; mobile scroll width was 390 px. The new screenshots are synthetic preview evidence. `python -m scripts.verify demo` reported that Docker's daemon was unavailable, so the real n8n run was not repeated. No schema migration was added.
+
 ## Operational journey completion — 28 October 2026
 
 Ordinary order, support, approval, and delivery pages previously exposed a raw event-name/JSON timeline while the guided scenario used separate readable labels. The detail route also assembled the cross-record audit query itself and silently capped the result. The recovery walkthrough could create a fresh approval after confirmed non-execution, but it lacked one persisted-state summary connecting the original ambiguity to the successful replacement.

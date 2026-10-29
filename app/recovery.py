@@ -20,8 +20,9 @@ RECOVERY_PRIORITY = {
 }
 
 
-def _approval_category(now, prior_terminal):
+def _approval_category(now, prior_terminal, inconsistent):
     return case(
+        (inconsistent, "blocked"),
         (Approval.execution_status.in_(["ambiguous", "disputed"]), "uncertain"),
         (Approval.execution_status.in_(["invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]), "blocked"),
         (prior_terminal, "blocked"),
@@ -44,6 +45,14 @@ def _work_category(model, now):
 def recovery_union(now=None):
     now = now or utcnow()
     prior_revision = aliased(Approval)
+    own_execution = aliased(ActionExecution)
+    inconsistent = or_(
+        (Approval.status == "rejected") & own_execution.id.is_not(None),
+        (Approval.execution_status == "succeeded") & or_(
+            Approval.status != "approved", own_execution.id.is_(None),
+            own_execution.state != "succeeded",
+        ),
+    )
     latest_reconciliation = aliased(ExecutionReconciliation)
     successor_reconciliation = aliased(ExecutionReconciliation)
     prior_execution_keys = select(
@@ -73,6 +82,7 @@ def recovery_union(now=None):
         literal("approval").label("source"), Approval.id.label("record_id"),
         (literal("Approval #") + cast(Approval.id, String) + literal(" · ") + Approval.proposed_action).label("label"),
         case(
+            (inconsistent, literal("Decision and execution records disagree; investigate before reporting an outcome.")),
             (Approval.execution_status.in_(["ambiguous", "disputed"]),
              func.coalesce(Approval.failure_detail, literal("The execution outcome needs review"))),
             (has_prior_terminal, literal("A related execution prevents this revision from acting; inspect its record.")),
@@ -80,14 +90,18 @@ def recovery_union(now=None):
         ).label("reason"),
         Approval.execution_status.label("raw_state"), Approval.attempts.label("attempts"),
         Approval.next_attempt_at.label("next_attempt_at"), Approval.created_at.label("occurred_at"),
-        _approval_category(now, has_prior_terminal).label("category"),
+        _approval_category(now, has_prior_terminal, inconsistent).label("category"),
         has_prior_terminal.label("prior_terminal"),
+    ).outerjoin(
+        own_execution,
+        own_execution.idempotency_key == literal("approval:") + cast(Approval.id, String),
     ).where(
         or_(Approval.replacement_approval_id.is_(None),
             Approval.execution_status.in_(["ambiguous", "disputed"])),
         or_(
             Approval.status == "pending",
             Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "disputed", "evidence_changed", "invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]),
+            inconsistent,
         ),
     )
     cases = select(
@@ -149,7 +163,7 @@ def recovery_item(row):
     row["url"] = f"/{'approvals' if source == 'approval' else 'cases' if source == 'case' else 'deliveries'}/{row['record_id']}"
     row["next_action"] = (
         "Inspect the related execution; this revision cannot act"
-        if row.get("prior_terminal") and row["category"] != "uncertain"
+        if row.get("prior_terminal") and row["category"] != "uncertain" and "disagree" not in row["reason"]
         else {
         "pending": "Review evidence and decide",
         "waiting": "Wait for the recorded retry deadline",
@@ -158,6 +172,9 @@ def recovery_item(row):
         "stale": "Compare current facts and check replacement eligibility",
         "uncertain": "Reconcile the outcome; retry remains blocked",
         "blocked": (
+            "Investigate conflicting persisted outcome records"
+            if "disagree" in row["reason"]
+            else
             "Correct the action contract before reprocessing"
             if row["raw_state"] == "invalid_action"
             else "Create a fresh pending approval from current facts"
