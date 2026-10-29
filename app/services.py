@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 from app.config import settings
 from app.integrations import verify_shopify, generate_support_content
+from app.action_provider import ActionRequest, MockActionAdapter, normalize_adapter_result
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
     ExecutionReconciliation, utcnow,
@@ -1030,7 +1031,7 @@ def reconcile_approval_execution(
     return reconciliation
 
 
-def execute_approved(db, approval, mock_outcome=None):
+def execute_approved(db, approval, mock_outcome=None, *, adapter=None):
     """Run an approved mock action; ``mock_outcome`` is preview-only injection."""
     approval = lock_approval_lifecycle(db, approval.id)
     if approval.status != "approved":
@@ -1152,22 +1153,20 @@ def execute_approved(db, approval, mock_outcome=None):
         execution.evidence_hash = approval.evidence_hash
     execution.attempts += 1
     approval.attempts = execution.attempts
-    if mock_outcome == "ambiguous" or (mock_outcome is None and settings.mock_action_ambiguous):
-        execution.state = "ambiguous"
-        execution.detail = "Simulated timeout after submission. Confirm provider state before resolving; automatic retry is blocked."
-    elif mock_outcome in ("retryable", "exhausted"):
-        execution.state = mock_outcome
-        execution.detail = "Simulated transient failure; no external request was made."
-    elif mock_outcome is None and execution.attempts <= settings.mock_action_failures:
-        execution.state = (
-            "retryable"
-            if execution.attempts < settings.max_action_attempts
-            else "exhausted"
-        )
-        execution.detail = "Simulated transient failure; no external request was made."
-    else:
-        execution.state = "succeeded"
-        execution.detail = "Mock action completed; no external API called."
+    request = ActionRequest(
+        kind=approval.kind,
+        subject_type=approval.subject_type,
+        subject_id=approval.subject_id,
+        action_name=approval.proposed_action,
+        reviewed_evidence=dict(approval.supporting_facts or {}),
+        evidence_hash=approval.evidence_hash,
+        idempotency_key=key,
+        attempt=execution.attempts,
+    )
+    outcome_adapter = adapter if adapter is not None else MockActionAdapter(outcome=mock_outcome)
+    result = normalize_adapter_result(outcome_adapter, request)
+    execution.state = result.state
+    execution.detail = result.detail
     execution.updated_at = utcnow()
     approval.execution_status = execution.state
     approval.failure_detail = (

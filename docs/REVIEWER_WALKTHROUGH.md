@@ -2,6 +2,8 @@
 
 No Shopify, OpenAI, or outbound-action credentials are needed. The preview and local stack both use synthetic customer data and mock actions. The local operator login is configured in `.env`; follow [README setup](../README.md#setup) before starting Docker.
 
+The provider-neutral action contract is tested with a fake/mock adapter only. Guided preview and ordinary local action outcomes remain simulated; this walkthrough does not call a provider sandbox or external action service.
+
 ## Quick review: isolated preview
 
 From the `popify` repository root, install the project dependencies once, then run:
