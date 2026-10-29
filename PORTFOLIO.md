@@ -41,6 +41,17 @@ Store operations combine repeatable work with decisions that need human judgment
 - Added an interactive guided scenario detail page with linked order, inquiry, approval revisions, persisted execution, and correlated audit events. The scenario progress and next step derive from saved state; retry timing and reconciliation consequences are explicit.
 - Added a PostgreSQL migration for immutable execution reconciliations, including a verifier for fresh and populated 0001–0006 schemas. Extended concurrency coverage for repeated identical and competing reconciliation requests. Fixed a progress-card style collision that made the attention stage render horizontally.
 
+## Reproducible reviewer recovery — 29 October 2026
+
+Inspection found that approved ambiguous approvals linked to `#approval-actions`, while only pending approvals rendered that anchor. The isolated HTTP smoke test stopped after creating a success scenario, so it did not prove the advertised ambiguity recovery. `scripts/verify.py` had no single command for that path.
+
+- The approval action anchor now encloses controls and explanatory outcomes for every approval state, including reconciliation and fresh approval creation. Browser inspection confirmed the guidance link scrolls to the reconciliation form.
+- Recovery classification now carries an explicit inconsistency flag instead of searching display text. Replaced revisions with contradictory terminal records remain visible in the blocked queue; a regression checks this case.
+- The isolated HTTP smoke test now completes ambiguity, asserted non-execution, fresh approval, persisted mock completion, and conflicting later evidence. `python -m scripts.verify reviewer` runs that path and workflow validation, then prints the commit, Python version, disposable environment, and n8n availability without secrets.
+- Current synthetic preview captures show the uncertain approval at desktop and mobile widths in `docs/screenshots/reconciliation-action-desktop.jpg` and `docs/screenshots/reconciliation-action-mobile.jpg`.
+
+Current verification: 100 behavior tests passed; all three workflow exports validated; the new reviewer command passed. PostgreSQL concurrency checks passed on isolated schemas in a disposable local PostgreSQL cluster. The changed approval page was inspected at 1440×900 and 390×844, with no horizontal overflow at 390 px, visible keyboard focus, a working reconciliation anchor, and browser back. No migration changed. `python -m scripts.verify demo` reported that Docker's daemon was unreachable, so the real local n8n demonstration was not run.
+
 ## Outcome consistency and recovery reachability — 29 October 2026
 
 The dashboard previously counted every successful execution row, even when its approval was rejected, while the recovery workspace omitted terminal records whose decision and execution disagreed. Record guidance identified some inconsistencies, but lower page copy and scenario stage text could still claim completion. The order journey query already used SQL-linked pagination, yet had no regression beyond its former 100-case limit.

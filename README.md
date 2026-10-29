@@ -38,9 +38,12 @@ Open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. This c
 
 For a short reviewer walkthrough, open **Guided demo → Five-minute reviewer path** in the preview. Start the success run, inspect its order and support evidence, approve the mock reply, and follow the saved result. Then start the recovery run, approve once to record a simulated timeout, append a confirmed-non-execution assertion with a synthetic supporting reference, create the fresh approval, and approve it. The final reviewer result connects the original ambiguous attempt, operator assertion, replacement revision, and separate successful local mock execution without implying provider verification. The scenario page shows the same readable event language used by ordinary order, support, approval, and delivery pages.
 
+To verify that recovery journey automatically against a fresh disposable preview process, run `python -m scripts.verify reviewer`. It signs in, records an ambiguous mock attempt, asserts non-execution, creates and approves a fresh revision, and then appends conflicting later evidence. The command checks the saved outcome shown after each step, validates the three workflow exports, and prints the checked commit, environment, and live n8n prerequisite. It leaves the normal local database untouched. Run `python -m scripts.verify demo` separately to exercise real local n8n workflows when Docker is available.
+
 Every ordinary record page begins with its current persisted state and one supported next action. Its **Operational journey** is a bounded, paginated history across related records and decisions; links and history pagination retain the originating queue search, status, and page context. Raw audit details remain available under each readable event for verification.
 
 The dashboard counts completed mock actions only when an approved decision, succeeded approval state, and succeeded execution record agree. If a terminal decision conflicts with its saved execution, the approval appears in the **Blocked** recovery category with an investigation step; the record and scenario pages do not claim completion. A completed ambiguity recovery links directly to the original assertion and the fresh approval's saved result.
+An inconsistent historical approval remains discoverable after replacement, so an operator can investigate the original record alongside its successor.
 
 ## Architecture
 
@@ -138,6 +141,8 @@ The overview, approval, recovery, and earlier scenario screenshots below are ret
 ![Current approval detail and operational journey at mobile width](docs/screenshots/operational-journey-mobile.jpg)
 ![Blocked recovery workspace at desktop width, synthetic preview](docs/screenshots/recovery-consistency-desktop.jpg)
 ![Blocked recovery workspace at mobile width, synthetic preview](docs/screenshots/recovery-consistency-mobile.jpg)
+![Ambiguous approval and working recovery guidance at desktop width, synthetic preview](docs/screenshots/reconciliation-action-desktop.jpg)
+![Ambiguous approval and working recovery guidance at mobile width, synthetic preview](docs/screenshots/reconciliation-action-mobile.jpg)
 
 The console includes overview metrics, order/support/approval/delivery queues, and one recovery workspace spanning pending decisions, waiting and eligible retries, exhausted attempts, stale evidence, uncertain outcomes, and blocked contracts. Dashboard totals and workspace rows share the same bounded query rules. Each state has a direct filter link; replaced revisions leave active recovery totals unless later evidence makes their execution uncertain again. Search, filters, and pagination are preserved through record navigation and decisions. Approval pages show source facts, revision lineage, and an audit timeline correlated to the support case or order. Delay review records retain threshold and timing evidence. Failed support cases and deliveries offer recovery controls; action failures explain retry timing and block blind retry of ambiguous results. Browser mutations require authenticated sessions and CSRF tokens.
 

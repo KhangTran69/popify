@@ -121,8 +121,9 @@
         {% if entity.subject_type == 'order' %}{% set known = known + ['created_at', 'hours_threshold'] %}{% endif %}
         {% for key, value in facts.items() if key not in known %}<div class="fact"><strong>{{ key.replace('_', ' ').capitalize() }}</strong><div>{{ value }}</div></div>{% endfor %}
         {% if entity.failure_detail and entity.execution_status == 'ambiguous' and reconciliation %}<div class="notice warn">{{ entity.failure_detail }}</div>{% elif entity.failure_detail and not (reconciliation or entity.execution_status in ['reconciled_completed', 'reconciled_not_executed', 'blocked_prior_outcome']) %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
+        <div id="approval-actions">
         {% if entity.status == 'pending' %}
-          <div id="approval-actions" class="decision"><p>{% if preview_can_demonstrate_blocked %}This synthetic action has no registered adapter. Approving records the decision and demonstrates the execution block; no action will run. Rejecting closes the request.{% elif preview_mode %}Approve to run the local mock adapter and save its result in the disposable database. Reject to close this request without running it. Workflow execution is disabled in preview.{% else %}Approving queues this mock action for n8n. Rejecting closes this request without executing it.{% endif %}</p>
+          <div class="decision"><p>{% if preview_can_demonstrate_blocked %}This synthetic action has no registered adapter. Approving records the decision and demonstrates the execution block; no action will run. Rejecting closes the request.{% elif preview_mode %}Approve to run the local mock adapter and save its result in the disposable database. Reject to close this request without running it. Workflow execution is disabled in preview.{% else %}Approving queues this mock action for n8n. Rejecting closes this request without executing it.{% endif %}</p>
             <form method="post" action="/approvals/{{ entity.id }}/decision{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}">{% if (refresh_supported or preview_can_demonstrate_blocked) and not freshness_differences %}<button name="decision" value="approved">{{ 'Approve to demonstrate block' if preview_can_demonstrate_blocked else 'Approve mock action' }}</button>{% else %}<span class="field-help">Approval is disabled until the evidence and action can be verified.</span>{% endif %} <button class="secondary" name="decision" value="rejected">Reject</button></form>
           </div>
         {% elif entity.status == 'superseded' %}
@@ -174,6 +175,7 @@
         {% elif entity.status == 'approved' %}
           <div class="notice">{% if preview_mode %}Decision recorded in the disposable preview. No workflow ran.{% else %}Approved and waiting for n8n to run the queued mock action.{% endif %}</div>
         {% endif %}
+        </div>
       {% endif %}
       {% if kind == 'approval' and entity.supporting_facts.get('correlation_id', '').startswith('guided-support:') %}
         <div class="related"><a href="/demo/{{ entity.supporting_facts.get('correlation_id').split(':')[-1] }}">← Back to guided run</a></div>

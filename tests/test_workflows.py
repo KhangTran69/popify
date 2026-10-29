@@ -588,6 +588,9 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
         correlation_id = approval.supporting_facts["correlation_id"]
     page = client.get(f"/demo/scenarios/{approval_id}")
     assert page.status_code == 200
+    approval_detail = client.get(f"/approvals/{approval_id}").text
+    assert 'href="#approval-actions"' in approval_detail
+    assert 'id="approval-actions"' in approval_detail
     assert f"{correlation_id}" in page.text
     assert f"/orders/" in page.text and f"/cases/" in page.text
     assert "Journey history" in page.text
@@ -627,6 +630,9 @@ def test_preview_scenario_page_shows_correlated_journey_and_reconciliation_form(
     )
     assert reconciled.headers["location"] == f"/demo/scenarios/{confirmed_id}"
     assert "Create a fresh pending approval" in client.get(reconciled.headers["location"]).text
+    reconciled_detail = client.get(f"/approvals/{confirmed_id}").text
+    assert 'href="#approval-actions"' in reconciled_detail
+    assert 'id="approval-actions"' in reconciled_detail
     replacement = client.post(
         f"/approvals/{confirmed_id}/refresh?from_scenario={confirmed_id}",
         data={"csrf_token": token}, follow_redirects=False,
@@ -1958,6 +1964,7 @@ def test_inconsistent_terminal_outcomes_are_visible_and_not_counted_as_success()
                              proposed_action="confirmed_execution", status="approved", execution_status="succeeded")
         db.add_all([missing, rejected, completed])
         db.flush()
+        missing.replacement_approval_id = completed.id
         db.add_all([
             ActionExecution(idempotency_key=f"approval:{rejected.id}", state="succeeded", attempts=1),
             ActionExecution(idempotency_key=f"approval:{completed.id}", state="succeeded", attempts=1),
@@ -1967,6 +1974,7 @@ def test_inconsistent_terminal_outcomes_are_visible_and_not_counted_as_success()
         assert recovery_counts(db)["blocked"] == 2
         rows, _, _, _ = recovery_page(db, category="blocked")
         assert {row["record_id"] for row in rows} == {missing_id, rejected_id}
+        assert all(row["inconsistent"] for row in rows)
         assert all("Investigate conflicting" in row["next_action"] for row in rows)
 
     dashboard = client.get("/").text
