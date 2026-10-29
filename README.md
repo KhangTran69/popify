@@ -40,6 +40,8 @@ For a short reviewer walkthrough, open **Guided demo → Five-minute reviewer pa
 
 Every ordinary record page begins with its current persisted state and one supported next action. Its **Operational journey** is a bounded, paginated history across related records and decisions; links and history pagination retain the originating queue search, status, and page context. Raw audit details remain available under each readable event for verification.
 
+The dashboard counts completed mock actions only when an approved decision, succeeded approval state, and succeeded execution record agree. If a terminal decision conflicts with its saved execution, the approval appears in the **Blocked** recovery category with an investigation step; the record and scenario pages do not claim completion. A completed ambiguity recovery links directly to the original assertion and the fresh approval's saved result.
+
 ## Architecture
 
 ```mermaid
@@ -134,6 +136,8 @@ The overview, approval, recovery, and earlier scenario screenshots below are ret
 ![Current five-minute reviewer path at mobile width](docs/screenshots/reviewer-path-mobile.jpg)
 ![Current approval detail and operational journey at desktop width](docs/screenshots/operational-journey-desktop.jpg)
 ![Current approval detail and operational journey at mobile width](docs/screenshots/operational-journey-mobile.jpg)
+![Blocked recovery workspace at desktop width, synthetic preview](docs/screenshots/recovery-consistency-desktop.jpg)
+![Blocked recovery workspace at mobile width, synthetic preview](docs/screenshots/recovery-consistency-mobile.jpg)
 
 The console includes overview metrics, order/support/approval/delivery queues, and one recovery workspace spanning pending decisions, waiting and eligible retries, exhausted attempts, stale evidence, uncertain outcomes, and blocked contracts. Dashboard totals and workspace rows share the same bounded query rules. Each state has a direct filter link; replaced revisions leave active recovery totals unless later evidence makes their execution uncertain again. Search, filters, and pagination are preserved through record navigation and decisions. Approval pages show source facts, revision lineage, and an audit timeline correlated to the support case or order. Delay review records retain threshold and timing evidence. Failed support cases and deliveries offer recovery controls; action failures explain retry timing and block blind retry of ambiguous results. Browser mutations require authenticated sessions and CSRF tokens.
 

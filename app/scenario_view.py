@@ -8,11 +8,13 @@ from app.models import Approval, utcnow
 from app.services import approval_freshness_differences, as_utc, prior_terminal_execution
 from app.preview_scenarios import SCENARIO_GUIDANCE, unresolved_related_approvals
 from app.record_journey import journey_event
+from app.outcome import approval_outcome_issue
 
 
 def build_scenario_view(db, scenario):
     current = scenario["current"]
     execution = scenario["executions"].get(f"approval:{current.id}")
+    outcome_issue = approval_outcome_issue(current, execution)
     reconciliation = scenario["reconciliations"].get(current.id)
     blocker_id = unresolved_related_approvals(db, [current.id]).get(current.id)
     if not blocker_id:
@@ -31,6 +33,8 @@ def build_scenario_view(db, scenario):
         next_step = "The reviewed evidence is stale. Compare the saved snapshot with current facts before creating a replacement approval."
     elif current.status == "pending":
         next_step = "Review the evidence and approve or reject the pending decision."
+    elif outcome_issue:
+        next_step = "Decision and execution records disagree. Inspect the saved history and ask a maintainer to investigate."
     elif current.status == "rejected":
         next_step = "This scenario is complete; the rejected action has no execution record."
     elif status == "succeeded":
@@ -63,7 +67,7 @@ def build_scenario_view(db, scenario):
         status == "reconciled_completed" and reconciliation
         and reconciliation.outcome == "confirmed_completed"
     )
-    result_complete = not blocking_approval and (
+    result_complete = not blocking_approval and not outcome_issue and (
         (current.status == "rejected" and execution is None)
         or (status == "succeeded" and execution_persisted_success)
         or assertion_persisted_complete
@@ -72,6 +76,10 @@ def build_scenario_view(db, scenario):
         outcome_detail = f"Related approval #{blocking_approval.id} has unresolved execution evidence. Inspect its original record."
     elif blocking_approval:
         outcome_detail = f"Related approval #{blocking_approval.id} has a prior execution. Inspect that outcome before acting."
+    elif outcome_issue:
+        outcome_detail = ("Approval status says succeeded, but no successful persisted execution record exists."
+                          if outcome_issue == "success_without_execution"
+                          else "The approval is rejected but an execution record also exists.")
     elif current.status == "rejected":
         outcome_detail = (
             "Rejected by the operator; no action execution was created."
@@ -157,8 +165,8 @@ def build_scenario_view(db, scenario):
             ),
             "proof": f"Decision by {current.actor or 'unknown'} at {current.decision_at.strftime('%d %b %Y %H:%M UTC') if current.decision_at else 'time not recorded'} · approval revision {current.revision} · execution #{execution.id}, {execution.attempts} attempt{'s' if execution.attempts != 1 else ''} · {prior_reconciliation.correlation_id}",
             "links": [
-                {"label": f"Original ambiguous approval #{prior_recovery.id}", "href": f"/approvals/{prior_recovery.id}?from_scenario={scenario['scenario_id']}"},
-                {"label": f"Fresh approval #{current.id}", "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}"},
+                {"label": f"Original ambiguous execution and assertion · approval #{prior_recovery.id}", "href": f"/approvals/{prior_recovery.id}?from_scenario={scenario['scenario_id']}#approval-actions"},
+                {"label": f"Fresh decision and saved result · approval #{current.id}", "href": f"/approvals/{current.id}?from_scenario={scenario['scenario_id']}#operational-journey"},
             ],
         }
     elif current.execution_status == "succeeded" and execution_persisted_success:
