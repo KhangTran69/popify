@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import timedelta
-from sqlalchemy import select, func
+from sqlalchemy import String, and_, cast, func, literal, select
 from sqlalchemy.orm import aliased
 
 from app.config import settings
@@ -234,6 +234,41 @@ def unresolved_related_approvals(db, approval_ids):
     return related_approval_ids(db, approval_ids, ("ambiguous", "disputed"))
 
 
+def confirmed_nonexecution_provenance(db, approval):
+    """Find the newest prior ambiguous execution with a current nonexecution assertion."""
+    subject_execution_ids = select(ActionExecution.id).where(
+        ActionExecution.idempotency_key.in_(subject_execution_keys(
+            approval.subject_type, approval.subject_id
+        ))
+    )
+    latest = select(
+        ExecutionReconciliation.action_execution_id.label("execution_id"),
+        func.max(ExecutionReconciliation.revision).label("revision"),
+    ).where(
+        ExecutionReconciliation.action_execution_id.in_(subject_execution_ids)
+    ).group_by(ExecutionReconciliation.action_execution_id).subquery()
+    approval_key = literal("approval:") + cast(Approval.id, String)
+    row = db.execute(
+        select(Approval, ActionExecution, ExecutionReconciliation)
+        .join(ActionExecution, ActionExecution.idempotency_key == approval_key)
+        .join(latest, latest.c.execution_id == ActionExecution.id)
+        .join(ExecutionReconciliation, and_(
+            ExecutionReconciliation.action_execution_id == latest.c.execution_id,
+            ExecutionReconciliation.revision == latest.c.revision,
+        ))
+        .where(
+            Approval.subject_type == approval.subject_type,
+            Approval.subject_id == approval.subject_id,
+            Approval.id < approval.id,
+            ActionExecution.state == "ambiguous",
+            ExecutionReconciliation.outcome == "confirmed_not_executed",
+        )
+        .order_by(Approval.id.desc())
+        .limit(1)
+    ).first()
+    return row if row else None
+
+
 def load_preview_scenario(db, approval_id, reconciliation_page=1, revision_page=1, audit_page=1):
     """Load bounded, paginated histories and keep current state independently visible."""
     if not settings.preview_mode:
@@ -271,12 +306,19 @@ def load_preview_scenario(db, approval_id, reconciliation_page=1, revision_page=
     display_approvals = list(approval_history)
     if current.id not in page_approval_ids:
         display_approvals.append(current)
-    approval_ids = list(dict.fromkeys([*page_approval_ids, current.id]))
+    # Outcome interpretation must not change when the reviewer pages revision
+    # history. Load the relevant original ambiguous attempt by its lifecycle
+    # state, independently of the visible revision page.
+    recovery_provenance = confirmed_nonexecution_provenance(db, current)
+    provenance_approval = recovery_provenance[0] if recovery_provenance else None
+    approval_ids = list(dict.fromkeys([
+        *page_approval_ids, current.id,
+        *([provenance_approval.id] if provenance_approval else []),
+    ]))
     executions = db.scalars(
         select(ActionExecution)
         .where(ActionExecution.idempotency_key.in_([f"approval:{item}" for item in approval_ids]))
         .order_by(ActionExecution.id)
-        .limit(21)
     ).all() if approval_ids else []
     reconciliations = latest_reconciliations(db, approval_ids)
     current_reconciliation_history = []
@@ -325,6 +367,7 @@ def load_preview_scenario(db, approval_id, reconciliation_page=1, revision_page=
         "approval_pages": approval_pages,
         "approval_total": approvals_total,
         "current": current,
+        "recovery_provenance": recovery_provenance,
         "executions": {item.idempotency_key: item for item in executions},
         "reconciliations": reconciliations,
         "reconciliation_history": current_reconciliation_history,

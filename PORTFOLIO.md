@@ -41,7 +41,22 @@ Store operations combine repeatable work with decisions that need human judgment
 - Added an interactive guided scenario detail page with linked order, inquiry, approval revisions, persisted execution, and correlated audit events. The scenario progress and next step derive from saved state; retry timing and reconciliation consequences are explicit.
 - Added a PostgreSQL migration for immutable execution reconciliations, including a verifier for fresh and populated 0001–0006 schemas. Extended concurrency coverage for repeated identical and competing reconciliation requests. Fixed a progress-card style collision that made the attention stage render horizontally.
 
-## Current reviewer experience and verification — 27 October 2026
+## Operational journey completion — 28 October 2026
+
+Ordinary order, support, approval, and delivery pages previously exposed a raw event-name/JSON timeline while the guided scenario used separate readable labels. The detail route also assembled the cross-record audit query itself and silently capped the result. The recovery walkthrough could create a fresh approval after confirmed non-execution, but it lacked one persisted-state summary connecting the original ambiguity to the successful replacement.
+
+- Added `app/record_journey.py`, a shared presentation/query boundary for readable event copy, bounded cross-record history, pagination, related approvals, and state-derived next-action guidance. `app/main.py` no longer owns that audit assembly, and `app/scenario_view.py` reuses the same event language.
+- Replaced raw record timelines with an **Operational journey** that preserves queue search, filters, pagination, and record links. Audit JSON remains expandable evidence, while the primary view explains what happened and what the operator can do next.
+- Added a reviewer result derived from persisted approvals, executions, and reconciliation records. A completed recovery explicitly retains the original ambiguous execution and operator assertion, identifies the fresh approval revision, and describes its separate successful local mock execution.
+
+Verification performed for this change:
+
+- **Local behavior and workflow validation (rerun 29 October):** `python -m scripts.verify local` passed **97 tests** and validated all three workflow exports. New regressions cover a missing execution record behind a succeeded status and conflicting later evidence after a fresh approval completes.
+- **PostgreSQL checks (29 October):** used a disposable temporary PostgreSQL 16 cluster and isolated schemas. `scripts.verify_migrations` passed for both a fresh schema and an upgrade with existing reconciliation records; `scripts.verify_postgres` passed the concurrent webhook, worker, decision, refresh, retry, reconciliation, and blocker-release scenarios. The repository's configured database and its data were not used.
+- **Synthetic browser review (29 October):** inspected the authenticated approval detail at 1440×900 and 390×844. The 390 px document had no horizontal overflow; the skip link received visible 2 px keyboard focus. Current synthetic captures are `docs/screenshots/operational-journey-desktop.jpg` and `docs/screenshots/operational-journey-mobile.jpg`.
+- **Real local n8n demonstration:** `python -m scripts.verify demo` reported **unavailable** because the Docker daemon was not reachable. Export validation is not claimed as workflow execution evidence.
+
+## Previous reviewer experience and verification — 27 October 2026
 
 Inspection of `app/main.py` found that the isolated scenario route mixed database recovery interpretation with page assembly. `app/templates/demo_scenario.html` presented raw audit events after several separate record sections; a confirmed non-execution still marked the outcome stage complete even though a new approval was needed. The `/demo` workspace loaded only its latest 50 scenarios and offered no way to reach older runs.
 

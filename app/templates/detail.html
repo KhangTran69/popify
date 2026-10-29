@@ -6,8 +6,13 @@
     <div><div class="eyebrow">{{ kind|upper }} RECORD · MOCK MODE</div><h1>{{ title }}</h1><p class="sub">Recorded facts, human decisions, and a traceable outcome.</p></div>
     <button class="secondary" type="button" onclick="location.reload()">Refresh status ↻</button>
   </div>
+  <section class="notice {{ record_guidance.tone }} record-guidance" aria-labelledby="record-guidance-title">
+    <span class="eyebrow">CURRENT STATE · PERSISTED RECORD</span>
+    <h2 id="record-guidance-title">{{ record_guidance.state }}</h2>
+    <p><strong>Next supported action:</strong> {{ record_guidance.action }}{% if record_guidance.href %} <a href="{{ record_guidance.href }}">{{ record_guidance.link or 'Open relevant record' }} ↗</a>{% endif %}</p>
+  </section>
   <div class="detailgrid">
-    <section class="box" aria-label="Record details">
+    <section class="box" id="record-details" aria-label="Record details">
       <h2>Record details</h2>
       {% if kind == 'order' %}
         <dl class="facts">
@@ -32,7 +37,7 @@
         {% if entity.failure_detail and entity.execution_status not in ['evidence_changed', 'invalid_action'] %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
         {% if entity.status in ['failed', 'exhausted'] %}
           <div class="notice warn"><strong>{{ 'Recovery required' if entity.status == 'exhausted' else 'Triage failed' }}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
-          <form method="post" action="/cases/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue triage retry</button></form>
+          <form id="case-recovery" method="post" action="/cases/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue triage retry</button></form>
         {% endif %}
       {% elif kind == 'delivery' %}
         <dl class="facts">
@@ -48,7 +53,7 @@
         {% if entity.error %}<div class="notice error">{{ entity.error }}. Check the payload and worker logs before retrying.</div>{% endif %}
         {% if entity.status in ['failed', 'exhausted'] %}
           <div class="notice warn"><strong>{{ 'Recovery required' if entity.status == 'exhausted' else 'Delivery failed' }}</strong><p>{{ retry_guidance(entity.next_attempt_at) }} {% if entity.next_attempt_at %}Next eligible: {{ entity.next_attempt_at|utc }}.{% endif %}</p></div>
-          <form method="post" action="/deliveries/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Retry delivery</button></form>
+          <form id="delivery-recovery" method="post" action="/deliveries/{{ entity.id }}/retry{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Queue delivery retry</button></form>
         {% endif %}
       {% else %}
         {% set facts = entity.supporting_facts or {} %}
@@ -62,7 +67,7 @@
           <dt>Next attempt</dt><dd>{{ entity.next_attempt_at|utc }}</dd>
         </dl>
         {% if freshness_differences %}
-          <div class="notice error evidence-status"><strong>{{ 'This approval is historical' if entity.execution_status == 'succeeded' else 'Current facts differ from the reviewed snapshot' }}</strong>
+          <div id="evidence-comparison" class="notice error evidence-status"><strong>{{ 'This approval is historical' if entity.execution_status == 'succeeded' else 'Current facts differ from the reviewed snapshot' }}</strong>
             <div class="evidence-comparison">{% for difference in freshness_comparison %}<article><strong>{{ difference.field }}</strong><small>{{ difference.reason }}</small><dl><dt>Reviewed</dt><dd>{{ difference.reviewed }}</dd><dt>Current</dt><dd>{{ difference.current }}</dd></dl></article>{% endfor %}</div>
           </div>
           {% if refresh_supported and (entity.status == 'pending' or entity.execution_status == 'evidence_changed') and not entity.replacement_approval_id and not refresh_blocked_by_execution %}
@@ -117,7 +122,7 @@
         {% for key, value in facts.items() if key not in known %}<div class="fact"><strong>{{ key.replace('_', ' ').capitalize() }}</strong><div>{{ value }}</div></div>{% endfor %}
         {% if entity.failure_detail and entity.execution_status == 'ambiguous' and reconciliation %}<div class="notice warn">{{ entity.failure_detail }}</div>{% elif entity.failure_detail and not (reconciliation or entity.execution_status in ['reconciled_completed', 'reconciled_not_executed', 'blocked_prior_outcome']) %}<div class="notice error">{{ entity.failure_detail }}</div>{% endif %}
         {% if entity.status == 'pending' %}
-          <div class="decision"><p>{% if preview_can_demonstrate_blocked %}This synthetic action has no registered adapter. Approving records the decision and demonstrates the execution block; no action will run. Rejecting closes the request.{% elif preview_mode %}Approve to run the local mock adapter and save its result in the disposable database. Reject to close this request without running it. Workflow execution is disabled in preview.{% else %}Approving queues this mock action for n8n. Rejecting closes this request without executing it.{% endif %}</p>
+          <div id="approval-actions" class="decision"><p>{% if preview_can_demonstrate_blocked %}This synthetic action has no registered adapter. Approving records the decision and demonstrates the execution block; no action will run. Rejecting closes the request.{% elif preview_mode %}Approve to run the local mock adapter and save its result in the disposable database. Reject to close this request without running it. Workflow execution is disabled in preview.{% else %}Approving queues this mock action for n8n. Rejecting closes this request without executing it.{% endif %}</p>
             <form method="post" action="/approvals/{{ entity.id }}/decision{{ detail_query }}"><input type="hidden" name="csrf_token" value="{{ csrf }}">{% if (refresh_supported or preview_can_demonstrate_blocked) and not freshness_differences %}<button name="decision" value="approved">{{ 'Approve to demonstrate block' if preview_can_demonstrate_blocked else 'Approve mock action' }}</button>{% else %}<span class="field-help">Approval is disabled until the evidence and action can be verified.</span>{% endif %} <button class="secondary" name="decision" value="rejected">Reject</button></form>
           </div>
         {% elif entity.status == 'superseded' %}
@@ -174,11 +179,12 @@
         <div class="related"><a href="/demo/{{ entity.supporting_facts.get('correlation_id').split(':')[-1] }}">← Back to guided run</a></div>
       {% endif %}
       {% if prior_approval %}<div class="notice">Revision {{ entity.revision }} replaces <a href="/approvals/{{ prior_approval.id }}{{ detail_query }}">approval #{{ prior_approval.id }} · revision {{ prior_approval.revision }} ↗</a>. Its decision and attempts remain in the audit history.</div>{% endif %}
-      {% if approval_revision_rows|length > 1 %}<div class="related revision-history"><h3>Approval revision history · {{ approval_history_total + 1 }} total</h3>{% for row in approval_revision_rows %}{% set a = row.approval %}<article><a href="/approvals/{{ a.id }}{{ detail_query }}">Revision {{ a.revision }} · {{ a.proposed_action.replace('_', ' ') }} ↗</a><span>{{ a.status }} · {{ a.execution_status }} · {{ a.attempts }} attempts</span><small>Decision: {{ a.actor or 'Not decided' }} · {{ a.decision_at|utc }}</small>{% if row.replaced_from %}<small>Replaces revision of approval #{{ row.replaced_from }}</small>{% endif %}{% if row.replacement_event %}<small>Replacement reason: {{ row.replacement_event.details.get('differences', [])|join('; ') or 'Evidence was refreshed' }} · {{ row.replacement_event.actor }} · {{ row.replacement_event.created_at|utc }}</small>{% endif %}{% if a.replacement_approval_id %}<small>Replaced by approval #{{ a.replacement_approval_id }}</small>{% endif %}</article>{% endfor %}{% if approval_history_pages > 1 %}<nav class="pagination" aria-label="Approval revision history pages">{% if approval_history_page > 1 %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}revision_page={{ approval_history_page - 1 }}">More recent revisions</a>{% endif %}<span>Page {{ approval_history_page }} of {{ approval_history_pages }}{% if latest_approval %} · Current revision #{{ latest_approval.revision }} is linked above{% endif %}</span>{% if approval_history_page < approval_history_pages %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}revision_page={{ approval_history_page + 1 }}">Older revisions</a>{% endif %}</nav>{% endif %}</div>{% endif %}
-      {% if related %}<div class="related"><h3>Related approvals</h3>{% for a in related %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · {{ a.proposed_action.replace('_', ' ') }} <span>{{ a.status }} →</span></a>{% endfor %}</div>{% endif %}
+      {% if approval_revision_rows|length > 1 %}<div id="approval-revisions" class="related revision-history"><h3>Approval revision history · {{ approval_history_total + 1 }} total</h3>{% for row in approval_revision_rows %}{% set a = row.approval %}<article><a href="/approvals/{{ a.id }}{{ detail_query }}">Revision {{ a.revision }} · {{ a.proposed_action.replace('_', ' ') }} ↗</a><span>{{ a.status }} · {{ a.execution_status }} · {{ a.attempts }} attempts</span><small>Decision: {{ a.actor or 'Not decided' }} · {{ a.decision_at|utc }}</small>{% if row.replaced_from %}<small>Replaces revision of approval #{{ row.replaced_from }}</small>{% endif %}{% if row.replacement_event %}<small>Replacement reason: {{ row.replacement_event.details.get('differences', [])|join('; ') or 'Evidence was refreshed' }} · {{ row.replacement_event.actor }} · {{ row.replacement_event.created_at|utc }}</small>{% endif %}{% if a.replacement_approval_id %}<small>Replaced by approval #{{ a.replacement_approval_id }}</small>{% endif %}</article>{% endfor %}{% if approval_history_pages > 1 %}<nav class="pagination" aria-label="Approval revision history pages">{% if approval_history_page > 1 %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}revision_page={{ approval_history_page - 1 }}">More recent revisions</a>{% endif %}<span>Page {{ approval_history_page }} of {{ approval_history_pages }}{% if latest_approval %} · Current revision #{{ latest_approval.revision }} is linked above{% endif %}</span>{% if approval_history_page < approval_history_pages %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}revision_page={{ approval_history_page + 1 }}">Older revisions</a>{% endif %}</nav>{% endif %}</div>{% endif %}
+      {% if related_total %}<div id="related-approvals" class="related"><h3>Related approvals · {{ related_total }} total</h3>{% for a in related %}<a href="/approvals/{{ a.id }}{{ detail_query }}">#{{ a.id }} · {{ a.proposed_action.replace('_', ' ') }} <span>{{ a.status }} →</span></a>{% endfor %}{% if related_pages > 1 %}<nav class="pagination" aria-label="Related approval pages">{% if related_page > 1 %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}related_page={{ related_page - 1 }}">Newer approvals</a>{% endif %}<span>Page {{ related_page }} of {{ related_pages }}</span>{% if related_page < related_pages %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}related_page={{ related_page + 1 }}">Older approvals</a>{% endif %}</nav>{% endif %}</div>{% endif %}
     </section>
-    <section class="box"><div class="panelhead timeline-heading"><h2>Event timeline</h2><span class="count">{{ timeline|length }}</span></div>{% if timeline_limited or related_cases_limited %}<p class="field-help">Showing at most the latest 100 related events{% if related_cases_limited %} across the 100 most recent related support cases{% endif %}.</p>{% endif %}
-      <div class="timeline">{% for e in timeline %}<article class="event"><strong>{{ e.event.replace('_', ' ').capitalize() }}</strong><small>{{ e.created_at|utc }} · {{ e.actor }}</small><small>{{ e.entity_type }} #{{ e.entity_id }}</small>{% if e.details %}<details><summary>Event details</summary><pre>{{ e.details|tojson(indent=2) }}</pre></details>{% endif %}<small class="mono">{{ e.correlation_id }}</small></article>{% else %}<div class="empty">No events recorded yet.</div>{% endfor %}</div>
+    <section class="box" id="operational-journey"><div class="panelhead timeline-heading"><div><h2>Operational journey</h2><p>Readable history across this record, related decisions, and persisted mock outcomes. Latest events first.</p></div><span class="count">{{ journey_total }}</span></div>
+      {% include '_journey_entries.html' %}
+      {% if journey_pages > 1 %}<nav class="pagination" aria-label="Operational journey pages">{% if journey_page > 1 %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}journey_page={{ journey_page - 1 }}">Newer events</a>{% endif %}<span>Page {{ journey_page }} of {{ journey_pages }}</span>{% if journey_page < journey_pages %}<a href="{{ detail_query }}{% if detail_query %}&amp;{% else %}?{% endif %}journey_page={{ journey_page + 1 }}">Older events</a>{% endif %}</nav>{% endif %}
     </section>
   </div>
 </main>
