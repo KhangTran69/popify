@@ -11,6 +11,7 @@
     <h2 id="record-guidance-title">{{ record_guidance.state }}</h2>
     <p><strong>Next supported action:</strong> {{ record_guidance.action }}{% if record_guidance.href %} <a href="{{ record_guidance.href }}">{{ record_guidance.link or 'Open relevant record' }} ↗</a>{% endif %}</p>
   </section>
+  {% if kind == 'approval' %}<nav aria-label="Approval page shortcuts" class="record-shortcuts"><a href="#record-details">Review facts</a><a href="#approval-actions">Decision and recovery</a><a href="#operational-journey">Saved history</a></nav>{% endif %}
   <div class="detailgrid">
     <section class="box" id="record-details" aria-label="Record details">
       <h2>Record details</h2>
