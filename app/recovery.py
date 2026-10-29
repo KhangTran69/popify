@@ -92,12 +92,13 @@ def recovery_union(now=None):
         Approval.next_attempt_at.label("next_attempt_at"), Approval.created_at.label("occurred_at"),
         _approval_category(now, has_prior_terminal, inconsistent).label("category"),
         has_prior_terminal.label("prior_terminal"),
+        inconsistent.label("inconsistent"),
     ).outerjoin(
         own_execution,
         own_execution.idempotency_key == literal("approval:") + cast(Approval.id, String),
     ).where(
         or_(Approval.replacement_approval_id.is_(None),
-            Approval.execution_status.in_(["ambiguous", "disputed"])),
+            Approval.execution_status.in_(["ambiguous", "disputed"]), inconsistent),
         or_(
             Approval.status == "pending",
             Approval.execution_status.in_(["failed", "queued", "retryable", "exhausted", "ambiguous", "disputed", "evidence_changed", "invalid_action", "blocked_prior_outcome", "superseded", "reconciled_not_executed"]),
@@ -111,6 +112,7 @@ def recovery_union(now=None):
         Case.status.label("raw_state"), Case.attempts.label("attempts"), Case.next_attempt_at.label("next_attempt_at"),
         Case.created_at.label("occurred_at"), _work_category(Case, now).label("category"),
         literal(False).label("prior_terminal"),
+        literal(False).label("inconsistent"),
     ).where(or_(Case.status.in_(["failed", "exhausted"]), (Case.status == "queued") & (Case.attempts > 0)))
     deliveries = select(
         literal("delivery").label("source"), Delivery.id.label("record_id"),
@@ -119,6 +121,7 @@ def recovery_union(now=None):
         Delivery.status.label("raw_state"), Delivery.attempts.label("attempts"), Delivery.next_attempt_at.label("next_attempt_at"),
         Delivery.received_at.label("occurred_at"), _work_category(Delivery, now).label("category"),
         literal(False).label("prior_terminal"),
+        literal(False).label("inconsistent"),
     ).where(or_(Delivery.status.in_(["failed", "exhausted"]), (Delivery.status == "received") & (Delivery.attempts > 0)))
     return union_all(approvals, cases, deliveries).subquery()
 
@@ -163,7 +166,7 @@ def recovery_item(row):
     row["url"] = f"/{'approvals' if source == 'approval' else 'cases' if source == 'case' else 'deliveries'}/{row['record_id']}"
     row["next_action"] = (
         "Inspect the related execution; this revision cannot act"
-        if row.get("prior_terminal") and row["category"] != "uncertain" and "disagree" not in row["reason"]
+        if row.get("prior_terminal") and row["category"] != "uncertain" and not row["inconsistent"]
         else {
         "pending": "Review evidence and decide",
         "waiting": "Wait for the recorded retry deadline",
@@ -173,7 +176,7 @@ def recovery_item(row):
         "uncertain": "Reconcile the outcome; retry remains blocked",
         "blocked": (
             "Investigate conflicting persisted outcome records"
-            if "disagree" in row["reason"]
+            if row["inconsistent"]
             else
             "Correct the action contract before reprocessing"
             if row["raw_state"] == "invalid_action"
