@@ -22,7 +22,9 @@ test -f .env || cp .env.example .env
 docker compose up --build -d
 ```
 
-Before the **first** start, choose `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env`. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. The local demonstration uses the configured existing values. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
+Before the **first** start, replace `POSTGRES_PASSWORD`, `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env` with unique values. Use a long URL-safe password for PostgreSQL; Compose builds the matching database URL from the configured database name, username, and password. Production requires at least 32 characters for `APP_SECRET`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY`, and at least 12 for `OPERATOR_PASSWORD`. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
+
+The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. The isolated preview keeps its fixed demonstration login behavior.
 
 No Shopify or LLM credentials are needed for mock mode. Named volumes preserve PostgreSQL and n8n across ordinary restarts. Do not use `docker compose down -v` to troubleshoot.
 
@@ -187,10 +189,11 @@ See `.env.example` and `app/config.py`. `.env` is ignored by Git and Docker buil
 | --- | --- |
 | `OPERATOR_USERNAME`, `OPERATOR_PASSWORD`, `APP_SECRET` | Operator sign-in and session signing |
 | `N8N_WEBHOOK_SECRET` | Internal API authentication; must agree across API and n8n |
-| `N8N_ENCRYPTION_KEY` | Stable key for n8n's persisted encrypted state |
+| `N8N_ENCRYPTION_KEY` | Stable key for n8n's persisted encrypted state; production requires at least 32 characters |
 | `SHOPIFY_WEBHOOK_SECRET`, `SHOPIFY_STORE_DOMAIN` | HMAC secret and single-store allowlist |
 | `ORDER_DELAY_HOURS` | Delay threshold, default 48 hours |
-| `POPIFY_ENV` | Defaults to production; set `development` only for local use. Production requires non-placeholder secrets and `COOKIE_SECURE=true` |
+| `POPIFY_ENV` | Defaults to production; set `development` only for local use. Production requires non-placeholder secrets at the minimum lengths above and `COOKIE_SECURE=true` |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | Compose database name and login; password must be URL-safe and set in `.env` |
 | `LLM_MODE` | `mock` by default; optional `openai` |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | Optional Responses API adapter |
 | `COOKIE_SECURE` | Set to `true` when served over HTTPS so session cookies use the Secure attribute |
