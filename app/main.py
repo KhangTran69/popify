@@ -1,4 +1,4 @@
-import json, logging, os, secrets, uuid, time
+import json, logging, os, secrets, uuid, time, threading
 from math import ceil
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
@@ -61,6 +61,57 @@ templates.env.filters["utc"] = lambda value: (
 templates.env.filters["snapshot_utc"] = snapshot_utc
 templates.env.globals["preview_mode"] = settings.preview_mode
 
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_BUCKET_LIMIT = 10_000
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_LOGIN_ATTEMPTS_LOCK = threading.Lock()
+
+
+def _login_rate_keys(request: Request, username: str) -> tuple[str, str]:
+    client_ip = request.client.host if request.client is not None else "unknown"
+    return (f"ip:{client_ip}", f"account:{username.strip().casefold()}")
+
+
+def _check_login_attempt(
+    request: Request, username: str, password: str, now: float
+) -> tuple[bool, int]:
+    keys = _login_rate_keys(request, username)
+    with _LOGIN_ATTEMPTS_LOCK:
+        for key in list(_LOGIN_ATTEMPTS):
+            recent = [
+                attempted_at
+                for attempted_at in _LOGIN_ATTEMPTS[key]
+                if now - attempted_at < _LOGIN_WINDOW_SECONDS
+            ]
+            if recent:
+                _LOGIN_ATTEMPTS[key] = recent
+            else:
+                del _LOGIN_ATTEMPTS[key]
+        waits = [
+            max(1, int(_LOGIN_WINDOW_SECONDS - (now - attempts[0])))
+            for key in keys
+            if len(attempts := _LOGIN_ATTEMPTS.get(key, [])) >= _LOGIN_MAX_FAILURES
+        ]
+        if waits:
+            return False, max(waits)
+        valid = secrets.compare_digest(
+            username, settings.operator_username
+        ) and secrets.compare_digest(password, settings.operator_password)
+        if valid:
+            for key in keys:
+                _LOGIN_ATTEMPTS.pop(key, None)
+            return True, 0
+        for key in keys:
+            _LOGIN_ATTEMPTS.setdefault(key, []).append(now)
+        while len(_LOGIN_ATTEMPTS) > _LOGIN_BUCKET_LIMIT:
+            oldest = min(
+                _LOGIN_ATTEMPTS,
+                key=lambda key: _LOGIN_ATTEMPTS[key][-1],
+            )
+            del _LOGIN_ATTEMPTS[oldest]
+        return False, 0
+
 
 @asynccontextmanager
 async def lifespan(app):
@@ -72,11 +123,32 @@ async def lifespan(app):
             "APP_SECRET": settings.app_secret,
             "OPERATOR_PASSWORD": settings.operator_password,
             "N8N_WEBHOOK_SECRET": settings.n8n_webhook_secret,
+            "N8N_ENCRYPTION_KEY": os.environ.get("N8N_ENCRYPTION_KEY", ""),
         }
-        placeholders = {"local-development-secret-change-me", "demo-change-me", "local-demo-secret"}
+        placeholders = {
+            "local-development-secret-change-me",
+            "demo-change-me",
+            "local-demo-secret",
+            "replace-with-random-key-before-sharing",
+        }
         missing = [name for name, value in required.items() if not value or value in placeholders]
         if missing:
             raise RuntimeError("Production requires non-placeholder values for: " + ", ".join(missing))
+        minimum_lengths = {
+            "APP_SECRET": (settings.app_secret, 32),
+            "OPERATOR_PASSWORD": (settings.operator_password, 12),
+            "N8N_WEBHOOK_SECRET": (settings.n8n_webhook_secret, 32),
+            "N8N_ENCRYPTION_KEY": (os.environ.get("N8N_ENCRYPTION_KEY", ""), 32),
+        }
+        weak = [
+            name
+            for name, (value, minimum) in minimum_lengths.items()
+            if len(value) < minimum
+        ]
+        if weak:
+            raise RuntimeError(
+                "Production values are too short for: " + ", ".join(weak)
+            )
         if os.environ.get("COOKIE_SECURE", "false").lower() != "true":
             raise RuntimeError("COOKIE_SECURE=true is required in production.")
     with engine.connect() as connection:
@@ -161,9 +233,27 @@ def login(
     csrf_token: str = Form(...),
 ):
     verify_csrf(request, csrf_token)
-    if not secrets.compare_digest(
-        username, settings.operator_username
-    ) or not secrets.compare_digest(password, settings.operator_password):
+    now = time.monotonic()
+    if settings.preview_mode:
+        valid = secrets.compare_digest(
+            username, settings.operator_username
+        ) and secrets.compare_digest(password, settings.operator_password)
+        retry_after = 0
+    else:
+        valid, retry_after = _check_login_attempt(request, username, password, now)
+    if retry_after:
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {
+                "request": request,
+                "csrf": csrf(request),
+                "error": "Too many sign-in attempts. Try again later.",
+            },
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+    if not valid:
         return templates.TemplateResponse(
             request,
             "login.html",
