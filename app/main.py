@@ -88,13 +88,6 @@ def _check_login_attempt(
                 _LOGIN_ATTEMPTS[key] = recent
             else:
                 del _LOGIN_ATTEMPTS[key]
-        waits = [
-            max(1, int(_LOGIN_WINDOW_SECONDS - (now - attempts[0])))
-            for key in keys
-            if len(attempts := _LOGIN_ATTEMPTS.get(key, [])) >= _LOGIN_MAX_FAILURES
-        ]
-        if waits:
-            return False, max(waits)
         valid = secrets.compare_digest(
             username, settings.operator_username
         ) and secrets.compare_digest(password, settings.operator_password)
@@ -102,6 +95,13 @@ def _check_login_attempt(
             for key in keys:
                 _LOGIN_ATTEMPTS.pop(key, None)
             return True, 0
+        waits = [
+            max(1, int(_LOGIN_WINDOW_SECONDS - (now - attempts[0])))
+            for key in keys
+            if len(attempts := _LOGIN_ATTEMPTS.get(key, [])) >= _LOGIN_MAX_FAILURES
+        ]
+        if waits:
+            return False, max(waits)
         for key in keys:
             _LOGIN_ATTEMPTS.setdefault(key, []).append(now)
         while len(_LOGIN_ATTEMPTS) > _LOGIN_BUCKET_LIMIT:
