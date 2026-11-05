@@ -24,7 +24,7 @@ docker compose up --build -d
 
 Before the **first** start, replace `POSTGRES_PASSWORD`, `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env` with unique values. Use a long URL-safe password for PostgreSQL; Compose builds the matching database URL from the configured database name, username, and password. Production requires at least 32 characters for `APP_SECRET`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY`, and at least 12 for `OPERATOR_PASSWORD`. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
 
-The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. The isolated preview keeps its fixed demonstration login behavior.
+The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. A correct operator password can still sign in while a failure bucket is limited. The isolated preview keeps its fixed demonstration login behavior.
 
 No Shopify or LLM credentials are needed for mock mode. Named volumes preserve PostgreSQL and n8n across ordinary restarts. Do not use `docker compose down -v` to troubleshoot.
 
