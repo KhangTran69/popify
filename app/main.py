@@ -1439,9 +1439,21 @@ def preview_run(
 
 @app.post("/webhooks/shopify/orders")
 async def shopify_order(request: Request, db: Session = Depends(get_db)):
-    raw = await request.body()
-    if len(raw) > 1_000_000:
-        raise HTTPException(413, "Webhook exceeds 1 MB")
+    max_body_bytes = 1_000_000
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_body_bytes:
+                raise HTTPException(413, "Webhook exceeds 1 MB")
+        except ValueError:
+            raise HTTPException(400, "invalid Content-Length")
+
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > max_body_bytes:
+            raise HTTPException(413, "Webhook exceeds 1 MB")
+        raw.extend(chunk)
+    raw = bytes(raw)
     if not verify_shopify(raw, request.headers.get("x-shopify-hmac-sha256")):
         raise HTTPException(401, "invalid webhook signature")
     try:
