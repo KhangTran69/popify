@@ -181,6 +181,17 @@ No manual-time-saved or business-impact estimate is reported.
 - Exhausted items require operator requeue. Requeue retains attempt history; an exhausted action gets one additional recovery attempt. An ambiguous action has **no retry button**. An approval blocked by an earlier execution can be requeued only after the earlier outcome is explicitly confirmed not executed and current evidence still matches; otherwise it stays blocked or moves to stale review.
 - The reconciliation reference is stored as supplied and is not externally verified. An operator must verify it through a trusted source before recording a definite outcome. A future live provider adapter could automate that lookup using its idempotency key (`approval:<id>`) or provider request ID. The current mock-only implementation does not promise exactly-once behavior across external APIs.
 
+## Change review map
+
+| Change area | Read first | Focused evidence |
+|---|---|---|
+| Approval decisions and provider-neutral action execution | [Decision route](app/main.py#L1300), [`decide_approval` and `execute_approved`](app/services.py#L804), and the [adapter contract](app/action_provider.py#L24) | [Idempotent decision/retry](tests/test_workflows.py#L326), [adapter receives reviewed action and stable key](tests/test_workflows.py#L372), [pending approval stays gated](tests/test_workflows.py#L429), and [execution uses reviewed evidence](tests/test_workflows.py#L939) |
+| Stale evidence and ambiguous-outcome reconciliation | [Refresh route](app/main.py#L1331), [reconciliation route](app/main.py#L1357), [`reconcile_approval_execution`](app/services.py#L913), and [freshness checks](app/services.py#L547) | [Blind retry is blocked](tests/test_workflows.py#L630), [operator assertions preserve the original execution](tests/test_workflows.py#L658), [later evidence appends to history](tests/test_workflows.py#L2446), and [conflicting evidence is visible](tests/test_workflows.py#L2473) |
+| Recovery queues and exhausted-action retry | [Recovery workspace](app/main.py#L486), [recovery categories](app/recovery.py#L45), and [approval retry route](app/main.py#L1390) | [Recovery categories stay separate](tests/test_workflows.py#L1193), [exhausted action requires authenticated recovery](tests/test_workflows.py#L2021), and [uncertain work is prioritized](tests/test_workflows.py#L2185) |
+| Disposable preview versus actual local workflows | [Reviewer walkthrough](docs/REVIEWER_WALKTHROUGH.md), [`scripts/preview.py`](scripts/preview.py), and [`scripts/verify.py`](scripts/verify.py) | [Preview HTTP smoke](tests/test_preview_http.py#L15) and [preview approval remains local](tests/test_workflows.py#L1225). The [verification commands](README.md#verification) distinguish SQLite preview from PostgreSQL checks and the Docker-backed n8n demo. |
+
+The workflow tests live in a large file; these links point to focused cases. Preview checks UI and persisted SQLite scenarios, while PostgreSQL concurrency and n8n execution have separate verification commands below.
+
 ## Configuration
 
 See `.env.example` and `app/config.py`. `.env` is ignored by Git and Docker build context. Startup rejects an unsupported LLM mode, invalid retry/delay bounds, or a policy map missing any of the five categories; Pydantic reports the invalid setting names in the API logs.
