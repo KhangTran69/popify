@@ -41,6 +41,12 @@ Store operations combine repeatable work with decisions that need human judgment
 - Added an interactive guided scenario detail page with linked order, inquiry, approval revisions, persisted execution, and correlated audit events. The scenario progress and next step derive from saved state; retry timing and reconciliation consequences are explicit.
 - Added a PostgreSQL migration for immutable execution reconciliations, including a verifier for fresh and populated 0001–0006 schemas. Extended concurrency coverage for repeated identical and competing reconciliation requests. Fixed a progress-card style collision that made the attention stage render horizontally.
 
+## Reviewer-path verification — 15 November 2026
+
+On clean `main` commit [`df54413`](https://github.com/KhangTran69/popify/commit/df54413ab94367b90c8bb3ca5db1361281062bf1), `python -m scripts.verify reviewer` passed its preview HTTP test (**1 passed**) and validated all three workflow exports. The saved recovery journey reached an ambiguous mock execution, an operator assertion of non-execution, a fresh approval, a persisted mock result, and conflicting later evidence. The command reported Python 3.13.12 and confirmed that live n8n was not exercised because Docker was unavailable.
+
+This verifies the isolated SQLite reviewer and recovery path. It does not verify PostgreSQL concurrency or live n8n. Delayed-order scanning is part of the separate local Docker walkthrough; the isolated preview seeds its starting order and triage rather than running that scan. The README walkthrough calls out this distinction.
+
 ## Reproducible reviewer recovery — 29 October 2026
 
 Inspection found that approved ambiguous approvals linked to `#approval-actions`, while only pending approvals rendered that anchor. The isolated HTTP smoke test stopped after creating a success scenario, so it did not prove the advertised ambiguity recovery. `scripts/verify.py` had no single command for that path.
