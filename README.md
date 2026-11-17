@@ -52,21 +52,43 @@ Only after the check succeeds, create the file exclusively and configure it. The
 In one terminal, confirm Docker is already running and the ports are free. If Docker is unavailable, lsof is missing, or any listener appears, stop without changing the existing service.
 
 ```sh
-docker info
-command -v lsof
-lsof -nP -iTCP:8001,5678 -sTCP:LISTEN
+docker info || { echo 'Docker is unavailable; stop before creating project resources.' >&2; exit 1; }
+command -v lsof >/dev/null || { echo 'lsof is unavailable; stop before checking ports.' >&2; exit 1; }
+PORT_CHECK_OUTPUT=$(lsof -nP -iTCP:8001,5678 -sTCP:LISTEN 2>&1)
+PORT_CHECK_STATUS=$?
+if [ "$PORT_CHECK_STATUS" -eq 0 ]; then
+  if [ -n "$PORT_CHECK_OUTPUT" ]; then
+    printf '%s\n' "$PORT_CHECK_OUTPUT" >&2
+    echo 'A required port is in use; stop before starting the project.' >&2
+    exit 1
+  fi
+elif [ "$PORT_CHECK_STATUS" -eq 1 ] && [ -z "$PORT_CHECK_OUTPUT" ]; then
+  : # lsof found no listener on either port
+else
+  if [ -n "$PORT_CHECK_OUTPUT" ]; then printf '%s\n' "$PORT_CHECK_OUTPUT" >&2; fi
+  echo 'Could not verify required ports; stop before starting the project.' >&2
+  exit 1
+fi
 ```
 
 Only after the checks succeed, choose a new project name and verify that no matching resources exist. If any command prints a value, choose another name and repeat these checks.
 
 ```sh
 # Keep this variable in the same terminal for setup, verification, and cleanup.
-POPI_PROJECT="popify-review-$(uuidgen | tr '[:upper:]' '[:lower:]')"
-test "$POPI_PROJECT" != popify-review-
+POPI_UUID=$(uuidgen) || { echo 'UUID generation failed; stop before creating project resources.' >&2; exit 1; }
+POPI_UUID=$(printf '%s' "$POPI_UUID" | tr '[:upper:]' '[:lower:]') || { echo 'UUID normalization failed; stop.' >&2; exit 1; }
+case "$POPI_UUID" in
+  ????????-????-????-????-????????????) ;;
+  *) echo 'UUID format is invalid; stop before creating project resources.' >&2; exit 1 ;;
+esac
+case "$POPI_UUID" in
+  *[!0123456789abcdef-]*) echo 'UUID contains invalid characters; stop.' >&2; exit 1 ;;
+esac
+POPI_PROJECT="popify-review-$POPI_UUID"
 export POPI_PROJECT
-docker ps -aq --filter "label=com.docker.compose.project=$POPI_PROJECT"
-docker volume ls -q --filter "label=com.docker.compose.project=$POPI_PROJECT"
-docker network ls -q --filter "label=com.docker.compose.project=$POPI_PROJECT"
+docker ps -aq --filter "label=com.docker.compose.project=$POPI_PROJECT" || { echo 'Docker container preflight failed; stop.' >&2; exit 1; }
+docker volume ls -q --filter "label=com.docker.compose.project=$POPI_PROJECT" || { echo 'Docker volume preflight failed; stop.' >&2; exit 1; }
+docker network ls -q --filter "label=com.docker.compose.project=$POPI_PROJECT" || { echo 'Docker network preflight failed; stop.' >&2; exit 1; }
 printf 'Using isolated Compose project: %s\n' "$POPI_PROJECT"
 ```
 
