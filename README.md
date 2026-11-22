@@ -344,7 +344,7 @@ For authenticated integration intake, POST a JSON inquiry to `/api/support` with
 ## Verification
 
 ```sh
-python -m pip install -r requirements-test.lock && python -m pip install --no-deps -e .
+python -m pip install -r requirements-test.lock -e '.[test]'
 python -m scripts.verify local                 # behavior suite and workflow exports
 python -m scripts.verify preview --port 8002   # disposable UI; stop with Ctrl+C
 python -m scripts.verify postgres              # fresh/upgrade migrations and concurrency
