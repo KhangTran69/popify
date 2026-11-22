@@ -1239,22 +1239,25 @@ def queue_support(db, message, order_ref, email, request_key=None):
 def _same_support_request(case, message, order_ref, email):
     return (
         case.message == message
-        and case.order_ref == (order_ref or None)
+        and (case.order_ref or None) == (order_ref or None)
         and (case.customer_email or "").strip().casefold()
         == (email or "").strip().casefold()
     )
 
 
 def process_support(db, case):
+    case_id = case.id
+    attempts_before = case.attempts
     case.attempts += 1
     try:
         return create_support_case(
             db, case.message, case.order_ref, case.customer_email, case=case
         )
     except Exception as exc:
-        case_id = case.id
         db.rollback()
         case = db.scalar(select(Case).where(Case.id == case_id).with_for_update())
+        if case.attempts != attempts_before or case.status not in ("queued", "failed"):
+            return case
         case.attempts += 1
         case.status = "exhausted" if case.attempts >= 3 else "failed"
         case.failure_detail = type(exc).__name__
