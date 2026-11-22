@@ -1502,6 +1502,74 @@ def test_form_queues_idempotently_and_n8n_triages():
     assert "Verified order reference" in client.get(first.headers["location"]).text
 
 
+def test_support_api_reuses_an_inquiry_without_an_order_reference():
+    headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
+    payload = {"message": "A synthetic inquiry", "request_key": "no-order-reference"}
+    first = client.post("/api/support", headers=headers, json={**payload, "order_ref": ""})
+    assert first.status_code == 202
+
+    replay = client.post("/api/support", headers=headers, json=payload)
+
+    assert replay.status_code == 202
+    assert replay.json() == first.json()
+
+
+def test_triage_write_failure_records_a_retryable_attempt():
+    headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
+    intake = client.post("/api/support", headers=headers, json={"message": "A synthetic inquiry"})
+    assert intake.status_code == 202
+    case_id = intake.json()["case_id"]
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TRIGGER reject_draft BEFORE UPDATE ON support_cases "
+            "WHEN NEW.status = 'needs_review' "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic draft write failure'); END"
+        )
+
+    triage = client.post("/api/n8n/triage-next", headers=headers)
+
+    assert triage.status_code == 200
+    assert triage.json() == {"case_id": case_id, "status": "failed"}
+    assert client.post("/api/n8n/triage-next", headers=headers).json() == {"status": "idle"}
+    with TestingSession() as db:
+        case = db.get(Case, case_id)
+        assert case.attempts == 1
+        assert case.failure_detail == "IntegrityError"
+        assert case.next_attempt_at is not None
+        assert db.scalar(select(Approval)) is None
+        failure = db.scalar(select(Audit).where(Audit.event == "triage_failed"))
+        assert failure.details == {"error_type": "IntegrityError"}
+
+
+def test_triage_rollback_preserves_another_workers_committed_result(monkeypatch):
+    from app import services
+
+    prepare = services.create_support_case
+    with TestingSession() as first, TestingSession() as second:
+        case = services.queue_support(first, "A synthetic inquiry", None, None)
+        case_id = case.id
+        rollback = first.rollback
+
+        def retry_after_rollback():
+            rollback()
+            services.process_support(second, second.get(Case, case_id))
+
+        def fail_first_attempt(db, *args, **kwargs):
+            if db is first:
+                raise RuntimeError("synthetic failure")
+            return prepare(db, *args, **kwargs)
+
+        monkeypatch.setattr(first, "rollback", retry_after_rollback)
+        monkeypatch.setattr(services, "create_support_case", fail_first_attempt)
+
+        result = services.process_support(first, case)
+
+        assert result.status == "needs_review"
+        assert result.attempts == 1
+        approval = first.scalar(select(Approval).where(Approval.subject_id == case_id))
+        assert approval.supporting_facts["case_status"] == result.status
+
+
 def test_guided_demo_requires_auth_and_csrf_and_runs_n8n(monkeypatch):
     import re
     from types import SimpleNamespace
