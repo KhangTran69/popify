@@ -152,7 +152,7 @@ def run():
             f"/approvals/{approval_id}/decision",
             data={"csrf_token": token, "decision": "approved"},
         ).raise_for_status()
-        trigger("exceptions/scan")
+        _trigger_workflow(n8n, "exceptions/scan")
     with SessionLocal() as db:
         a = db.get(Approval, approval_id)
         assert a.execution_status == "succeeded", a.execution_status
