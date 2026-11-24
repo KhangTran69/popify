@@ -26,7 +26,7 @@ flowchart LR
 - `python -m scripts.verify local`: **122 tests passed** and all three workflow exports validated.
 - `scripts.verify_migrations` passed on fresh and populated upgrade schemas; `scripts.verify_postgres` passed the concurrency scenarios on a disposable PostgreSQL 16.15 cluster. The app's configured database and its data were not used.
 - `python -m scripts.benchmark --count 100` was exercised against a disposable PostgreSQL 16.15 cluster in three runs of 100 signed synthetic deliveries each on Python 3.13.12 / macOS 27.2.1 ARM64. Across runs, intake acknowledgment p50 was **2.69–2.79 ms**, p95 was **3.10–3.74 ms**, and sequential persisted worker throughput was **309–346 deliveries/second**. Measurement used an in-process FastAPI client; it excludes network latency, n8n scheduling, and concurrent workers. This is a local baseline, not a production capacity claim.
-- The initial full-stack CI run passed, and a repeated run exposed a startup race where the demo could call an n8n webhook before workflow import finished. The demo now retries only the transient unregistered-webhook response; CI is rerunning this path for the fix. Local Docker is unavailable in this checkout.
+- [GitHub Actions for commit `97e06b4`](https://github.com/KhangTran69/popify/actions/runs/45360601051) passed all three jobs, including the disposable Compose stack, real local n8n workflow demo, PostgreSQL benchmark, and concurrency checks. The demo retries only the transient unregistered-webhook response that exposed the startup race. Local Docker is unavailable in this checkout.
 
 ## Implemented improvements
 
