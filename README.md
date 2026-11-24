@@ -55,7 +55,7 @@ The trigger URLs use port 5678 and are local demo conveniences. They return work
 
 ## Current verification
 
-Latest local run: `python -m scripts.verify local` passed **120 tests** and validated all three workflow exports. Three PostgreSQL benchmark runs processed 100 signed deliveries each; the measurements and their limits are in [PORTFOLIO.md](PORTFOLIO.md). GitHub Actions now starts a disposable PostgreSQL/FastAPI/n8n Compose stack, runs the real local workflow demo, and benchmarks persisted deliveries. Local Docker was unavailable for this change, so the new full-stack job still needs its PR CI result. A synthetic preview is not counted as live n8n verification.
+Latest local run: `python -m scripts.verify local` passed **120 tests** and validated all three workflow exports. Three PostgreSQL benchmark runs processed 100 signed deliveries each; the measurements and their limits are in [PORTFOLIO.md](PORTFOLIO.md). GitHub Actions also passed the disposable PostgreSQL/FastAPI/n8n Compose run, real local workflow demo, and persisted-delivery benchmark for this change. The local Docker daemon was unavailable, so the full-stack result comes from CI. A synthetic preview is not counted as live n8n verification.
 
 ## Setup
 

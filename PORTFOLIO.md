@@ -26,8 +26,7 @@ flowchart LR
 - `python -m scripts.verify local`: **120 tests passed** and all three workflow exports validated.
 - `scripts.verify_migrations` passed on fresh and populated upgrade schemas; `scripts.verify_postgres` passed the concurrency scenarios on a disposable PostgreSQL 16.15 cluster. The app's configured database and its data were not used.
 - `python -m scripts.benchmark --count 100` was exercised against a disposable PostgreSQL 16.15 cluster in three runs of 100 signed synthetic deliveries each on Python 3.13.12 / macOS 27.2.1 ARM64. Across runs, intake acknowledgment p50 was **2.69–2.79 ms**, p95 was **3.10–3.74 ms**, and sequential persisted worker throughput was **309–346 deliveries/second**. Measurement used an in-process FastAPI client; it excludes network latency, n8n scheduling, and concurrent workers. This is a local baseline, not a production capacity claim.
-- The CI workflow now includes a full Docker Compose run that starts PostgreSQL, FastAPI, and n8n, executes the local demo, and runs the benchmark against CI's disposable database. Local Docker was unavailable during this change, so that full-stack check is pending the PR's GitHub Actions run.
-- The local Docker daemon was unavailable, so the real n8n workflow demo could not be run from this checkout. The full-stack CI job is the verification path for that check.
+- [GitHub Actions for commit `f2ad6d7`](https://github.com/KhangTran69/popify/actions/runs/45359115862) passed all three jobs, including the disposable Compose stack, real local n8n workflow demo, and PostgreSQL benchmark. The local Docker daemon was unavailable, so full-stack verification ran in CI.
 
 ## Implemented improvements
 
