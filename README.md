@@ -1,175 +1,27 @@
 # PoPify
 
-A local e-commerce operations demonstration: receive an order, detect a delay, prepare a grounded reply, request human approval, and audit a **mock** outcome. Three n8n workflows orchestrate durable work; FastAPI implements business rules and PostgreSQL preserves state. The operator console uses Jinja templates, CSS, and a small form-submission enhancement.
+A local e-commerce operations application demonstrating durable order intake, support triage, delivery-delay review, and human-approved **mock** actions with FastAPI, PostgreSQL, and three n8n workflows.
 
-## Open the running project
+## Start here
 
-- [Operator login](http://localhost:8001/login): `operator` / `demo-change-me` unless changed in `.env`.
-- [Operator overview](http://localhost:8001/)
-- [Guided end-to-end demo](http://localhost:8001/demo)
-- [n8n editor](http://localhost:5678): its owner account is separate from the operator account.
-- [API health](http://localhost:8001/health)
-
-For a concise walkthrough that separates the disposable preview from the local n8n run, see [Reviewer walkthrough](docs/REVIEWER_WALKTHROUGH.md).
-
-## Setup
-
-Requires Docker Desktop with Compose. From the repository root:
+For a fast, isolated recovery walkthrough that does not need Docker, install the pinned dependencies and run:
 
 ```sh
-# First installation only. Create .env only when it does not already exist.
-if [ ! -e .env ]; then
-  (set -C; cat .env.example > .env) || { echo '.env appeared during setup; inspect it and retry.' >&2; exit 1; }
-fi
-docker compose up --build -d
+python -m pip install -r requirements-test.lock -e '.[test]'
+python -m scripts.verify reviewer
 ```
 
-Before the **first** start, replace `POSTGRES_PASSWORD`, `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env` with unique values. Use a long URL-safe password for PostgreSQL; Compose builds the matching database URL from the configured database name, username, and password. Production requires at least 32 characters for `APP_SECRET`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY`, and at least 12 for `OPERATOR_PASSWORD`. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
+To interact with the preview, run `python -m scripts.preview --port 8002`, then open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. Preview data is disposable SQLite; it does not run n8n.
 
-The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. A correct operator password can still sign in while a failure bucket is limited. The isolated preview keeps its fixed demonstration login behavior.
-
-No Shopify or LLM credentials are needed for mock mode. Named volumes preserve PostgreSQL and n8n across ordinary restarts. Do not use `docker compose down -v` to troubleshoot.
-
-On startup, SQL migrations apply transactionally. n8n imports and publishes the three versioned workflow exports when their content changes, retaining their stable IDs. Before an update, it exports existing workflows to `/home/node/.n8n/commerceops-before-update.json` inside its volume. An unrelated or inactive workflow is not deleted. Edits to these three workflows in the n8n editor should be exported back into the repository before changing the bundled files.
-
-### Disposable reviewer stack and cleanup
-
-For a fresh local end-to-end review, use a **fresh clone or worktree** with no existing `.env` or application data. Compose names its PostgreSQL and n8n volumes from the project name, so a unique name keeps this review's database and workflow state separate from the default project. The API and n8n host ports are fixed at `8001` and `5678`; if either port is already in use, stop here rather than stopping another service.
-
-Create the local-only configuration in the fresh checkout. Set unique values for the required secrets; keep `LLM_MODE=mock` and leave Shopify/OpenAI credentials unset.
-
-```sh
-# Run this check first. If it fails, stop; never overwrite an existing .env.
-test ! -e .env
-```
-
-Only after the check succeeds, create the file exclusively and configure it. The shell's no-clobber mode makes creation fail if another process creates `.env` after the preflight:
-
-```sh
-(set -C; cat .env.example > .env) || { echo '.env appeared during setup; stop and inspect it.' >&2; exit 1; }
-```
-
-In one terminal, confirm Docker is already running and the ports are free. If Docker is unavailable, lsof is missing, or any listener appears, stop without changing the existing service.
-
-```sh
-docker info || { echo 'Docker is unavailable; stop before creating project resources.' >&2; exit 1; }
-command -v lsof >/dev/null || { echo 'lsof is unavailable; stop before checking ports.' >&2; exit 1; }
-PORT_CHECK_OUTPUT=$(lsof -nP -iTCP:8001,5678 -sTCP:LISTEN 2>&1)
-PORT_CHECK_STATUS=$?
-if [ "$PORT_CHECK_STATUS" -eq 0 ]; then
-  if [ -n "$PORT_CHECK_OUTPUT" ]; then
-    printf '%s\n' "$PORT_CHECK_OUTPUT" >&2
-    echo 'A required port is in use; stop before starting the project.' >&2
-    exit 1
-  fi
-elif [ "$PORT_CHECK_STATUS" -eq 1 ] && [ -z "$PORT_CHECK_OUTPUT" ]; then
-  : # lsof found no listener on either port
-else
-  if [ -n "$PORT_CHECK_OUTPUT" ]; then printf '%s\n' "$PORT_CHECK_OUTPUT" >&2; fi
-  echo 'Could not verify required ports; stop before starting the project.' >&2
-  exit 1
-fi
-```
-
-Only after the checks succeed, choose a new project name and verify that no matching resources exist. If any command prints a value, choose another name and repeat these checks.
-
-```sh
-# Keep this variable in the same terminal for setup, verification, and cleanup.
-POPI_UUID=$(uuidgen) || { echo 'UUID generation failed; stop before creating project resources.' >&2; exit 1; }
-POPI_UUID=$(printf '%s' "$POPI_UUID" | tr '[:upper:]' '[:lower:]') || { echo 'UUID normalization failed; stop.' >&2; exit 1; }
-case "$POPI_UUID" in
-  ????????-????-????-????-????????????) ;;
-  *) echo 'UUID format is invalid; stop before creating project resources.' >&2; exit 1 ;;
-esac
-case "$POPI_UUID" in
-  *[!0123456789abcdef-]*) echo 'UUID contains invalid characters; stop.' >&2; exit 1 ;;
-esac
-POPI_PROJECT="popify-review-$POPI_UUID"
-export POPI_PROJECT
-docker ps -aq --filter "label=com.docker.compose.project=$POPI_PROJECT" || { echo 'Docker container preflight failed; stop.' >&2; exit 1; }
-docker volume ls -q --filter "label=com.docker.compose.project=$POPI_PROJECT" || { echo 'Docker volume preflight failed; stop.' >&2; exit 1; }
-docker network ls -q --filter "label=com.docker.compose.project=$POPI_PROJECT" || { echo 'Docker network preflight failed; stop.' >&2; exit 1; }
-printf 'Using isolated Compose project: %s\n' "$POPI_PROJECT"
-```
-
-Proceed only if all three resource checks returned no rows. In the same terminal, define the cleanup function and start the project:
-
-```sh
-# Record the configured file identity and contents so cleanup can leave it alone if it changes.
-POPI_ENV_ID_LINE=$(ls -di .env) || { echo 'Cannot identify .env; stop before starting the project.' >&2; exit 1; }
-POPI_ENV_ID=${POPI_ENV_ID_LINE%% *}
-case "$POPI_ENV_ID" in ''|*[!0-9]*) echo 'Cannot validate the .env file identity.' >&2; exit 1 ;; esac
-POPI_HASH_OUTPUT=$(shasum -a 256 .env) || { echo 'Cannot hash .env; stop before starting the project.' >&2; exit 1; }
-POPI_ENV_SHA=${POPI_HASH_OUTPUT%% *}
-case "$POPI_ENV_SHA" in ''|*[!0123456789abcdefABCDEF]*) echo 'Cannot validate the .env checksum.' >&2; exit 1 ;; esac
-[ "${#POPI_ENV_SHA}" -eq 64 ] || { echo 'Cannot validate the full .env checksum.' >&2; exit 1; }
-export POPI_ENV_ID POPI_ENV_SHA
-
-cleanup_popify_review() {
-  docker compose -p "$POPI_PROJECT" down --volumes --remove-orphans || return 1
-  REVIEW_CONTAINERS=$(docker ps -aq --filter "label=com.docker.compose.project=$POPI_PROJECT") || return 1
-  REVIEW_VOLUMES=$(docker volume ls -q --filter "label=com.docker.compose.project=$POPI_PROJECT") || return 1
-  REVIEW_NETWORKS=$(docker network ls -q --filter "label=com.docker.compose.project=$POPI_PROJECT") || return 1
-  if [ -n "$REVIEW_CONTAINERS" ] || [ -n "$REVIEW_VOLUMES" ] || [ -n "$REVIEW_NETWORKS" ]; then
-    echo 'Cleanup incomplete; inspect only resources with the printed project label.' >&2
-    return 1
-  fi
-  if [ -f .env ]; then
-    POPI_CURRENT_ID_LINE=$(ls -di .env) || POPI_CURRENT_ID_LINE=
-    POPI_CURRENT_ENV_ID=${POPI_CURRENT_ID_LINE%% *}
-    POPI_CURRENT_HASH_OUTPUT=$(shasum -a 256 .env) || POPI_CURRENT_HASH_OUTPUT=
-    POPI_CURRENT_ENV_SHA=${POPI_CURRENT_HASH_OUTPUT%% *}
-    case "$POPI_CURRENT_ENV_SHA" in *[!0123456789abcdefABCDEF]*|'') POPI_CURRENT_ENV_SHA= ;; esac
-    [ "${#POPI_CURRENT_ENV_SHA}" -eq 64 ] || POPI_CURRENT_ENV_SHA=
-    if [ -n "$POPI_CURRENT_ENV_ID" ] && [ "$POPI_CURRENT_ENV_ID" = "$POPI_ENV_ID" ] && [ -n "$POPI_CURRENT_ENV_SHA" ] && [ "$POPI_CURRENT_ENV_SHA" = "$POPI_ENV_SHA" ]; then
-      rm .env || return 1
-      printf 'Removed isolated project %s and its unchanged generated .env.\n' "$POPI_PROJECT"
-    else
-      echo '.env changed, was replaced, or could not be verified; left it untouched.'
-    fi
-  else
-    echo '.env is missing; nothing to remove.'
-  fi
-}
-
-docker compose -p "$POPI_PROJECT" up --build -d
-docker compose -p "$POPI_PROJECT" ps
-```
-
-Only continue when `db`, `api`, and `n8n` report healthy. Follow the [local Docker walkthrough](docs/REVIEWER_WALKTHROUGH.md) in the Browser, or run the documented synthetic workflow check:
+For the **real local n8n walkthrough**, use the [isolated Docker setup](docs/LOCAL_STACK_SETUP.md). Once `db`, `api`, and `n8n` are healthy, run this one command from the repository root in the same terminal:
 
 ```sh
 docker compose -p "$POPI_PROJECT" exec -T api python -m scripts.demo
 ```
 
-After a successful or failed review, call the cleanup function in the **same terminal**:
+It creates synthetic records, invokes all three local n8n workflows, and prints the linked saved result. It uses mock actions and does not call Shopify, OpenAI, or customer messaging services.
 
-```sh
-cleanup_popify_review || { echo 'Cleanup did not complete; keep the project name and inspect only its labeled resources.' >&2; exit 1; }
-unset -f cleanup_popify_review
-unset POPI_PROJECT
-```
-
-If a preflight stops, no project resources were started. Remove `.env` only if it is still the file this procedure created and configured. Keep the same `-p "$POPI_PROJECT"` on every Compose command. The named volumes are disposable only because this procedure creates them under a unique project name; do not use `down --volumes` with the default project or to troubleshoot a stack containing data you want to keep. This local review uses synthetic data and mock actions; it does not call Shopify, OpenAI, or an external action provider.
-
-### Isolated interface preview without Docker
-
-After installing the project dependencies, run:
-
-```sh
-python -m scripts.preview --port 8002
-```
-
-Open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. This creates a disposable SQLite database in a temporary directory and seeds synthetic pending, completed, rejected, retryable, exhausted, ambiguous, evidence-changed, unsupported-action, support-recovery, and delivery-recovery records. The Guided demo page offers saved examples and an interactive scenario runner. Choose pending, success, rejection, transient failure, exhaustion, stale evidence, uncertain execution, or a blocked action; each new run starts with a saved synthetic inquiry and a pending human decision. Approval applies only that run's mock outcome, while rejection records no execution. Review the linked order, inquiry, approval revisions, execution attempts, and correlated audit history. Reconciliation assertions are append-only: an unknown result can be followed by later evidence; contradictory definite claims enter a disputed, blocked state until another supported conclusion is recorded. Confirmed non-execution permits a fresh pending approval; confirmed completion closes recovery; neither rewrites the original ambiguous execution. Long scenario histories are paginated while the current approval and authoritative reconciliation remain visible. Preview mode ignores `.env` integration settings, forces mock LLM behavior, clears Shopify/OpenAI credentials and the n8n endpoint, and blocks webhook/worker routes. The persistent preview banner identifies the isolated data; n8n, paid services, and external actions are unavailable. Stop the process with Ctrl+C; its temporary database is removed when it exits. This preview is for interface and recovery-state review; it does **not** verify PostgreSQL concurrency or execute any n8n workflow.
-
-For a short reviewer walkthrough, open **Guided demo → Five-minute reviewer path** in the preview. Start the success run, inspect its order and support evidence, approve the mock reply, and follow the saved result. Then start the recovery run, approve once to record a simulated timeout, append a confirmed-non-execution assertion with a synthetic supporting reference, create the fresh approval, and approve it. The final reviewer result connects the original ambiguous attempt, operator assertion, replacement revision, and separate successful local mock execution without implying provider verification. The scenario page shows the same readable event language used by ordinary order, support, approval, and delivery pages.
-
-To verify that recovery journey automatically against a fresh disposable preview process, run `python -m scripts.verify reviewer`. It signs in, records an ambiguous mock attempt, asserts non-execution, creates and approves a fresh revision, and then appends conflicting later evidence. The command checks the saved outcome shown after each step, validates the three workflow exports, and prints the checked commit, environment, and live n8n prerequisite. It leaves the normal local database untouched. Run `python -m scripts.verify demo` separately to exercise real local n8n workflows when Docker is available.
-
-Every ordinary record page begins with its current persisted state and one supported next action. Its **Operational journey** is a bounded, paginated history across related records and decisions; links and history pagination retain the originating queue search, status, and page context. Raw audit details remain available under each readable event for verification.
-
-The dashboard counts completed mock actions only when an approved decision, succeeded approval state, and succeeded execution record agree. If a terminal decision conflicts with its saved execution, the approval appears in the **Blocked** recovery category with an investigation step; the record and scenario pages do not claim completion. A completed ambiguity recovery links directly to the original assertion and the fresh approval's saved result.
-An inconsistent historical approval remains discoverable after replacement, so an operator can investigate the original record alongside its successor.
+[Reviewer walkthrough](docs/REVIEWER_WALKTHROUGH.md) · [Operator login](http://localhost:8001/login) · [Overview](http://localhost:8001/) · [Guided demo](http://localhost:8001/demo) · [n8n editor](http://localhost:5678) · [API health](http://localhost:8001/health)
 
 ## Architecture
 
@@ -201,12 +53,57 @@ There is no custom scheduler. Each workflow runs once per minute in n8n. FastAPI
 
 The trigger URLs use port 5678 and are local demo conveniences. They return worker summaries and do not accept customer payloads. The n8n editor shows its own execution history. Successful workflow data contains worker summaries; error payload persistence is disabled. Original customer messages remain in the protected operator application.
 
+## Current verification
+
+Latest local run: `python -m scripts.verify local` passed **120 tests** and validated all three workflow exports. Three PostgreSQL benchmark runs processed 100 signed deliveries each; the measurements and their limits are in [PORTFOLIO.md](PORTFOLIO.md). GitHub Actions now starts a disposable PostgreSQL/FastAPI/n8n Compose stack, runs the real local workflow demo, and benchmarks persisted deliveries. Local Docker was unavailable for this change, so the new full-stack job still needs its PR CI result. A synthetic preview is not counted as live n8n verification.
+
+## Setup
+
+Requires Docker Desktop with Compose. From the repository root:
+
+```sh
+# First installation only. Create .env only when it does not already exist.
+if [ ! -e .env ]; then
+  (set -C; cat .env.example > .env) || { echo '.env appeared during setup; inspect it and retry.' >&2; exit 1; }
+fi
+docker compose up --build -d
+```
+
+Before the **first** start, replace `POSTGRES_PASSWORD`, `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env` with unique values. Use a long URL-safe password for PostgreSQL; Compose builds the matching database URL from the configured database name, username, and password. Production requires at least 32 characters for `APP_SECRET`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY`, and at least 12 for `OPERATOR_PASSWORD`. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
+
+The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. A correct operator password can still sign in while a failure bucket is limited. The isolated preview keeps its fixed demonstration login behavior.
+
+No Shopify or LLM credentials are needed for mock mode. Named volumes preserve PostgreSQL and n8n across ordinary restarts. Do not use `docker compose down -v` to troubleshoot.
+
+On startup, SQL migrations apply transactionally. n8n imports and publishes the three versioned workflow exports when their content changes, retaining their stable IDs. Before an update, it exports existing workflows to `/home/node/.n8n/commerceops-before-update.json` inside its volume. An unrelated or inactive workflow is not deleted. Edits to these three workflows in the n8n editor should be exported back into the repository before changing the bundled files.
+
+For an isolated full-stack review, follow the [disposable reviewer setup and cleanup](docs/LOCAL_STACK_SETUP.md). It uses a unique Compose project and leaves the default project, its volumes, and any existing `.env` untouched.
+
+### Isolated interface preview without Docker
+
+After installing the project dependencies, run:
+
+```sh
+python -m scripts.preview --port 8002
+```
+
+Open `http://127.0.0.1:8002` and sign in with `preview` / `preview-only`. This creates a disposable SQLite database in a temporary directory and seeds synthetic pending, completed, rejected, retryable, exhausted, ambiguous, evidence-changed, unsupported-action, support-recovery, and delivery-recovery records. The Guided demo page offers saved examples and an interactive scenario runner. Choose pending, success, rejection, transient failure, exhaustion, stale evidence, uncertain execution, or a blocked action; each new run starts with a saved synthetic inquiry and a pending human decision. Approval applies only that run's mock outcome, while rejection records no execution. Review the linked order, inquiry, approval revisions, execution attempts, and correlated audit history. Reconciliation assertions are append-only: an unknown result can be followed by later evidence; contradictory definite claims enter a disputed, blocked state until another supported conclusion is recorded. Confirmed non-execution permits a fresh pending approval; confirmed completion closes recovery; neither rewrites the original ambiguous execution. Long scenario histories are paginated while the current approval and authoritative reconciliation remain visible. Preview mode ignores `.env` integration settings, forces mock LLM behavior, clears Shopify/OpenAI credentials and the n8n endpoint, and blocks webhook/worker routes. The persistent preview banner identifies the isolated data; n8n, paid services, and external actions are unavailable. Stop the process with Ctrl+C; its temporary database is removed when it exits. This preview is for interface and recovery-state review; it does **not** verify PostgreSQL concurrency or execute any n8n workflow.
+
+For a short reviewer walkthrough, open **Guided demo → Five-minute reviewer path** in the preview. Start the success run, inspect its order and support evidence, approve the mock reply, and follow the saved result. Then start the recovery run, approve once to record a simulated timeout, append a confirmed-non-execution assertion with a synthetic supporting reference, create the fresh approval, and approve it. The final reviewer result connects the original ambiguous attempt, operator assertion, replacement revision, and separate successful local mock execution without implying provider verification. The scenario page shows the same readable event language used by ordinary order, support, approval, and delivery pages.
+
+To verify that recovery journey automatically against a fresh disposable preview process, run `python -m scripts.verify reviewer`. It signs in, records an ambiguous mock attempt, asserts non-execution, creates and approves a fresh revision, and then appends conflicting later evidence. The command checks the saved outcome shown after each step, validates the three workflow exports, and prints the checked commit, environment, and live n8n prerequisite. It leaves the normal local database untouched. Run `python -m scripts.verify demo` separately to exercise real local n8n workflows when Docker is available.
+
+Every ordinary record page begins with its current persisted state and one supported next action. Its **Operational journey** is a bounded, paginated history across related records and decisions; links and history pagination retain the originating queue search, status, and page context. Raw audit details remain available under each readable event for verification.
+
+The dashboard counts completed mock actions only when an approved decision, succeeded approval state, and succeeded execution record agree. If a terminal decision conflicts with its saved execution, the approval appears in the **Blocked** recovery category with an investigation step; the record and scenario pages do not claim completion. A completed ambiguity recovery links directly to the original assertion and the fresh approval's saved result.
+An inconsistent historical approval remains discoverable after replacement, so an operator can investigate the original record alongside its successor.
+
 ## Five-minute demonstration
 
 Run the repeatable demonstration:
 
 ```sh
-docker compose exec -T api python -m scripts.demo
+docker compose -p "$POPI_PROJECT" exec -T api python -m scripts.demo
 ```
 
 It adds a fresh synthetic order aged 72 hours, invokes all three **real local n8n workflows**, queues a matched support inquiry, signs into the operator API, approves only this run's mock tasks, and checks the outcome. It repeats a decision and worker call to verify one execution record. It prints record links and the measured receipt-to-persistence duration. Existing data is retained. It drains up to 50 queued deliveries/cases if earlier work is ahead of its records. Run with default mock failure settings for the success scenario.
@@ -349,11 +246,12 @@ python -m scripts.verify local                 # behavior suite and workflow exp
 python -m scripts.verify preview --port 8002   # disposable UI; stop with Ctrl+C
 python -m scripts.verify postgres              # fresh/upgrade migrations and concurrency
 python -m scripts.verify demo                  # real local n8n workflow demonstration
+python -m scripts.benchmark --count 100         # temporary SQLite service-level benchmark
 ```
 
 Run `postgres` and `demo` after starting the local Compose stack. The command reports an unavailable Docker daemon or missing required services with exit status 2; a failed check returns its error and stops subsequent checks. It never silently skips a requested check. PostgreSQL checks create and remove only their own disposable schemas. For a separately provisioned disposable PostgreSQL server, set `DATABASE_URL` to that server and run `python -m scripts.verify_migrations` and `python -m scripts.verify_postgres` directly.
 
-The behavior suite uses isolated SQLite, resets state between tests, and tests approval gating, reviewed-action/evidence binding, signature validation, stale events including subsecond source timestamps, grounding, missing flags, CSRF, authentication, pagination, revision-aware recovery filters, exact recovery links, bounded retries, delayed eligibility, exhaustion, append-only ambiguous reconciliation, conflicting evidence, prohibited transitions, scenario replay, history pagination, and requeue after a prior blocker is confirmed not executed. `scripts.verify_migrations` validates a fresh schema and a populated 0007 upgrade with an existing reconciliation; `scripts.verify_postgres.py` covers source-row locking, concurrent replacement, duplicate reconciliation, competing assertions, follow-up resolution, and concurrent blocker-resolution/requeue ordering. Both PostgreSQL verifiers use disposable schemas and never clear application tables.
+The behavior suite uses isolated SQLite, resets state between tests, and tests approval gating, reviewed-action/evidence binding, signature validation, stale events including subsecond source timestamps, grounding, missing flags, CSRF, authentication, pagination, revision-aware recovery filters, exact recovery links, bounded retries, delayed eligibility, exhaustion, append-only ambiguous reconciliation, conflicting evidence, prohibited transitions, scenario replay, history pagination, and requeue after a prior blocker is confirmed not executed. `scripts.verify_migrations` validates a fresh schema and a populated upgrade with an existing reconciliation; `scripts.verify_postgres.py` covers source-row locking, concurrent replacement, duplicate reconciliation, competing assertions, follow-up resolution, and concurrent blocker-resolution/requeue ordering. Both PostgreSQL verifiers use disposable schemas and never clear application tables.
 
 The PostgreSQL concurrency verifier creates its own randomly named temporary schema and removes only that schema afterward. It exercises concurrent webhook retries, duplicate workers, concurrent first inserts/out-of-order updates, repeated approval, repeated execution, and concurrent identical/conflicting reconciliation submissions. It does not clear the application's tables.
 
@@ -361,7 +259,16 @@ The demo exercises actual n8n HTTP triggers, PostgreSQL persistence, authenticat
 
 To check restart recovery without clearing data: stop only n8n (`docker compose stop n8n`), queue a synthetic order through the guided demo or an existing local fixture, restart the API (`docker compose restart api`), then start n8n (`docker compose start n8n`). The queued delivery should remain visible, and workflow 01 should process it after n8n resumes. The 24 October 2026 check used delivery `restart-b6c57714b2`: it remained queued across the API restart and was processed once after the n8n trigger, creating order 14.
 
-GitHub Actions runs the SQLite behavior suite, verifies that exactly three exported workflows contain schedule, webhook, and worker nodes with resolvable connections, and runs the six-worker concurrency verifier against PostgreSQL 16. No Shopify or LLM credentials are required. `requirements.lock` and `requirements-test.lock` pin the runtime and test dependency closures used by the container and CI.
+The benchmark defaults to a temporary SQLite database that is deleted on exit. It reports signed-intake acknowledgment latency after commit and sequential targeted worker throughput. It uses an in-process ASGI client, so its figures exclude network latency, n8n scheduling, and concurrent workers. To measure PostgreSQL, run only against a disposable database and explicitly opt in:
+
+```sh
+DATABASE_URL='postgresql+psycopg://user:password@localhost:5432/popify_benchmark' \
+  python -m scripts.benchmark --count 100 --use-configured-database --confirm-disposable-db
+```
+
+This appends uniquely named synthetic records and never deletes database contents. GitHub's Compose job uses its own disposable database for the PostgreSQL measurement.
+
+GitHub Actions runs the SQLite behavior suite, validates all three workflow exports, runs the six-worker PostgreSQL concurrency verifier, and starts a full disposable Compose stack to execute the real local n8n workflows and PostgreSQL benchmark. It uses mock actions and no Shopify, OpenAI, or provider credentials. `requirements.lock` and `requirements-test.lock` pin the runtime and test dependency closures used by the container and CI.
 
 ## Live verification still required
 
@@ -371,6 +278,12 @@ GitHub Actions runs the SQLite behavior suite, verifies that exactly three expor
 4. Send a real development-store order event to `/webhooks/shopify/orders`. Check 202 intake, n8n processing, and the matching order. Replay the delivery ID and send an older update to verify safety.
 5. For optional OpenAI verification, configure a key, restart the API, and submit representative inquiries. Review categories, uncertainty, policy, and approved mock outcomes. This incurs provider usage and was not performed here.
 6. External messaging/refunds/cancellations are not implemented and remain disabled. Connecting a live action adapter requires separate authorization and provider-specific idempotency/reconciliation work.
+
+## Production-readiness boundary
+
+PoPify is a single-store portfolio demonstration. Its operator login uses one configured username/password, a signed session cookie, CSRF protection, and login rate limiting; it has no per-person accounts, MFA, SSO, or role management. Worker events and failures appear in application audit history, but there is no centralized metrics backend, alerting, or defined service-level objective. Docker named volumes preserve data across restarts, but the project has no scheduled offsite backup or tested point-in-time restore process.
+
+Before production, add managed identity and per-operator authorization, managed secret storage and rotation, encrypted backups with restore drills, centralized logs/metrics/alerts, retention and privacy controls, and store isolation. Before connecting a live commerce or messaging provider, implement a least-privilege provider adapter, provider-specific idempotency and reconciliation, rate-limit handling, sandbox tests, and explicit operator authorization. Real messages, refunds, and cancellations are not implemented.
 
 Official documentation consulted for this implementation:
 

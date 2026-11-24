@@ -4,6 +4,31 @@
 
 Store operations combine repeatable work with decisions that need human judgment. PoPify demonstrates one store's order intake, delayed-order detection, support drafting, approval, and recorded outcome using three n8n workflows, FastAPI, PostgreSQL, and a server-rendered operator console.
 
+## Reviewer quick start
+
+- **Interactive recovery:** install the pinned requirements and run `python -m scripts.preview --port 8002`; this isolated SQLite UI has no network access to n8n or providers. To check the main recovery path automatically, run `python -m scripts.verify reviewer`.
+- **Real local workflows:** follow [Disposable local reviewer stack and cleanup](docs/LOCAL_STACK_SETUP.md), then run `docker compose -p "$POPI_PROJECT" exec -T api python -m scripts.demo` in the same terminal. It invokes all three real local n8n workflows with synthetic data and mock actions.
+- **Architecture:** Shopify-shaped order intake is HMAC checked and committed to PostgreSQL; three n8n workflows call FastAPI workers; operators review saved evidence before mock execution; the result and decision history remain in the console audit trail. The diagram and workflow contracts are in [README.md](README.md#architecture).
+
+```mermaid
+flowchart LR
+  W[Signed order webhook] --> A[FastAPI validation and durable queue]
+  A --> P[(PostgreSQL)]
+  P --> N[n8n workers]
+  N --> A
+  A --> O[Operator reviews evidence]
+  O --> M[Approval-gated mock action]
+  M --> H[(Execution and audit history)]
+```
+
+## Current verification — 24 November 2026
+
+- `python -m scripts.verify local`: **120 tests passed** and all three workflow exports validated.
+- `scripts.verify_migrations` passed on fresh and populated upgrade schemas; `scripts.verify_postgres` passed the concurrency scenarios on a disposable PostgreSQL 16.15 cluster. The app's configured database and its data were not used.
+- `python -m scripts.benchmark --count 100` was exercised against a disposable PostgreSQL 16.15 cluster in three runs of 100 signed synthetic deliveries each on Python 3.13.12 / macOS 27.2.1 ARM64. Across runs, intake acknowledgment p50 was **2.69–2.79 ms**, p95 was **3.10–3.74 ms**, and sequential persisted worker throughput was **309–346 deliveries/second**. Measurement used an in-process FastAPI client; it excludes network latency, n8n scheduling, and concurrent workers. This is a local baseline, not a production capacity claim.
+- The CI workflow now includes a full Docker Compose run that starts PostgreSQL, FastAPI, and n8n, executes the local demo, and runs the benchmark against CI's disposable database. Local Docker was unavailable during this change, so that full-stack check is pending the PR's GitHub Actions run.
+- The local Docker daemon was unavailable, so the real n8n workflow demo could not be run from this checkout. The full-stack CI job is the verification path for that check.
+
 ## Implemented improvements
 
 - Replaced direct browser execution with durable queues for support triage and approved actions, both consumed by n8n.
@@ -41,13 +66,13 @@ Store operations combine repeatable work with decisions that need human judgment
 - Added an interactive guided scenario detail page with linked order, inquiry, approval revisions, persisted execution, and correlated audit events. The scenario progress and next step derive from saved state; retry timing and reconciliation consequences are explicit.
 - Added a PostgreSQL migration for immutable execution reconciliations, including a verifier for fresh and populated 0001–0006 schemas. Extended concurrency coverage for repeated identical and competing reconciliation requests. Fixed a progress-card style collision that made the attention stage render horizontally.
 
-## Reviewer-path verification — 15 November 2026
+## Historical reviewer-path verification — 15 November 2026
 
 On clean `main` commit [`df54413`](https://github.com/KhangTran69/popify/commit/df54413ab94367b90c8bb3ca5db1361281062bf1), `python -m scripts.verify reviewer` passed its preview HTTP test (**1 passed**) and validated all three workflow exports. The saved recovery journey reached an ambiguous mock execution, an operator assertion of non-execution, a fresh approval, a persisted mock result, and conflicting later evidence. The command reported Python 3.13.12 and confirmed that live n8n was not exercised because Docker was unavailable.
 
 This verifies the isolated SQLite reviewer and recovery path. It does not verify PostgreSQL concurrency or live n8n. Delayed-order scanning is part of the separate local Docker walkthrough; the isolated preview seeds its starting order and triage rather than running that scan. The README walkthrough calls out this distinction.
 
-## Reproducible reviewer recovery — 29 October 2026
+## Historical implementation — reviewer recovery, 29 October 2026
 
 Inspection found that approved ambiguous approvals linked to `#approval-actions`, while only pending approvals rendered that anchor. The isolated HTTP smoke test stopped after creating a success scenario, so it did not prove the advertised ambiguity recovery. `scripts/verify.py` had no single command for that path.
 
@@ -56,9 +81,9 @@ Inspection found that approved ambiguous approvals linked to `#approval-actions`
 - The isolated HTTP smoke test now completes ambiguity, asserted non-execution, fresh approval, persisted mock completion, and conflicting later evidence. `python -m scripts.verify reviewer` runs that path and workflow validation, then prints the commit, Python version, disposable environment, and n8n availability without secrets.
 - Current synthetic preview captures show the uncertain approval at desktop and mobile widths in `docs/screenshots/reconciliation-action-desktop.jpg` and `docs/screenshots/reconciliation-action-mobile.jpg`.
 
-Current verification: 100 behavior tests passed; all three workflow exports validated; the new reviewer command passed. PostgreSQL concurrency checks passed on isolated schemas in a disposable local PostgreSQL cluster. The changed approval page was inspected at 1440×900 and 390×844, with no horizontal overflow at 390 px, visible keyboard focus, a working reconciliation anchor, and browser back. No migration changed. `python -m scripts.verify demo` reported that Docker's daemon was unreachable, so the real local n8n demonstration was not run.
+Verification at that change: 100 behavior tests passed; all three workflow exports validated; the new reviewer command passed. PostgreSQL concurrency checks passed on isolated schemas in a disposable local PostgreSQL cluster. The changed approval page was inspected at 1440×900 and 390×844, with no horizontal overflow at 390 px, visible keyboard focus, a working reconciliation anchor, and browser back. No migration changed. `python -m scripts.verify demo` reported that Docker's daemon was unreachable, so the real local n8n demonstration was not run.
 
-## Outcome consistency and recovery reachability — 29 October 2026
+## Historical implementation — outcome consistency and recovery reachability, 29 October 2026
 
 The dashboard previously counted every successful execution row, even when its approval was rejected, while the recovery workspace omitted terminal records whose decision and execution disagreed. Record guidance identified some inconsistencies, but lower page copy and scenario stage text could still claim completion. The order journey query already used SQL-linked pagination, yet had no regression beyond its former 100-case limit.
 
@@ -68,7 +93,7 @@ The dashboard previously counted every successful execution row, even when its a
 
 Verification performed for this change: `python -m scripts.verify local` passed **99 tests** and all three workflow exports validated. The PostgreSQL concurrency script passed on isolated schemas in a disposable local PostgreSQL 16 cluster. Browser inspection covered the blocked recovery page at 1440×900 and 390×844, record navigation and browser back, and visible 2 px keyboard focus; mobile scroll width was 390 px. The new screenshots are synthetic preview evidence. `python -m scripts.verify demo` reported that Docker's daemon was unavailable, so the real n8n run was not repeated. No schema migration was added.
 
-## Operational journey completion — 28 October 2026
+## Historical implementation — operational journey completion, 28 October 2026
 
 Ordinary order, support, approval, and delivery pages previously exposed a raw event-name/JSON timeline while the guided scenario used separate readable labels. The detail route also assembled the cross-record audit query itself and silently capped the result. The recovery walkthrough could create a fresh approval after confirmed non-execution, but it lacked one persisted-state summary connecting the original ambiguity to the successful replacement.
 
@@ -83,7 +108,7 @@ Verification performed for this change:
 - **Synthetic browser review (29 October):** inspected the authenticated approval detail at 1440×900 and 390×844. The 390 px document had no horizontal overflow; the skip link received visible 2 px keyboard focus. Current synthetic captures are `docs/screenshots/operational-journey-desktop.jpg` and `docs/screenshots/operational-journey-mobile.jpg`.
 - **Real local n8n demonstration:** `python -m scripts.verify demo` reported **unavailable** because the Docker daemon was not reachable. Export validation is not claimed as workflow execution evidence.
 
-## Previous reviewer experience and verification — 27 October 2026
+## Historical implementation and verification — 27 October 2026
 
 Inspection of `app/main.py` found that the isolated scenario route mixed database recovery interpretation with page assembly. `app/templates/demo_scenario.html` presented raw audit events after several separate record sections; a confirmed non-execution still marked the outcome stage complete even though a new approval was needed. The `/demo` workspace loaded only its latest 50 scenarios and offered no way to reach older runs.
 
@@ -167,10 +192,10 @@ Verification performed for this follow-up:
 
 ## Limitations
 
-No live Shopify development store, real LLM request, customer message, cancellation, or refund was used. Shopify HMAC handling is exercised with synthetic signed payloads. The optional OpenAI adapter has mocked HTTP coverage. All action execution and provider failures are simulated. Retry-After behavior is represented by a configurable mock minimum delay, not a verified live provider response. Reconciliation records an operator assertion and reference; it does not query or verify any provider. The reference/email match is an operator lookup check, not customer identity verification. Production authentication and measured business impact remain out of scope. The full Docker stack and real n8n integration were unavailable for this change.
+No live Shopify development store, real LLM request, customer message, cancellation, or refund was used. Shopify HMAC handling is exercised with synthetic signed payloads. The optional OpenAI adapter has mocked HTTP coverage. All action execution and provider failures are simulated. Retry-After behavior is represented by a configurable mock minimum delay, not a verified live provider response. Reconciliation records an operator assertion and reference; they do not query or verify any provider. The reference/email match is an operator lookup check, not customer identity verification. Authentication is a single configured operator account with signed sessions, CSRF protection, and rate limiting; per-person identity, MFA, SSO, and roles are absent. Audit history is local, without centralized alerting or SLOs. Named volumes persist across restarts but are not a backup strategy; automated offsite backups and restore drills are absent. The measured throughput is a local sequential service baseline, not a production capacity guarantee.
 
 ## Resume bullets
 
 - Built three n8n workflows coordinating durable order ingestion, support triage, delayed-order review, and approval-gated mock execution using FastAPI and PostgreSQL.
 - Designed an authenticated operator console with searchable queues, CSRF-protected decisions, correlated timelines, event-derived metrics, and failure recovery controls.
-- Verified behavior with the current automated suite; ran schema-upgrade and concurrency checks on disposable PostgreSQL. Historical restart-recovery and local n8n demonstrations cover repeat-safe approvals and audited outcomes.
+- Verified **120 automated tests**, PostgreSQL migration and concurrency checks, and all three workflow exports; measured 100 signed deliveries per run on disposable PostgreSQL at 309–346 sequential worker items per second (local baseline).
