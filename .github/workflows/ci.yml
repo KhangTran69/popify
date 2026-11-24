@@ -58,3 +58,28 @@ jobs:
       - run: python -m scripts.migrate
       - run: python -m scripts.verify_migrations
       - run: python -m scripts.verify_postgres
+
+  live-compose-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Configure disposable mock stack
+        run: cp .env.example .env
+      - name: Start PostgreSQL, FastAPI, and n8n
+        run: docker compose up --build --detach --wait --wait-timeout 240
+      - name: Run the real local workflow walkthrough
+        run: python -m scripts.verify demo
+      - name: Benchmark signed intake and PostgreSQL queue processing
+        run: >-
+          docker compose exec -T -e POPIFY_BENCHMARK_COMMIT=${GITHUB_SHA} api
+          python -m scripts.benchmark --count 100
+          --use-configured-database --confirm-disposable-db
+      - name: Show service logs on failure and clean up
+        if: always()
+        run: |
+          docker compose logs --no-color --tail=120 || true
+          docker compose down --remove-orphans

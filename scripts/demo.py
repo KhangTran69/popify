@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 import uuid
 from datetime import timedelta
 import httpx
@@ -10,6 +11,23 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import Delivery, Order, Case, Approval, ActionExecution, Audit, utcnow
 from app.services import audit
+
+
+def _trigger_workflow(n8n: httpx.Client, path: str) -> dict:
+    """Wait briefly for n8n's imported production webhook to become available."""
+    deadline = time.monotonic() + 60
+    while True:
+        response = n8n.post("/webhook/commerceops/" + path)
+        if response.status_code == 404 and "not registered" in response.text.lower():
+            if time.monotonic() < deadline:
+                time.sleep(2)
+                continue
+            raise RuntimeError(
+                f"n8n webhook {path!r} was still not registered after 60 seconds; "
+                "check that the workflow import and publish startup completed"
+            )
+        response.raise_for_status()
+        return response.json()
 
 
 def run():
@@ -56,14 +74,9 @@ def run():
         httpx.Client(base_url="http://n8n:5678", timeout=65) as n8n,
     ):
 
-        def trigger(path):
-            result = n8n.post("/webhook/commerceops/" + path)
-            result.raise_for_status()
-            return result.json()
-
         # Drain at most 50 queued items so existing work is preserved.
         for _ in range(50):
-            trigger("orders/process")
+            _trigger_workflow(n8n, "orders/process")
             with SessionLocal() as db:
                 if db.get(Delivery, delivery_id).status == "processed":
                     break
@@ -71,7 +84,7 @@ def run():
             raise RuntimeError(
                 "Demo order did not reach processed state within 50 runs"
             )
-        trigger("exceptions/scan")
+        _trigger_workflow(n8n, "exceptions/scan")
         key = "demo-support-" + run_id
         response = api.post(
             "/api/support",
@@ -86,7 +99,7 @@ def run():
         response.raise_for_status()
         case_id = response.json()["case_id"]
         for _ in range(50):
-            trigger("support/triage")
+            _trigger_workflow(n8n, "support/triage")
             with SessionLocal() as db:
                 if db.get(Case, case_id).status == "needs_review":
                     break
@@ -133,13 +146,13 @@ def run():
                 data={"csrf_token": token, "decision": "approved"},
             )
             response.raise_for_status()
-        trigger("exceptions/scan")
+        _trigger_workflow(n8n, "exceptions/scan")
         # Repeat the same approval and worker call: there must still be one execution per action.
         api.post(
             f"/approvals/{approval_id}/decision",
             data={"csrf_token": token, "decision": "approved"},
         ).raise_for_status()
-        trigger("exceptions/scan")
+        _trigger_workflow(n8n, "exceptions/scan")
     with SessionLocal() as db:
         a = db.get(Approval, approval_id)
         assert a.execution_status == "succeeded", a.execution_status

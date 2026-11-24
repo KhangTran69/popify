@@ -1,6 +1,6 @@
 # PoPify reviewer walkthrough
 
-No Shopify, OpenAI, or outbound-action credentials are needed. The preview and local stack both use synthetic customer data and mock actions. The local operator login is configured in `.env`; follow [README setup](../README.md#setup) before starting Docker.
+No Shopify, OpenAI, or outbound-action credentials are needed. The preview and local stack both use synthetic customer data and mock actions. The local operator login is configured in `.env`; follow the [isolated local stack setup](LOCAL_STACK_SETUP.md) before starting Docker.
 
 The provider-neutral action contract is tested with a fake/mock adapter only. Guided preview and ordinary local action outcomes remain simulated; this walkthrough does not call a provider sandbox or external action service.
 
@@ -25,7 +25,7 @@ The preview's starting order, inquiry, classification, and draft are generated l
 
 ## End-to-end workflow review: local Docker
 
-Follow the [disposable reviewer-stack setup and cleanup](../README.md#disposable-reviewer-stack-and-cleanup), then sign in with the local operator account and open **Guided demo**. This path runs the actual local n8n workflows over a synthetic order; it does not receive a live Shopify event. The workflow buttons appear only when each step is ready; the page refreshes while work is queued. At each step, use the named button or wait for its scheduled worker.
+Follow [Disposable local reviewer stack and cleanup](LOCAL_STACK_SETUP.md), then sign in with the local operator account and open **Guided demo**. This path runs the actual local n8n workflows over a synthetic order; it does not receive a live Shopify event. The workflow buttons appear only when each step is ready; the page refreshes while work is queued. At each step, use the named button or wait for its scheduled worker.
 
 1. Click **Start guided demo**. The page queues a synthetic Shopify-shaped delivery. In step 01, click **Run order workflow now** or wait for the scheduled worker.
 2. After the order appears, step 02 offers **Run exception workflow now**. Click it or wait for the scheduled scan to create the delayed-order review and unlock step 03.
