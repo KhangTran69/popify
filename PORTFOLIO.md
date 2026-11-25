@@ -21,9 +21,12 @@ flowchart LR
   M --> H[(Execution and audit history)]
 ```
 
-## Current verification — 24 November 2026
+## Current verification — 25 November 2026
 
-- `python -m scripts.verify local`: **122 tests passed** and all three workflow exports validated.
+- Dependency-update check: **123 tests passed** and all three workflow exports validated; `pip install -r requirements-test.lock -e '.[test]'` resolved with the updated runtime lock.
+
+### Earlier verification — 24 November 2026
+
 - `scripts.verify_migrations` passed on fresh and populated upgrade schemas; `scripts.verify_postgres` passed the concurrency scenarios on a disposable PostgreSQL 16.15 cluster. The app's configured database and its data were not used.
 - `python -m scripts.benchmark --count 100` was exercised against a disposable PostgreSQL 16.15 cluster in three runs of 100 signed synthetic deliveries each on Python 3.13.12 / macOS 27.2.1 ARM64. Across runs, intake acknowledgment p50 was **2.69–2.79 ms**, p95 was **3.10–3.74 ms**, and sequential persisted worker throughput was **309–346 deliveries/second**. Measurement used an in-process FastAPI client; it excludes network latency, n8n scheduling, and concurrent workers. This is a local baseline, not a production capacity claim.
 - [GitHub Actions for commit `97e06b4`](https://github.com/KhangTran69/popify/actions/runs/45360601051) passed all three jobs, including the disposable Compose stack, real local n8n workflow demo, PostgreSQL benchmark, and concurrency checks. The demo retries only the transient unregistered-webhook response that exposed the startup race. Local Docker is unavailable in this checkout.
@@ -197,4 +200,4 @@ No live Shopify development store, real LLM request, customer message, cancellat
 
 - Built three n8n workflows coordinating durable order ingestion, support triage, delayed-order review, and approval-gated mock execution using FastAPI and PostgreSQL.
 - Designed an authenticated operator console with searchable queues, CSRF-protected decisions, correlated timelines, event-derived metrics, and failure recovery controls.
-- Verified **122 automated tests**, PostgreSQL migration and concurrency checks, and all three workflow exports; measured 100 signed deliveries per run on disposable PostgreSQL at 309–346 sequential worker items per second (local baseline).
+- Verified **123 automated tests** and all three workflow exports on Python 3.12; the exact CI dependency installation completed and `pip check` found no broken requirements. A prior local PostgreSQL benchmark measured 100 signed deliveries per run at 309–346 sequential worker items per second (baseline only).

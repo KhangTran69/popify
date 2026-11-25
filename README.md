@@ -55,7 +55,7 @@ The trigger URLs use port 5678 and are local demo conveniences. They return work
 
 ## Current verification
 
-Latest local run: `python -m scripts.verify local` passed **122 tests** and validated all three workflow exports. Three PostgreSQL benchmark runs processed 100 signed deliveries each; the measurements and their limits are in [PORTFOLIO.md](PORTFOLIO.md). [GitHub Actions for the current change](https://github.com/KhangTran69/popify/actions/runs/45360601051) passed the disposable PostgreSQL/FastAPI/n8n Compose walkthrough, persisted-delivery benchmark, and concurrency checks. The demo waits through n8n's transient webhook-registration window; the local Docker daemon is unavailable in this checkout, so full-stack verification ran in CI. A synthetic preview is not counted as live n8n verification.
+Latest local run on this dependency-update branch: 123 tests passed and all three workflow exports validated. The updated runtime lock now matches the exact dependencies in `pyproject.toml`; CI installs the lock and editable project together to catch future drift. Three PostgreSQL benchmark runs processed 100 signed deliveries each; the measurements and their limits are in [PORTFOLIO.md](PORTFOLIO.md). A synthetic preview is not counted as live n8n verification.
 
 ## Setup
 
