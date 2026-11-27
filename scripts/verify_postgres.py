@@ -123,6 +123,15 @@ def run():
             assert db.scalar(select(func.count(Delivery.id))) == 1
             delivery_id = db.scalar(select(Delivery.id))
 
+        changed = json.dumps({**json.loads(raw), "name": "#CONFLICT"}).encode()
+        changed_headers = {**headers, "X-Shopify-Hmac-SHA256": base64.b64encode(hmac.new(
+            settings.shopify_webhook_secret.encode(), changed, hashlib.sha256).digest()).decode()}
+        with TestClient(main.app) as client:
+            assert client.post("/webhooks/shopify/orders", content=changed, headers=changed_headers).status_code == 409
+        with sessions() as db:
+            assert db.get(Delivery, delivery_id).payload["name"] == "#CONCURRENT"
+        print("PASS: conflicting signed delivery ID rejected without replacing original evidence")
+
         def process(_):
             with sessions() as db:
                 return process_delivery(db, delivery_id)

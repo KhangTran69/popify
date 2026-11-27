@@ -1529,6 +1529,24 @@ async def webhook_body(request: Request):
     return await request.body()
 
 
+def acknowledge_existing_delivery(db, existing, *, shop, topic, event_id, payload):
+    """A repeated delivery ID is an acknowledgement only for the same stored input."""
+    try:
+        same_payload = minimized_order_payload(existing.payload) == payload
+    except (ValueError, TypeError, UnicodeError):
+        same_payload = False
+    if (existing.shop_domain.lower() != shop or existing.topic != topic or not same_payload
+            or (existing.event_id and event_id and existing.event_id != event_id)):
+        audit(db, "delivery", existing.id, "delivery_id_conflict",
+              correlation_id=existing.webhook_id)
+        db.commit()
+        raise HTTPException(409, "Delivery ID already associated with different order input")
+    audit(db, "delivery", existing.id, "duplicate_delivery_ignored",
+          correlation_id=existing.webhook_id)
+    db.commit()
+    return JSONResponse({"received": True, "duplicate": True}, status_code=200)
+
+
 @app.post("/webhooks/shopify/orders")
 def shopify_order(request: Request, raw: bytes = Depends(webhook_body), db: Session = Depends(get_db)):
     # Database operations run in the sync worker pool, not on the ASGI event loop.
@@ -1566,17 +1584,8 @@ def shopify_order(request: Request, raw: bytes = Depends(webhook_body), db: Sess
     shop = shop.lower()
     existing = db.scalar(select(Delivery).where(Delivery.webhook_id == webhook_id))
     if existing:
-        db.add(
-            Audit(
-                correlation_id=webhook_id,
-                entity_type="delivery",
-                entity_id=existing.id,
-                event="duplicate_delivery_ignored",
-                details={"webhook_id": webhook_id},
-            )
-        )
-        db.commit()
-        return JSONResponse({"received": True, "duplicate": True}, status_code=200)
+        return acknowledge_existing_delivery(db, existing, shop=shop, topic=topic,
+                                             event_id=event_id, payload=payload)
     delivery = Delivery(
         webhook_id=webhook_id,
         event_id=event_id,
@@ -1601,15 +1610,8 @@ def shopify_order(request: Request, raw: bytes = Depends(webhook_body), db: Sess
         db.rollback()
         existing = db.scalar(select(Delivery).where(Delivery.webhook_id == webhook_id))
         if existing:
-            audit(
-                db,
-                "delivery",
-                existing.id,
-                "duplicate_delivery_ignored",
-                correlation_id=webhook_id,
-            )
-            db.commit()
-            return JSONResponse({"received": True, "duplicate": True}, status_code=200)
+            return acknowledge_existing_delivery(db, existing, shop=shop, topic=topic,
+                                                 event_id=event_id, payload=payload)
         raise
     db.refresh(delivery)
     return JSONResponse({"received": True, "delivery_id": delivery.id}, status_code=202)
