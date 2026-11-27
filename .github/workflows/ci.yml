@@ -78,6 +78,8 @@ jobs:
           docker compose exec -T -e POPIFY_BENCHMARK_COMMIT=${GITHUB_SHA} api
           python -m scripts.benchmark --count 100
           --use-configured-database --confirm-disposable-db
+      - name: Verify disposable PostgreSQL backup restoration
+        run: docker compose exec -T -e POPIFY_CONFIRM_DISPOSABLE=1 db sh -s < scripts/verify_restore.sh
       - name: Show service logs on failure and clean up
         if: always()
         run: |

@@ -20,7 +20,7 @@ const runPage = document.querySelector('[data-auto-refresh="true"]');
 if (runPage) {
   window.setInterval(() => {
     const active = document.activeElement;
-    const editing = active && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName);
+    const editing = active && (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'A'].includes(active.tagName) || active.isContentEditable);
     const submitting = document.querySelector('form[data-submitting="true"]');
     if (!editing && !submitting && document.visibilityState === 'visible') location.reload();
   }, 5000);

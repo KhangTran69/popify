@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import select, func, or_, cast, String, exists, literal
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as DatabaseTimeout
 from pydantic import BaseModel, Field
 import httpx
 from sqlalchemy.orm import Session, selectinload
@@ -19,6 +19,8 @@ from app.config import settings
 from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integration_secret
 from app.identity import managed_login, session_account, revoke_session
 from app.models import OperatorAccount
+from app.privacy import minimized_order_payload
+from app.operations import queue_summary
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
     ExecutionReconciliation, utcnow,
@@ -63,6 +65,7 @@ templates.env.filters["utc"] = lambda value: (
 )
 templates.env.filters["snapshot_utc"] = snapshot_utc
 templates.env.globals["preview_mode"] = settings.preview_mode
+templates.env.globals["demo_enabled"] = settings.preview_mode or not (settings.managed_identity and os.environ.get("POPIFY_ENV", "production").lower() == "production")
 
 _LOGIN_WINDOW_SECONDS = 15 * 60
 _LOGIN_MAX_FAILURES = 5
@@ -165,7 +168,10 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="CommerceOps", lifespan=lifespan)
+app = FastAPI(title="CommerceOps", lifespan=lifespan,
+              docs_url=None if settings.managed_identity else "/docs",
+              redoc_url=None if settings.managed_identity else "/redoc",
+              openapi_url=None if settings.managed_identity else "/openapi.json")
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.app_secret,
@@ -188,6 +194,10 @@ async def block_live_integrations_in_preview(request: Request, call_next):
             {"detail": "Live integrations are disabled in the isolated preview."},
             status_code=409,
         )
+    if settings.managed_identity and not settings.preview_mode and os.environ.get("POPIFY_ENV", "production").lower() == "production" and (
+        request.url.path == "/demo" or request.url.path.startswith(("/demo/", "/api/demo/"))
+    ):
+        return JSONResponse({"detail": "Synthetic demo routes are disabled in production."}, status_code=404)
     return await call_next(request)
 
 
@@ -254,6 +264,33 @@ def health(db: Session = Depends(get_db)):
             else "mock"
         ),
     }
+
+
+@app.get("/live")
+def liveness():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness(db: Session = Depends(get_db)):
+    try:
+        db.execute(select(Order.id).limit(1))
+        if settings.managed_identity and not settings.preview_mode:
+            if not db.scalar(select(OperatorAccount.id).where(OperatorAccount.active.is_(True), OperatorAccount.role == "admin").limit(1)):
+                return JSONResponse({"status": "not_ready"}, status_code=503)
+    except Exception:
+        return JSONResponse({"status": "not_ready"}, status_code=503)
+    return {"status": "ready"}
+
+
+@app.get("/api/ops/status")
+def operational_status(actor=Depends(operator), db: Session = Depends(get_db)):
+    activity = workflow_activity(db)
+    return {"mode": "isolated_preview" if settings.preview_mode else "mock_actions",
+            "queues": queue_summary(db),
+            "workers": [{"number": item["number"], "recent_poll": item["recent"],
+                         "last_poll": as_utc(item["last"].created_at).isoformat() if item["last"] else None}
+                        for item in activity]}
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1498,6 +1535,10 @@ async def shopify_order(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(400, "invalid JSON")
     if not isinstance(payload, dict):
         raise HTTPException(422, "Order payload must be an object")
+    try:
+        payload = minimized_order_payload(payload)
+    except (ValueError, UnicodeError):
+        raise HTTPException(422, "Invalid order fields")
     webhook_id = request.headers.get("x-shopify-webhook-id", "")
     topic = request.headers.get("x-shopify-topic", "orders/create")
     shop = request.headers.get("x-shopify-shop-domain")
@@ -1877,7 +1918,7 @@ def scan_delayed(
 
 @app.exception_handler(HTTPException)
 async def http_error(request, exc):
-    if "text/html" in request.headers.get("accept", ""):
+    if not request.url.path.startswith(("/api/", "/webhooks/")) and "text/html" in request.headers.get("accept", ""):
         if exc.status_code == 401:
             return RedirectResponse("/login", 303)
         return templates.TemplateResponse(
@@ -1895,6 +1936,7 @@ async def http_error(request, exc):
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
 
 
+@app.exception_handler(DatabaseTimeout)
 @app.exception_handler(OperationalError)
 async def database_error(request, exc):
     # Never expose connection strings, SQL parameters or customer records.
@@ -1904,7 +1946,7 @@ async def database_error(request, exc):
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
-    if "text/html" in request.headers.get("accept", ""):
+    if not request.url.path.startswith(("/api/", "/webhooks/")) and "text/html" in request.headers.get("accept", ""):
         return templates.TemplateResponse(
             request,
             "error.html",
@@ -1940,6 +1982,7 @@ async def request_log(request, call_next):
                 "event": "http_request",
                 "correlation_id": correlation,
                 "method": request.method,
+                "route": getattr(request.scope.get("route"), "path", "unmatched"),
                 "status": response.status_code,
                 "duration_ms": round((time.monotonic() - started) * 1000),
             }

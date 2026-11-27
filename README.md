@@ -69,9 +69,9 @@ fi
 docker compose up --build -d
 ```
 
-Before the **first** start, replace `POSTGRES_PASSWORD`, `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env` with unique values. Use a long URL-safe password for PostgreSQL; Compose builds the matching database URL from the configured database name, username, and password. Production requires at least 32 characters for `APP_SECRET`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY`, and at least 12 for `OPERATOR_PASSWORD`. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
+Before the **first** start, replace `POSTGRES_PASSWORD`, `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env` with unique values. Use a long URL-safe password for PostgreSQL; Compose builds the matching database URL from the configured database name, username, and password. Production requires at least 32 characters for `APP_SECRET`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY`, ; production accounts are provisioned with passwords of 12–256 characters. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
 
-The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. A correct operator password can still sign in while a failure bucket is limited. The isolated preview keeps its fixed demonstration login behavior.
+The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. In legacy local mode a correct password can still sign in while limited; managed identity mode enforces the persisted budget before password verification. The isolated preview keeps its fixed demonstration login behavior.
 
 No Shopify or LLM credentials are needed for mock mode. Named volumes preserve PostgreSQL and n8n across ordinary restarts. Do not use `docker compose down -v` to troubleshoot.
 
@@ -283,9 +283,11 @@ GitHub Actions runs the SQLite behavior suite, validates all three workflow expo
 
 See [Managed operator identities](docs/OPERATOR_IDENTITY.md) for account provisioning, role boundaries and session revocation. Production requires managed identity and PostgreSQL; the shared configured login remains for local development and isolated preview only.
 
+See [Operations and recovery runbook](docs/OPERATIONS.md) for readiness, protected metrics, privacy and restoration procedures.
+
 ## Production-readiness boundary
 
-PoPify is a single-store portfolio demonstration. Its operator login uses one configured username/password, a signed session cookie, CSRF protection, and login rate limiting; managed identity mode provides individual accounts, roles and revocable sessions. MFA and SSO are not implemented. Worker events and failures appear in application audit history, but there is no centralized metrics backend, alerting, or defined service-level objective. Docker named volumes preserve data across restarts, but the project has no scheduled offsite backup or tested point-in-time restore process.
+PoPify is a single-store portfolio demonstration. Its operator login uses one configured username/password, a signed session cookie, CSRF protection, and login rate limiting; managed identity mode provides individual accounts, roles and revocable sessions. MFA and SSO are not implemented. Worker events and failures appear in application audit history, but the protected operations endpoint provides queue and worker summaries; a centralized metrics backend, alerts and formal service objectives are still required. Docker named volumes preserve data across restarts, but the project has no scheduled offsite backup or tested point-in-time restore process.
 
 Before production, verify managed identity and per-operator authorization, managed secret storage and rotation, encrypted backups with restore drills, centralized logs/metrics/alerts, retention and privacy controls, and store isolation. Before connecting a live commerce or messaging provider, implement a least-privilege provider adapter, provider-specific idempotency and reconciliation, rate-limit handling, sandbox tests, and explicit operator authorization. Real messages, refunds, and cancellations are not implemented.
 

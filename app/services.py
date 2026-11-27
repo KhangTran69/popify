@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 from app.config import settings
 from app.integrations import verify_shopify, generate_support_content
+from app.privacy import minimized_order_payload
 from app.action_provider import ActionRequest, MockActionAdapter, normalize_adapter_result
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
@@ -93,7 +94,7 @@ def normalize_order(payload, shop="demo.myshopify.com"):
         source_updated_at=parse_dt(
             payload.get("updated_at") or payload.get("created_at")
         ),
-        payload=payload,
+        payload=minimized_order_payload(payload),
     )
 
 

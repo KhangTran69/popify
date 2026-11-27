@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 from app import main
 from app.config import settings
+from app.identity import manage_account, managed_login, session_account
 from app.db import Base, engine, get_db
 from app.models import Order, Delivery, Case, Approval, ActionExecution, ExecutionReconciliation, utcnow
 from app.services import (
@@ -46,6 +47,22 @@ def run():
     old_secret = settings.shopify_webhook_secret
     try:
         Base.metadata.create_all(isolated)
+        with sessions() as db:
+            manage_account(db, "concurrency-user", "create", role="reviewer", password="synthetic-test-password")
+        def fail_login(index):
+            with sessions() as db:
+                return managed_login(db, "concurrency-user", "wrong", f"synthetic-{index}")[2]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            waits = list(pool.map(fail_login, range(6)))
+        assert sum(wait > 0 for wait in waits) == 1, waits
+        with sessions() as db:
+            manage_account(db, "revocable-user", "create", role="support", password="synthetic-test-password")
+            _, token, _ = managed_login(db, "revocable-user", "synthetic-test-password", "synthetic-valid")
+            assert session_account(db, token) is not None
+            manage_account(db, "revocable-user", "revoke")
+        with sessions() as db:
+            assert session_account(db, token) is None
+        print("PASS: concurrent managed login budget and cross-session revocation")
 
         def session_override():
             with sessions() as db:

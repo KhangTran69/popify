@@ -7,7 +7,7 @@ from datetime import timedelta, timezone
 
 from sqlalchemy import delete, func, select, text
 from app.models import OperatorAccount, OperatorSession, LoginBucket, Audit, utcnow
-from app.security import secure_equal
+from app.config import settings
 
 ROLES = ("admin", "support", "reviewer", "auditor")
 SESSION_HOURS = 8
@@ -16,7 +16,7 @@ WINDOW_SECONDS = 900
 MAX_FAILURES = 5
 MAX_BUCKETS = 10_000
 USERNAME = re.compile(r"[a-z][a-z0-9_.-]{2,63}")
-RESERVED = {"system", "preview", "n8n", "shopify", "integration", "worker", "mock", "unknown"}
+RESERVED = {"system", "preview", "n8n", "shopify", "integration", "worker", "mock", "unknown", "deployment_admin"}
 DUMMY_HASH = "pbkdf2_sha256$600000$" + "00" * 16 + "$" + "00" * 32
 
 
@@ -69,11 +69,12 @@ def managed_login(db, username, password, client_address):
     The lock covers only login requests, not normal operator or worker activity.
     A gateway must also limit total traffic before it reaches the application.
     """
-    now = utcnow()
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(607291041)"))
+    now = utcnow()
     db.execute(delete(LoginBucket).where(LoginBucket.expires_at <= now))
-    keys = [_digest("ip:" + client_address), _digest("account:" + canonical_username(username))]
+    keys = [hmac.new(settings.app_secret.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()
+            for value in ("ip:" + client_address, "account:" + canonical_username(username))]
     buckets = [db.get(LoginBucket, key) for key in keys]
     waits = [max(1, int((_aware(b.expires_at) - now).total_seconds()) + 1)
              for b in buckets if b and b.failures >= MAX_FAILURES]
@@ -100,6 +101,11 @@ def managed_login(db, username, password, client_address):
     if buckets[1] is not None:
         db.delete(buckets[1])
     db.execute(delete(OperatorSession).where(OperatorSession.expires_at <= now))
+    # Limit active sessions per account without weakening revocation.
+    older = list(db.scalars(select(OperatorSession.token_hash).where(
+        OperatorSession.account_id == account.id).order_by(OperatorSession.expires_at.desc()).offset(4)))
+    if older:
+        db.execute(delete(OperatorSession).where(OperatorSession.token_hash.in_(older)))
     token = secrets.token_urlsafe(32)
     db.add(OperatorSession(token_hash=_digest(token), account_id=account.id,
                            expires_at=now + timedelta(hours=SESSION_HOURS)))
