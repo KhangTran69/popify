@@ -32,7 +32,7 @@ services:
     networks: [data_plane]
     restart: unless-stopped
   operator-gateway:
-    networks: [operator_plane]
+    networks: [operator_plane, ingress_plane]
     image: nginx:1.28-alpine
     ports: ["127.0.0.1:8444:8443"]
     volumes:
@@ -47,4 +47,8 @@ networks:
     internal: true
   worker_plane:
     internal: true
-  operator_plane: {}
+  operator_plane:
+    internal: true
+  # Only the ingress gateway joins this host-facing network. API, database and
+  # n8n have no external network attachment in private mock staging.
+  ingress_plane: {}
