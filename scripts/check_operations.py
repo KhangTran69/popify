@@ -118,10 +118,12 @@ def update_outbox(path, snapshot=None, repeat_seconds=900, *, acknowledge=None):
             if not isinstance(event, dict):
                 raise ValueError("Invalid alert event")
             event_id = event.get("event_id")
-            if not isinstance(event_id, str) or len(event_id) != 32 or event_id in ids:
+            if not isinstance(event_id, str) or len(event_id) != 32 or any(c not in "0123456789abcdef" for c in event_id) or event_id in ids:
                 raise ValueError("Invalid alert event ID")
             if event.get("transition") not in ("opened", "reminder", "resolved") or not isinstance(event.get("code"), str):
                 raise ValueError("Invalid alert transition")
+            if not isinstance(event.get("observed_at_epoch"), int) or event["observed_at_epoch"] < 0:
+                raise ValueError("Invalid alert event timestamp")
             ids.add(event_id)
         if acknowledge is not None:
             pending = [event for event in pending if event["event_id"] != acknowledge]
@@ -169,7 +171,11 @@ def main(argv=None):
     if args.state_file or args.outbox_file:
         try:
             if args.outbox_file:
-                snapshot["pending_events"] = update_outbox(args.outbox_file, snapshot, args.repeat_seconds)
+                pending = update_outbox(args.outbox_file, snapshot, args.repeat_seconds)
+                snapshot["pending_events"] = pending
+                snapshot["handoff"] = {"pending_count": len(pending),
+                    "oldest_pending_seconds": max(0, int(time.time()) - min(e["observed_at_epoch"] for e in pending)) if pending else None,
+                    "status": "awaiting_acknowledgement" if pending else "clear"}
             else:
                 snapshot["transitions"] = update_state(args.state_file, snapshot, args.repeat_seconds)
         except (OSError, ValueError):
@@ -177,7 +183,7 @@ def main(argv=None):
             print(json.dumps(snapshot))
             return 2
     print(json.dumps(snapshot))
-    return 2 if snapshot["status"] == "unavailable" else 1 if snapshot["alerts"] else 0
+    return 2 if snapshot["status"] == "unavailable" else 1 if snapshot["alerts"] or snapshot.get("pending_events") else 0
 
 
 if __name__ == "__main__":

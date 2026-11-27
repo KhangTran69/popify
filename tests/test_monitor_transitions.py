@@ -84,3 +84,21 @@ def test_ack_command_is_independent_of_database(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(monitor, "SessionLocal", unavailable)
     assert monitor.main(["--outbox-file", str(path), "--ack-event", event["event_id"]]) == 0
     assert json.loads(capsys.readouterr().out)["pending_count"] == 0
+
+
+def test_healthy_snapshot_with_pending_delivery_is_not_clear(tmp_path, monkeypatch, capsys):
+    from contextlib import nullcontext
+    from scripts import check_operations as monitor
+    path = tmp_path / "outbox.json"
+    monitor.update_outbox(path, snapshot("orders_overdue"))
+    monkeypatch.setattr(monitor, "SessionLocal", lambda: nullcontext(None))
+    monkeypatch.setattr(monitor, "operational_snapshot", lambda db: snapshot(status="healthy"))
+    assert monitor.main(["--outbox-file", str(path)]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "healthy"
+    assert result["handoff"]["pending_count"] == 2
+    assert result["handoff"]["status"] == "awaiting_acknowledgement"
+    for event in result["pending_events"]:
+        monitor.update_outbox(path, acknowledge=event["event_id"])
+    assert monitor.main(["--outbox-file", str(path)]) == 0
+    assert json.loads(capsys.readouterr().out)["handoff"]["status"] == "clear"

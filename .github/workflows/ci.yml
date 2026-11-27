@@ -114,9 +114,11 @@ jobs:
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/live)" = 200
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 503
           docker compose exec -T api python -m scripts.verify_db_outage unavailable --confirm-disposable
+          docker compose exec -T api python -m scripts.verify_monitor_outage unavailable --confirm-disposable
           docker compose up -d --wait --wait-timeout 120 db
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 200
           docker compose exec -T api python -m scripts.verify_db_outage recovered --confirm-disposable
+          docker compose exec -T api python -m scripts.verify_monitor_outage recovered --confirm-disposable
       - name: Seed synthetic managed identity for restore verification
         run: docker compose exec -T api python -m scripts.seed_restore_identity --confirm-disposable
       - name: Verify encrypted disposable PostgreSQL backup restoration
