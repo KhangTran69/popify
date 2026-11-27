@@ -42,8 +42,21 @@ restored_sequences=$(psql -X -U "$user" -d "$target" -v ON_ERROR_STOP=1 -Atc "$s
 source_sessions=$(psql -X -U "$user" -d "$source_db" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM operator_sessions")
 restored_sessions=$(psql -X -U "$user" -d "$target" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM operator_sessions")
 [ "$source_sessions" -gt 0 ] && [ "$source_sessions" = "$restored_sessions" ]
-psql -X -U "$user" -d "$target" -v ON_ERROR_STOP=1 -c "DELETE FROM operator_sessions; DELETE FROM login_buckets;" >/dev/null
+# Explicitly reject a source-as-target invocation before the real invalidation.
+if sh /tmp/popify-invalidate-restored-identity.sh --confirm-isolated-restore "$source_db" "$source_db"; then
+  echo "Source database invalidation unexpectedly allowed" >&2; exit 1
+fi
+sh /tmp/popify-invalidate-restored-identity.sh --confirm-isolated-restore "$source_db" "$target"
+sh /tmp/popify-invalidate-restored-identity.sh --confirm-isolated-restore "$source_db" "$target"
 [ "$(psql -X -U "$user" -d "$target" -Atc "SELECT count(*) FROM operator_sessions")" = 0 ]
 [ "$(psql -X -U "$user" -d "$target" -Atc "SELECT count(*) FROM login_buckets")" = 0 ]
 [ "$(psql -X -U "$user" -d "$source_db" -Atc "SELECT count(*) FROM operator_sessions")" = "$source_sessions" ]
+for entry in operator_accounts:id audit_events:id orders:id deliveries:id support_cases:id approvals:id action_executions:id execution_reconciliations:id schema_migrations:version; do
+  table=${entry%:*}
+  sort_key=${entry#*:}
+  query="SELECT md5(coalesce(string_agg(to_jsonb(t)::text, '' ORDER BY $sort_key), '')) FROM $table t"
+  [ "$(psql -X -U "$user" -d "$source_db" -v ON_ERROR_STOP=1 -Atc "$query")" = "$(psql -X -U "$user" -d "$target" -v ON_ERROR_STOP=1 -Atc "$query")" ] || {
+    echo "Post-invalidation restore content mismatch: $table" >&2; exit 1;
+  }
+done
 echo "PASS: disposable PostgreSQL restore matched business and audit content; restored sessions revoked without changing source; elapsed_seconds=$(($(date +%s)-started))"

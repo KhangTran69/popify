@@ -22,6 +22,7 @@ if bash scripts/backup_encrypted.sh "$recipient" "$work/backup.gpg"; then
 fi
 prepare_recovery_keyring "$work" "$recipient" "$work/backup.gpg"
 docker compose cp scripts/verify_restore.sh db:/tmp/popify-verify-restore.sh
+docker compose cp scripts/invalidate_restored_identity.sh db:/tmp/popify-invalidate-restored-identity.sh
 gpg --batch --decrypt "$work/backup.gpg" |
   docker compose exec -T -e POPIFY_CONFIRM_DISPOSABLE=1 -e POPIFY_RESTORE_FROM_STDIN=1 db sh /tmp/popify-verify-restore.sh
 echo "PASS: encrypted archive decrypted and restored; no-clobber protection verified"
