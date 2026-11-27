@@ -136,6 +136,10 @@ jobs:
   scheduled-workload:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [steady, overload]
     steps:
       - uses: actions/checkout@v7
       - name: Configure disposable mock stack
@@ -147,11 +151,11 @@ jobs:
       - name: Measure real scheduled order and support queue latency
         run: |
           set -o pipefail
-          docker compose exec -T api python -m scripts.verify_scheduled_workload --confirm-disposable | tee scheduled-workload.log
+          docker compose exec -T api python -m scripts.verify_scheduled_workload --confirm-disposable --profile ${{ matrix.profile }} | tee scheduled-workload.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduled-workload
+          name: scheduled-workload-${{ matrix.profile }}
           path: scheduled-workload.log
           if-no-files-found: ignore
       - name: Clean disposable scheduled stack
