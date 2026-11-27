@@ -1,7 +1,7 @@
 """Bounded operational summaries and actionable alerts without customer content."""
 from sqlalchemy import case, func, or_, select
 from app.config import settings
-from app.models import Approval, Audit, Case, Delivery, utcnow
+from app.models import ActionExecution, Approval, Audit, Case, Delivery, utcnow
 from app.services import as_utc
 
 QUEUE_AGE_SECONDS = 120
@@ -95,6 +95,8 @@ def queue_summary(db):
         }
     result["uncertain_actions"] = db.scalar(select(func.count()).select_from(Approval).where(
         Approval.execution_status.in_(["ambiguous", "disputed", "blocked_prior_outcome"]))) or 0
+    result["started_executions"] = db.scalar(select(func.count()).select_from(ActionExecution).where(
+        ActionExecution.state == "started")) or 0
     pending_count, oldest_pending = db.execute(select(func.count(), func.min(Approval.created_at)).where(
         Approval.status == "pending", Approval.replacement_approval_id.is_(None))).one()
     result["pending_review"] = {"count": pending_count, "oldest_seconds": max(0, int((now - as_utc(oldest_pending)).total_seconds())) if oldest_pending else None}
@@ -125,6 +127,12 @@ def operational_snapshot(db, *, preview=False):
         if queue["exhausted"]:
             alert(f"{name}_exhausted", "warning", f"{name.title()} has exhausted work.",
                   "Review recorded failures in Recovery before manually retrying.")
+    if queues["pending_review"]["oldest_seconds"] is not None and queues["pending_review"]["oldest_seconds"] >= settings.human_review_alert_seconds:
+        alert("human_review_overdue", "warning", "A human decision has exceeded the configured review threshold.",
+              "Assign an authorized reviewer; do not bypass human approval to clear the queue.")
+    if queues["started_executions"]:
+        alert("started_execution_unresolved", "critical", "A persisted execution has no recorded terminal outcome.",
+              "Inspect the original attempt and reconciliation evidence; never redispatch an unknown outcome.")
     if queues["uncertain_actions"]:
         alert("uncertain_actions", "critical", "Provider outcome requires reconciliation.",
               "Inspect saved evidence; never blindly replay an uncertain action.")

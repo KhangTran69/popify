@@ -38,3 +38,23 @@ def test_due_scheduled_exhausted_and_uncertain_are_distinct():
             "orders_overdue", "support_exhausted", "uncertain_actions", "worker_1_failed", "worker_3_stale"}
         assert all(w["state"] == "disabled" for w in operational_snapshot(db, preview=True)["workers"])
     engine.dispose()
+
+
+def test_pending_review_and_persisted_attempt_alerts(monkeypatch):
+    from app.config import settings
+    from app.models import ActionExecution
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(settings, "human_review_alert_seconds", 60)
+    with Session(engine) as db:
+        db.add(Approval(kind="support", subject_type="case", subject_id=4, proposed_action="send_reply",
+                        status="pending", created_at=utcnow()-timedelta(seconds=90)))
+        db.add(ActionExecution(idempotency_key="synthetic-started", state="started", attempts=1))
+        db.commit()
+        snapshot = operational_snapshot(db)
+        assert snapshot["queues"]["started_executions"] == 1
+        alerts = {item["code"]:item for item in snapshot["alerts"]}
+        assert alerts["started_execution_unresolved"]["severity"] == "critical"
+        assert alerts["human_review_overdue"]["severity"] == "warning"
+        assert "synthetic-started" not in str(snapshot)
+    engine.dispose()

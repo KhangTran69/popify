@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     n8n_base_url: str = "http://n8n:5678"
     n8n_webhook_secret: str = "local-demo-secret"
     order_delay_hours: int = Field(default=48, ge=1, le=8760)
+    human_review_alert_seconds: int = Field(default=86400, ge=60, le=604800)
     mock_action_failures: int = Field(default=0, ge=0, le=10)
     mock_action_ambiguous: bool = False
     max_action_attempts: int = Field(default=3, ge=1, le=10)

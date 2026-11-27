@@ -31,3 +31,5 @@ Use [OPERATIONAL_HANDOVER.md](OPERATIONAL_HANDOVER.md) to record ownership and e
 CI exercises a fresh synthetic recovery keyring and rejects truncated encrypted archives before restoration. This does not establish actual offsite custody or authenticity of an archive obtained from an untrusted source; validate provenance separately before an authorized restore.
 
 Expired authentication-artifact cleanup is implemented with a dry-run default and explicit apply flag. Business-data deletion remains blocked on an approved retention policy and evidence-preservation review.
+
+Agree a human-review escalation threshold with the designated operator before pilot access; CI defaults to 24 hours and verifies overdue-review and unresolved-execution alerts without exposing record identifiers. Alert delivery and staffing remain operational gates.
