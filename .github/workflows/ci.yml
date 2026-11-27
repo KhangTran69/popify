@@ -123,6 +123,10 @@ jobs:
         env:
           POPIFY_CONFIRM_DISPOSABLE: "1"
         run: bash scripts/verify_encrypted_restore.sh
+      - name: Recover encrypted n8n state on separate volume
+        env:
+          POPIFY_CONFIRM_DISPOSABLE: "1"
+        run: bash scripts/verify_n8n_restore.sh
       - name: Show service logs on failure and clean up
         if: always()
         run: |

@@ -14,30 +14,32 @@ KEY = "ci-n8n-outage-recovery"
 def run():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("queue", "pending", "recovered"))
+    parser.add_argument("--key", default=KEY, choices=(KEY, "ci-n8n-restored-volume"))
     parser.add_argument("--confirm-disposable", action="store_true", required=True)
     args = parser.parse_args()
+    key = args.key
     if os.environ.get("POPIFY_ENV", "").lower() != "development":
         parser.error("Only a disposable development stack is supported")
     if args.stage == "queue":
         with SessionLocal() as db:
-            if db.scalar(select(Delivery).where(Delivery.webhook_id == KEY)):
+            if db.scalar(select(Delivery).where(Delivery.webhook_id == key)):
                 raise RuntimeError("Fixture already exists; use a fresh disposable stack")
             now = utcnow()
-            delivery = Delivery(webhook_id=KEY, topic="orders/create", shop_domain="demo.myshopify.com",
-                payload={"id": KEY, "name": "#OUTAGE-CHECK", "created_at": now.isoformat(),
+            delivery = Delivery(webhook_id=key, topic="orders/create", shop_domain="demo.myshopify.com",
+                payload={"id": key, "name": "#OUTAGE-CHECK", "created_at": now.isoformat(),
                          "updated_at": now.isoformat()}, status="received")
             db.add(delivery)
             db.flush()
-            audit(db, "delivery", delivery.id, "synthetic_delivery_received", correlation_id=KEY)
+            audit(db, "delivery", delivery.id, "synthetic_delivery_received", correlation_id=key)
             db.commit()
         print("PASS: queued durable synthetic record while n8n is stopped")
         return
     deadline = time.monotonic() + 150
     while True:
         with SessionLocal() as db:
-            delivery = db.scalar(select(Delivery).where(Delivery.webhook_id == KEY))
+            delivery = db.scalar(select(Delivery).where(Delivery.webhook_id == key))
             assert delivery, "Durable delivery was lost"
-            orders = list(db.scalars(select(Order).where(Order.external_id == KEY)))
+            orders = list(db.scalars(select(Order).where(Order.external_id == key)))
             if args.stage == "pending":
                 assert delivery.status == "received" and not orders
                 print("PASS: queued record survived API restart while n8n remained stopped")
