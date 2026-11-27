@@ -180,7 +180,7 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=settings.app_secret,
     same_site="lax",
-    max_age=8 * 60 * 60,
+    max_age=settings.operator_session_minutes * 60 if settings.managed_identity else 8 * 60 * 60,
     https_only=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
 )
 
@@ -251,11 +251,12 @@ def csrf(request):
 
 def verify_csrf(request, token):
     if settings.managed_identity:
-        fetch_site = request.headers.get("sec-fetch-site", "").lower()
-        if fetch_site in {"cross-site", "same-site"}:
+        fetch_sites = request.headers.getlist("sec-fetch-site")
+        if len(fetch_sites) > 1 or (fetch_sites and fetch_sites[0].lower() not in {"same-origin", "none"}):
             raise HTTPException(403, "Cross-origin form submission denied")
         origins = request.headers.getlist("origin")
-        if origins and settings.operator_origin and origins != [settings.operator_origin]:
+        if len(origins) > 1 or (origins and (origins[0] == "null" or
+                (settings.operator_origin and origins != [settings.operator_origin]))):
             raise HTTPException(403, "Cross-origin form submission denied")
     expected = request.session.get("csrf", "")
     if not expected or not secure_equal(expected, token):

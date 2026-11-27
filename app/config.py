@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     shopify_admin_token: str = ""
     shopify_api_version: str = "2026-10"
     managed_identity: bool = False
+    operator_session_minutes: int = Field(default=480, ge=15, le=480)
+    operator_max_sessions: int = Field(default=5, ge=1, le=5)
     operator_origin: str = ""
     allow_external_ai: bool = False
     operator_username: str = "operator"

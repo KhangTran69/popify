@@ -190,3 +190,44 @@ def test_session_lookup_refreshes_role_and_revocation(identity_db):
         with identity_db() as other:
             manage_account(other, "test-reviewer", "role", role="auditor")
         assert session_account(db, token) is None
+
+
+def test_configurable_session_lifetime_and_cap(identity_db, monkeypatch):
+    from app.identity import _digest
+    monkeypatch.setattr(settings, "operator_session_minutes", 30)
+    monkeypatch.setattr(settings, "operator_max_sessions", 2)
+    tokens = []
+    with identity_db() as db:
+        for _ in range(3):
+            _, token, wait = managed_login(db, "test-support", PASSWORD, "synthetic-policy")
+            assert token and not wait
+            tokens.append(token)
+        assert session_account(db, tokens[0]) is None
+        for token in tokens[1:]:
+            assert session_account(db, token)
+            expiry = db.get(OperatorSession, _digest(token)).expires_at
+            assert 29 * 60 <= (expiry.replace(tzinfo=utcnow().tzinfo) - utcnow()).total_seconds() <= 30 * 60
+        assert len(list(db.scalars(select(OperatorSession)))) == 2
+    monkeypatch.setattr(settings, "operator_max_sessions", 1)
+    with identity_db() as db:
+        _, latest, wait = managed_login(db, "test-support", PASSWORD, "synthetic-policy")
+        assert latest and not wait and session_account(db, latest)
+        assert all(session_account(db, old) is None for old in tokens)
+        assert len(list(db.scalars(select(OperatorSession)))) == 1
+
+
+@pytest.mark.parametrize("headers", [
+    [("Sec-Fetch-Site", "same-origin"), ("Sec-Fetch-Site", "cross-site")],
+    [("Origin", "null")],
+    [("Origin", "https://one.example.test"), ("Origin", "https://two.example.test")],
+    [("Sec-Fetch-Site", "unknown")],
+])
+def test_ambiguous_cross_origin_headers_denied(identity_db, headers):
+    from app.models import Case
+    client = TestClient(main.app, follow_redirects=False)
+    token = login(client, "support")
+    response = client.post("/support", headers=headers,
+        data={"csrf_token": token, "message": "Synthetic", "request_key": "ambiguous-origin"})
+    assert response.status_code == 403
+    with identity_db() as db:
+        assert db.scalar(select(Case).where(Case.request_key == "ambiguous-origin")) is None

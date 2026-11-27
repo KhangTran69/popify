@@ -8,7 +8,7 @@ import re
 import uuid
 import time
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, select, text, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 
@@ -359,6 +359,51 @@ def verify_admin_logout_order(sessions):
     print("PASS: administrator logout serialized with account mutation; logged-out administrator denied")
 
 
+def verify_session_expiry_during_lock(sessions):
+    """An expiry predicate bound before waiting on a row lock is not sufficient."""
+    from app.models import OperatorSession
+    with sessions() as db:
+        manage_account(db, "ci-expiry-race", "create", role="support", password=PASSWORD)
+        _, token, wait = managed_login(db, "ci-expiry-race", PASSWORD, "synthetic-expiry")
+        assert token and not wait
+    digest = identity._digest(token)
+    real_clock = identity.utcnow
+    clock = [real_clock()]
+    expiry = clock[0] + timedelta(minutes=1)
+    with sessions() as db:
+        row = db.get(OperatorSession, digest)
+        row.expires_at = expiry
+        db.commit()
+    entered = Event()
+    def lookup():
+        with sessions() as db:
+            connection = db.connection()
+            def before_execute(conn, cursor, statement, parameters, context, executemany):
+                if "operator_sessions" in statement and "FOR SHARE" in statement:
+                    entered.set()
+            event.listen(connection, "before_cursor_execute", before_execute)
+            try:
+                return session_account(db, token, lock_mutation=True)
+            finally:
+                event.remove(connection, "before_cursor_execute", before_execute)
+    identity.utcnow = lambda: clock[0]
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with sessions() as blocker:
+                blocker.scalar(select(OperatorSession).where(OperatorSession.token_hash == digest).with_for_update())
+                future = pool.submit(lookup)
+                try:
+                    assert entered.wait(5)
+                    assert not future.done()
+                    clock[0] = expiry + timedelta(seconds=1)
+                finally:
+                    blocker.rollback()
+            assert future.result(timeout=10) is None
+    finally:
+        identity.utcnow = real_clock
+    print("PASS: session expiration rechecked after waiting for PostgreSQL session lock")
+
+
 def run():
     if os.environ.get("POPIFY_CONFIRM_DISPOSABLE") != "1" or not settings.managed_identity or engine.dialect.name != "postgresql" or os.environ.get("POPIFY_ENV") != "production":
         raise RuntimeError("Requires explicit disposable PostgreSQL and production managed-identity configuration.")
@@ -424,6 +469,7 @@ def run():
                 assert execution and execution.state == "succeeded"
             verify_mutation_revocation_order(sessions)
             verify_admin_logout_order(sessions)
+            verify_session_expiry_during_lock(sessions)
             verify_delivery_batches(sessions)
             verify_support_batches(sessions)
             verify_worker_lock_contention(sessions)
