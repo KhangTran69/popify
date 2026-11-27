@@ -44,10 +44,6 @@ expect_code 413 -H "Expect: 100-continue" --expect100-timeout 5 --data-binary @"
 seq 1 40 | xargs -P 8 -I '__INDEX__' sh -c 'curl -ks --max-time 10 -o /dev/null -w "%{http_code}\n" -X POST -d "{}" "$1"' _ "$base" '__INDEX__' > "$tmp/status"
 sort "$tmp/status" | uniq -c
 [ "$(wc -l < "$tmp/status")" -eq 40 ]
-if grep -Ev '^(401|429)
-echo "PASS: TLS ingress route isolation, body limit, invalid signature and bounded burst rejection"
- "$tmp/status"; then echo 'Unexpected ingress burst response' >&2; exit 1; fi
-grep -q '^429
-echo "PASS: TLS ingress route isolation, body limit, invalid signature and bounded burst rejection"
- "$tmp/status"
+if grep -Ev '^(401|429)$' "$tmp/status"; then echo 'Unexpected ingress burst response' >&2; exit 1; fi
+grep -q '^429$' "$tmp/status"
 echo "PASS: TLS ingress route isolation, body limit, invalid signature and bounded burst rejection"
