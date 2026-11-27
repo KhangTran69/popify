@@ -137,11 +137,11 @@ jobs:
 
   scheduled-workload:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        profile: [steady, overload]
+        profile: [steady, overload, mixed]
     steps:
       - uses: actions/checkout@v7
       - name: Configure disposable mock stack

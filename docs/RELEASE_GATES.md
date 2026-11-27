@@ -33,3 +33,5 @@ CI exercises a fresh synthetic recovery keyring and rejects truncated encrypted 
 Expired authentication-artifact cleanup is implemented with a dry-run default and explicit apply flag. Business-data deletion remains blocked on an approved retention policy and evidence-preservation review.
 
 Agree a human-review escalation threshold with the designated operator before pilot access; CI defaults to 24 hours and verifies overdue-review and unresolved-execution alerts without exposing record identifiers. Alert delivery and staffing remain operational gates.
+
+The scheduled CI workload also includes a mixed synthetic profile: 12 orders every 15 seconds, their dependent support inquiries, and 24 independent damaged-item inquiries every 8 seconds. It measures separate paired and independent support waits, acknowledgement times and combined backlog/drainage. Its acceptance requires backlog growth, bounded drain within 660 seconds, preserved unmatched-order privacy, stable request-key replay, conflicting replay rejection and pending human approval without execution. This is a provisional synthetic overload regression, not a production capacity or support SLA.
