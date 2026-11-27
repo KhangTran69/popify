@@ -2,9 +2,10 @@ import hashlib, logging, uuid
 import json
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func, text, exists, literal, cast, String
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as DatabaseTimeout
 from sqlalchemy.orm import Session, aliased
 from app.config import settings
+from app.db import bound_worker_lock_wait
 from app.integrations import verify_shopify, generate_support_content
 from app.privacy import minimized_order_payload
 from app.action_provider import ActionRequest, MockActionAdapter, normalize_adapter_result
@@ -114,6 +115,7 @@ def audit(
 
 
 def process_delivery(db: Session, delivery_id: int):
+    bound_worker_lock_wait(db)
     delivery = db.scalar(
         select(Delivery).where(Delivery.id == delivery_id).with_for_update()
     )
@@ -194,8 +196,14 @@ def process_delivery(db: Session, delivery_id: int):
         )
         db.commit()
         return {"status": "processed", "order_id": order.id}
+    except (OperationalError, DatabaseTimeout):
+        # Infrastructure failures (including lock timeout) are retried by the
+        # scheduler; they are not evidence of a malformed business record.
+        db.rollback()
+        raise
     except Exception as exc:
         db.rollback()
+        bound_worker_lock_wait(db)
         delivery = db.scalar(
             select(Delivery).where(Delivery.id == delivery_id).with_for_update()
         )
@@ -1273,11 +1281,16 @@ def process_support(db, case):
     attempts_before = case.attempts
     case.attempts += 1
     try:
+        bound_worker_lock_wait(db)
         return create_support_case(
             db, case.message, case.order_ref, case.customer_email, case=case
         )
+    except (OperationalError, DatabaseTimeout):
+        db.rollback()
+        raise
     except Exception as exc:
         db.rollback()
+        bound_worker_lock_wait(db)
         case = db.scalar(select(Case).where(Case.id == case_id).with_for_update())
         if case.attempts != attempts_before or case.status not in ("queued", "failed"):
             return case

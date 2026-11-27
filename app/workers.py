@@ -2,11 +2,13 @@
 import time
 from sqlalchemy import or_, select
 from app.config import settings
+from app.db import bound_worker_lock_wait
 from app.models import Delivery, Case, utcnow
 from app.services import process_delivery, process_support, audit
 
 
 def process_next_delivery(db):
+    bound_worker_lock_wait(db)
     pending = db.scalar(
         select(Delivery)
         .where(
@@ -27,6 +29,7 @@ def process_next_delivery(db):
 
 
 def process_next_support(db):
+    bound_worker_lock_wait(db)
     case = db.scalar(
         select(Case)
         .where(

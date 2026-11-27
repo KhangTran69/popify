@@ -101,6 +101,52 @@ def verify_support_batches(sessions):
     print("PASS: competing support batches created nine pending approvals exactly once at five-item limit and skipped future retry")
 
 
+def verify_worker_lock_contention(sessions):
+    """A lock timeout must preserve previously committed work and retry budgets."""
+    now = utcnow()
+    first_key, blocked_key = "ci-lock-first", "ci-lock-blocked"
+    with sessions() as db:
+        for key, external in ((first_key, first_key), (blocked_key, "production-batch-0")):
+            db.add(Delivery(webhook_id=key, topic="orders/create", shop_domain="demo.myshopify.com",
+                            payload={"id": external, "created_at": now.isoformat(), "updated_at": now.isoformat()},
+                            status="received"))
+        db.commit()
+    headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
+    with TestClient(main.app, base_url="https://testserver", follow_redirects=False) as client:
+        with sessions() as blocker:
+            blocker.scalar(select(Order).where(Order.external_id == "production-batch-0").with_for_update())
+            response = client.post("/api/n8n/process-next?batch_size=5", headers=headers)
+            assert response.status_code == 503 and response.headers["Retry-After"] == "5"
+            with sessions() as db:
+                first = db.scalar(select(Delivery).where(Delivery.webhook_id == first_key))
+                blocked = db.scalar(select(Delivery).where(Delivery.webhook_id == blocked_key))
+                assert first.status == "processed" and first.attempts == 1
+                assert blocked.status == "received" and blocked.attempts == 0
+            blocker.rollback()
+        assert client.post("/api/n8n/process-next?batch_size=5", headers=headers).json()["outcomes"]["processed"] == 1
+        with sessions() as db:
+            blocked = db.scalar(select(Delivery).where(Delivery.webhook_id == blocked_key))
+            assert blocked.status == "processed" and blocked.attempts == 1
+            db.add(Case(request_key="ci-lock-support", message="Synthetic inquiry", status="queued"))
+            db.commit()
+        with sessions() as blocker:
+            blocker.execute(text("LOCK TABLE approvals IN SHARE MODE"))
+            response = client.post("/api/n8n/triage-next?batch_size=5", headers=headers)
+            assert response.status_code == 503
+            with sessions() as db:
+                case = db.scalar(select(Case).where(Case.request_key == "ci-lock-support"))
+                assert case.status == "queued" and case.attempts == 0
+                assert not list(db.scalars(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id)))
+            blocker.rollback()
+        assert client.post("/api/n8n/triage-next?batch_size=5", headers=headers).json()["outcomes"]["needs_review"] == 1
+        with sessions() as db:
+            case = db.scalar(select(Case).where(Case.request_key == "ci-lock-support"))
+            assert case.status == "needs_review" and case.attempts == 1
+            approvals = list(db.scalars(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id)))
+            assert len(approvals) == 1 and approvals[0].status == "pending"
+    print("PASS: PostgreSQL worker lock timeout returns retryable 503, preserves committed batch items and retry budgets, then drains exactly once")
+
+
 def verify_recovery(sessions, worker, support, support_token, reviewer, reviewer_token):
     """Exercise actual HTTP contracts and PostgreSQL state, all provider outcomes synthetic."""
     headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
@@ -345,6 +391,7 @@ def run():
             verify_admin_logout_order(sessions)
             verify_delivery_batches(sessions)
             verify_support_batches(sessions)
+            verify_worker_lock_contention(sessions)
             verify_recovery(sessions, admin, support, support_token, reviewer, reviewer_token)
             cookie = reviewer.cookies.get("session")
             assert admin.post("/operators/ci-reviewer", data={"action": "revoke", "csrf_token": admin_token}).status_code == 303
