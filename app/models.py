@@ -203,3 +203,30 @@ class ExecutionReconciliation(Base):
 
 
 Index("ix_approval_queue", Approval.status, Approval.execution_status)
+
+
+class OperatorAccount(Base):
+    __tablename__ = "operator_accounts"
+    __table_args__ = (CheckConstraint("role IN ('admin','support','reviewer','auditor')", name="ck_operator_role"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True)
+    role: Mapped[str] = mapped_column(String(16))
+    password_hash: Mapped[str] = mapped_column(String(160))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class OperatorSession(Base):
+    __tablename__ = "operator_sessions"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("operator_accounts.id", ondelete="CASCADE"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class LoginBucket(Base):
+    __tablename__ = "login_buckets"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    failures: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+Index("ix_audit_workflow_recent", Audit.entity_type, Audit.entity_id, Audit.event, Audit.id)

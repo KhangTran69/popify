@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     shopify_store_domain: str = ""
     shopify_admin_token: str = ""
     shopify_api_version: str = "2026-10"
+    managed_identity: bool = False
+    allow_external_ai: bool = False
     operator_username: str = "operator"
     operator_password: str = "demo-change-me"
     llm_mode: Literal["mock", "openai"] = "mock"
@@ -55,6 +57,8 @@ def load_settings():
             _env_file=None,
             database_url=os.environ["DATABASE_URL"],
             preview_mode=True,
+            managed_identity=False,
+            allow_external_ai=False,
             app_secret=secrets.token_urlsafe(32),
             shopify_webhook_secret="",
             shopify_store_domain="",

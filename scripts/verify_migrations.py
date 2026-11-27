@@ -82,6 +82,9 @@ def run():
                         RETURNING id
                     """).scalar_one()
                     apply(connection, migration_0008)
+                    for migration in migrations:
+                        if migration.name > migration_0008.name:
+                            apply(connection, migration)
                     row = connection.execute(text("""
                         SELECT a.status, a.execution_status, a.actor, a.attempts,
                                e.state, e.attempts,
@@ -109,7 +112,9 @@ def run():
                         FROM execution_reconciliations WHERE approval_id = 1
                     """).one()
                     assert result == (2, 2, "legacy-operator", "still_unknown"), result
-        print("PASS: migration 0008 applies to a fresh schema and upgrades populated 0007 data, preserving historical ambiguous decisions and allowing an append-only follow-up.")
+                assert connection.exec_driver_sql("SELECT count(*) FROM operator_accounts").scalar_one() == 0
+                assert connection.exec_driver_sql("SELECT count(*) FROM operator_sessions").scalar_one() == 0
+        print("PASS: identity schema and migration 0008 apply to a fresh schema and upgrades populated 0007 data, preserving historical ambiguous decisions and allowing an append-only follow-up.")
     finally:
         for isolated in isolated_engines:
             isolated.dispose()

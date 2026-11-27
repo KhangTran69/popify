@@ -17,6 +17,8 @@ from sqlalchemy.orm import Session, selectinload
 from app.db import Base, engine, get_db
 from app.config import settings
 from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integration_secret
+from app.identity import managed_login, session_account, revoke_session
+from app.models import OperatorAccount
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
     ExecutionReconciliation, utcnow,
@@ -120,9 +122,14 @@ async def lifespan(app):
     if not settings.preview_mode and environment not in {"development", "production"}:
         raise RuntimeError("POPIFY_ENV must be development or production.")
     if not settings.preview_mode and environment == "production":
+        if not settings.managed_identity or engine.dialect.name != "postgresql":
+            raise RuntimeError("Production requires managed operator identity and PostgreSQL.")
+        if settings.shopify_webhook_secret and not settings.shopify_store_domain:
+            raise RuntimeError("Production Shopify intake requires a store allowlist.")
+        if settings.llm_mode == "openai" and not settings.allow_external_ai:
+            raise RuntimeError("External AI processing requires explicit configuration approval.")
         required = {
             "APP_SECRET": settings.app_secret,
-            "OPERATOR_PASSWORD": settings.operator_password,
             "N8N_WEBHOOK_SECRET": settings.n8n_webhook_secret,
             "N8N_ENCRYPTION_KEY": os.environ.get("N8N_ENCRYPTION_KEY", ""),
         }
@@ -139,7 +146,6 @@ async def lifespan(app):
             raise RuntimeError("Production requires non-placeholder values for: " + ", ".join(missing))
         minimum_lengths = {
             "APP_SECRET": (settings.app_secret, 32),
-            "OPERATOR_PASSWORD": (settings.operator_password, 12),
             "N8N_WEBHOOK_SECRET": (settings.n8n_webhook_secret, 32),
             "N8N_ENCRYPTION_KEY": (os.environ.get("N8N_ENCRYPTION_KEY", ""), 32),
         }
@@ -164,6 +170,7 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=settings.app_secret,
     same_site="lax",
+    max_age=8 * 60 * 60,
     https_only=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
 )
 
@@ -184,12 +191,35 @@ async def block_live_integrations_in_preview(request: Request, call_next):
     return await call_next(request)
 
 
-def operator(request: Request):
-    actor = request.session.get("operator")
-    if not isinstance(actor, str) or not actor or not secure_equal(actor, settings.operator_username):
-        request.session.clear()
-        raise HTTPException(401, "Sign in to access the operator console")
-    return actor
+def operator(request: Request, db: Session = Depends(get_db)):
+    if settings.managed_identity and not settings.preview_mode:
+        account = session_account(db, request.session.get("identity_token"))
+        if account:
+            request.state.operator_account = account
+            request.state.operator_role = account.role
+            request.state.operator_name = account.username
+            return account.username
+    else:
+        actor = request.session.get("operator")
+        if isinstance(actor, str) and actor and secure_equal(actor, settings.operator_username):
+            request.state.operator_role = "admin"
+            request.state.operator_name = actor
+            return actor
+    request.session.clear()
+    raise HTTPException(401, "Sign in to access the operator console")
+
+
+def require_roles(*roles):
+    def authorized(request: Request, actor=Depends(operator)):
+        if request.state.operator_role not in roles:
+            raise HTTPException(403, "Your operator role cannot perform this action.")
+        return actor
+    return authorized
+
+
+support_operator = require_roles("admin", "support")
+review_operator = require_roles("admin", "reviewer")
+admin_operator = require_roles("admin")
 
 
 def csrf(request):
@@ -239,14 +269,21 @@ def login(
     username: str = Form(...),
     password: str = Form(...),
     csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
     now = time.monotonic()
+    identity_token = None
     if settings.preview_mode:
         valid = secure_equal(
             username, settings.operator_username
         ) and secure_equal(password, settings.operator_password)
         retry_after = 0
+    elif settings.managed_identity:
+        account, identity_token, retry_after = managed_login(
+            db, username, password, request.client.host if request.client else "unknown"
+        )
+        valid = account is not None
     else:
         valid, retry_after = _check_login_attempt(request, username, password, now)
     if retry_after:
@@ -273,14 +310,19 @@ def login(
             status_code=401,
         )
     request.session.clear()
-    request.session["operator"] = username
+    if identity_token:
+        request.session["identity_token"] = identity_token
+    else:
+        request.session["operator"] = username
     request.session["csrf"] = secrets.token_urlsafe(32)
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/logout")
-def logout(request: Request, csrf_token: str = Form(...), actor=Depends(operator)):
+def logout(request: Request, csrf_token: str = Form(...), actor=Depends(operator), db: Session = Depends(get_db)):
     verify_csrf(request, csrf_token)
+    if settings.managed_identity and not settings.preview_mode:
+        revoke_session(db, request.session.get("identity_token"), request.state.operator_account)
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
 
@@ -585,7 +627,7 @@ def preview_scenario_create(
     request: Request,
     scenario: str = Form(...),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -630,7 +672,7 @@ def preview_scenario_detail(
 def guided_demo_start(
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -756,7 +798,7 @@ def guided_demo_support(
     request: Request,
     message: str = Form(...),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session=Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -775,7 +817,7 @@ def guided_demo_support(
             message,
             order.order_number,
             order.email,
-            request_key=f"guided-support:{delivery.id}",
+            request_key=f"guided-support:{delivery.id}", actor=actor,
         )
     except SupportRequestKeyConflict:
         raise HTTPException(409, "This guided run already has a different support inquiry.")
@@ -788,7 +830,7 @@ def guided_demo_run_workflow(
     phase: str,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session=Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1279,7 +1321,7 @@ def retry_delivery(
     delivery_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1311,7 +1353,7 @@ def approval_decision(
     request: Request,
     decision: str = Form(...),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(review_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1341,7 +1383,7 @@ def refresh_approval_route(
     approval_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(review_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1371,7 +1413,7 @@ def reconcile_approval_route(
     reference: str = Form(""),
     scenario_id: int | None = Form(None),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(review_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1400,7 +1442,7 @@ def retry(
     approval_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(review_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1419,7 +1461,7 @@ def preview_run(
     approval_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1584,7 +1626,7 @@ def support_api(
     if not data.message.strip():
         raise HTTPException(422, "Message is required")
     try:
-        case = queue_support(db, data.message, data.order_ref, data.email, data.request_key)
+        case = queue_support(db, data.message, data.order_ref, data.email, data.request_key, actor="integration")
     except SupportRequestKeyConflict:
         raise HTTPException(409, "request_key is already associated with different inquiry details")
     return {"case_id": case.id, "status": case.status}
@@ -1623,7 +1665,7 @@ def retry_case(
     case_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(support_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1648,7 +1690,7 @@ def retry_case(
 
 
 @app.get("/support", response_class=HTMLResponse)
-def support_form(request: Request, actor=Depends(operator)):
+def support_form(request: Request, actor=Depends(support_operator)):
     return templates.TemplateResponse(
         request,
         "support.html",
@@ -1672,7 +1714,7 @@ def support_submit(
     email: str = Form(""),
     request_key: str = Form(...),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(support_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1686,7 +1728,7 @@ def support_submit(
         raise HTTPException(422, "Check the inquiry fields")
     try:
         case = queue_support(
-            db, message, order_ref or None, email or None, request_key=request_key
+            db, message, order_ref or None, email or None, request_key=request_key, actor=actor
         )
     except SupportRequestKeyConflict:
         raise HTTPException(409, "This request key is already associated with different inquiry details.")
@@ -1697,7 +1739,7 @@ def support_submit(
 def demo_order(
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1722,6 +1764,8 @@ def demo_order(
         status="received",
     )
     db.add(d)
+    db.flush()
+    audit(db, "delivery", d.id, "synthetic_delivery_received", actor, correlation_id=d.webhook_id)
     db.commit()
     db.refresh(d)
     return RedirectResponse(f"/deliveries/{d.id}", 303)
@@ -1843,7 +1887,7 @@ async def http_error(request, exc):
                 "request": request,
                 "title": str(exc.status_code),
                 "message": str(exc.detail),
-                "actor": request.session.get("operator"),
+                "actor": getattr(request.state, "operator_name", None),
                 "csrf": csrf(request),
             },
             status_code=exc.status_code,
@@ -1868,7 +1912,7 @@ async def validation_error(request, exc):
                 "request": request,
                 "title": "Check your input",
                 "message": "A required field is missing or invalid. Go back and check the form.",
-                "actor": request.session.get("operator"),
+                "actor": getattr(request.state, "operator_name", None),
                 "csrf": csrf(request),
             },
             status_code=422,

@@ -279,11 +279,15 @@ GitHub Actions runs the SQLite behavior suite, validates all three workflow expo
 5. For optional OpenAI verification, configure a key, restart the API, and submit representative inquiries. Review categories, uncertainty, policy, and approved mock outcomes. This incurs provider usage and was not performed here.
 6. External messaging/refunds/cancellations are not implemented and remain disabled. Connecting a live action adapter requires separate authorization and provider-specific idempotency/reconciliation work.
 
+## Managed operator accounts
+
+See [Managed operator identities](docs/OPERATOR_IDENTITY.md) for account provisioning, role boundaries and session revocation. Production requires managed identity and PostgreSQL; the shared configured login remains for local development and isolated preview only.
+
 ## Production-readiness boundary
 
-PoPify is a single-store portfolio demonstration. Its operator login uses one configured username/password, a signed session cookie, CSRF protection, and login rate limiting; it has no per-person accounts, MFA, SSO, or role management. Worker events and failures appear in application audit history, but there is no centralized metrics backend, alerting, or defined service-level objective. Docker named volumes preserve data across restarts, but the project has no scheduled offsite backup or tested point-in-time restore process.
+PoPify is a single-store portfolio demonstration. Its operator login uses one configured username/password, a signed session cookie, CSRF protection, and login rate limiting; managed identity mode provides individual accounts, roles and revocable sessions. MFA and SSO are not implemented. Worker events and failures appear in application audit history, but there is no centralized metrics backend, alerting, or defined service-level objective. Docker named volumes preserve data across restarts, but the project has no scheduled offsite backup or tested point-in-time restore process.
 
-Before production, add managed identity and per-operator authorization, managed secret storage and rotation, encrypted backups with restore drills, centralized logs/metrics/alerts, retention and privacy controls, and store isolation. Before connecting a live commerce or messaging provider, implement a least-privilege provider adapter, provider-specific idempotency and reconciliation, rate-limit handling, sandbox tests, and explicit operator authorization. Real messages, refunds, and cancellations are not implemented.
+Before production, verify managed identity and per-operator authorization, managed secret storage and rotation, encrypted backups with restore drills, centralized logs/metrics/alerts, retention and privacy controls, and store isolation. Before connecting a live commerce or messaging provider, implement a least-privilege provider adapter, provider-specific idempotency and reconciliation, rate-limit handling, sandbox tests, and explicit operator authorization. Real messages, refunds, and cancellations are not implemented.
 
 Official documentation consulted for this implementation:
 
@@ -307,4 +311,4 @@ Official documentation consulted for this implementation:
 | n8n encryption-key mismatch | Restore the original configured key; do not rotate it or delete volumes |
 | Migration error | Read API startup logs and `schema_migrations`; preserve the database and fix the failing migration |
 
-This is a single-operator local portfolio system. Production identity, secret rotation, retention, high-volume worker throughput, multi-store isolation, and real outbound adapters require additional work.
+This is a single-operator local portfolio system. Production identity verification, secret rotation, retention, high-volume worker throughput, multi-store isolation, and real outbound adapters require additional work.

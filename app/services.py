@@ -1203,7 +1203,7 @@ def execute_approved(db, approval, mock_outcome=None, *, adapter=None):
     db.flush()
 
 
-def queue_support(db, message, order_ref, email, request_key=None):
+def queue_support(db, message, order_ref, email, request_key=None, *, actor="system"):
     key = request_key or str(uuid.uuid4())
     existing = db.scalar(select(Case).where(Case.request_key == key))
     if existing:
@@ -1231,7 +1231,7 @@ def queue_support(db, message, order_ref, email, request_key=None):
         raise SupportRequestKeyConflict(
             "request_key is already associated with different inquiry details"
         )
-    audit(db, "case", case.id, "inquiry_queued", correlation_id=key)
+    audit(db, "case", case.id, "inquiry_queued", actor=actor, correlation_id=key)
     db.commit()
     return case
 
