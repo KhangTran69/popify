@@ -21,6 +21,7 @@ from app.identity import managed_login, session_account, revoke_session, manage_
 from app.models import OperatorAccount, OperatorSession, LoginBucket
 from app.privacy import minimized_order_payload, valid_text_fields
 from app.operations import operational_snapshot, workflow_activity
+from app.workers import heartbeat, run_batch, process_next_delivery, process_next_support
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
     ExecutionReconciliation, utcnow,
@@ -417,16 +418,6 @@ def operator_update(username: str, request: Request, action: str = Form(...),
 
 
 
-def heartbeat(db, number, result, completed=False, failed=False):
-    audit(
-        db,
-        "workflow",
-        number,
-        "work_failed" if failed else "work_completed" if completed else "poll_completed",
-        details=result,
-    )
-    db.commit()
-    return result
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1625,26 +1616,6 @@ def n8n_process(
     return process_delivery(db, delivery_id)
 
 
-def process_next_delivery(db):
-    pending = db.scalar(
-        select(Delivery)
-        .where(
-            or_(
-                Delivery.next_attempt_at.is_(None), Delivery.next_attempt_at <= utcnow()
-            ),
-            (Delivery.status == "received")
-            | (
-                (Delivery.status == "failed")
-                & (Delivery.attempts < settings.max_delivery_attempts)
-            ),
-        )
-        .order_by(Delivery.id)
-        .with_for_update(skip_locked=True)
-        .limit(1)
-    )
-    return process_delivery(db, pending.id) if pending else {"status": "idle"}
-
-
 @app.post("/api/n8n/process-next")
 def n8n_next(
     x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db),
@@ -1652,29 +1623,7 @@ def n8n_next(
 ):
     if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
-    if batch_size == 1:
-        result = process_next_delivery(db)
-        return heartbeat(db, 1, result, completed=result["status"] == "processed",
-                         failed=result["status"] in ("failed", "exhausted"))
-    # Each delivery retains its own transaction, row lock and retry schedule.
-    # The time budget is checked between items; it is not a database statement timeout.
-    deadline = time.monotonic() + 7
-    counts = {"processed": 0, "failed": 0, "exhausted": 0, "duplicate": 0, "deferred": 0}
-    for _ in range(batch_size):
-        if time.monotonic() >= deadline:
-            break
-        result = process_next_delivery(db)
-        status = result["status"]
-        if status == "idle":
-            break
-        counts[status] += 1
-        # Record each result even if a later item encounters a database outage.
-        heartbeat(db, 1, result, completed=status == "processed", failed=status in ("failed", "exhausted"))
-    failed = bool(counts["failed"] or counts["exhausted"])
-    processed = counts["processed"]
-    result = {"status": "failed" if failed else "processed" if processed else "idle",
-              "batch_size": batch_size, "outcomes": counts}
-    return heartbeat(db, 1, result, completed=bool(processed), failed=failed)
+    return run_batch(db, 1, process_next_delivery, batch_size, "processed")
 
 
 class Inquiry(BaseModel):
@@ -1703,30 +1652,14 @@ def support_api(
 
 @app.post("/api/n8n/triage-next")
 def triage_next(
-    x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db)
+    x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db),
+    batch_size: int = Query(1, ge=1, le=5),
 ):
     if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
-    case = db.scalar(
-        select(Case)
-        .where(
-            Case.status.in_(["queued", "failed"]),
-            or_(Case.next_attempt_at.is_(None), Case.next_attempt_at <= utcnow()),
-        )
-        .order_by(Case.id)
-        .with_for_update(skip_locked=True)
-        .limit(1)
-    )
-    if not case:
-        return heartbeat(db, 2, {"status": "idle"})
-    case = process_support(db, case)
-    return heartbeat(
-        db,
-        2,
-        {"case_id": case.id, "status": case.status},
-        completed=case.status == "needs_review",
-        failed=case.status in ("failed", "exhausted"),
-    )
+    # External AI can take substantially longer than mock triage. Retain the
+    # existing single-item behavior there until a separate capacity test.
+    return run_batch(db, 2, process_next_support, batch_size if settings.llm_mode == "mock" else 1, "needs_review")
 
 
 @app.post("/cases/{case_id}/retry")

@@ -68,6 +68,35 @@ def verify_delivery_batches(sessions):
     print("PASS: competing bounded batch requests persisted five orders exactly once and skipped scheduled retry")
 
 
+def verify_support_batches(sessions):
+    keys = [f"production-support-batch-{i}" for i in range(5)]
+    with sessions() as db:
+        for key in keys:
+            db.add(Case(request_key=key, correlation_id=key, message="Synthetic inquiry", status="queued"))
+        db.add(Case(request_key="production-support-future", message="Synthetic retry",
+                    status="failed", attempts=1, next_attempt_at=utcnow()+timedelta(hours=1)))
+        db.commit()
+    def poll():
+        client = TestClient(main.app, base_url="https://testserver", follow_redirects=False)
+        try:
+            response = client.post("/api/n8n/triage-next?batch_size=3", headers={"X-N8N-Secret": settings.n8n_webhook_secret})
+            assert response.status_code == 200
+            return response.json()["outcomes"]["needs_review"]
+        finally:
+            client.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sum(pool.map(lambda _: poll(), range(2))) == 5
+    with sessions() as db:
+        cases = list(db.scalars(select(Case).where(Case.request_key.in_(keys))))
+        assert len(cases) == 5 and all(c.status == "needs_review" and c.attempts == 1 for c in cases)
+        for case in cases:
+            approvals = list(db.scalars(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id)))
+            assert len(approvals) == 1 and approvals[0].status == "pending"
+        future = db.scalar(select(Case).where(Case.request_key == "production-support-future"))
+        assert future.status == "failed" and future.attempts == 1
+    print("PASS: competing support batches created five pending approvals exactly once and skipped future retry")
+
+
 def verify_recovery(sessions, worker, support, support_token, reviewer, reviewer_token):
     """Exercise actual HTTP contracts and PostgreSQL state, all provider outcomes synthetic."""
     headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
@@ -204,6 +233,7 @@ def run():
                 assert approval.actor == "ci-reviewer" and approval.status == "approved"
                 assert execution and execution.state == "succeeded"
             verify_delivery_batches(sessions)
+            verify_support_batches(sessions)
             verify_recovery(sessions, admin, support, support_token, reviewer, reviewer_token)
             cookie = reviewer.cookies.get("session")
             assert admin.post("/operators/ci-reviewer", data={"action": "revoke", "csrf_token": admin_token}).status_code == 303

@@ -21,9 +21,9 @@ from app.models import Approval, Audit, Case, Delivery, Order, utcnow
 from app.services import as_utc
 from scripts.benchmark import percentile_ms
 
-COUNT = 4
-INTERVAL = 35
-DEADLINE = 420
+COUNT = 12
+INTERVAL = 25
+DEADLINE = 540
 
 
 def signed_order(client, key, *, delayed=False):
@@ -56,6 +56,9 @@ def run():
     start = time.monotonic()
     submitted, inquiries, order_wait, support_wait, ack = set(), set(), {}, {}, []
     exception_seen = False
+    peak_orders = peak_support = 0
+    end_to_end = {}
+    receipts = {}
     with httpx.Client(base_url="http://127.0.0.1:8000", timeout=10) as client:
         while time.monotonic() - start < DEADLINE:
             elapsed = time.monotonic() - start
@@ -68,6 +71,7 @@ def run():
                 for key in submitted:
                     delivery = db.scalar(select(Delivery).where(Delivery.webhook_id == key))
                     assert delivery is not None, "Acknowledged delivery missing"
+                    receipts[key] = as_utc(delivery.received_at)
                     if delivery.status == "processed":
                         assert delivery.processed_at is not None
                         orders = list(db.scalars(select(Order).where(Order.external_id == key)))
@@ -95,6 +99,7 @@ def run():
                                 Approval.subject_id == case.id, Approval.proposed_action == "send_reply")))
                             assert len(approvals) == 1 and approvals[0].status == "pending"
                             support_wait[key] = (as_utc(event.created_at) - as_utc(case.created_at)).total_seconds()
+                            end_to_end[key] = (as_utc(event.created_at) - receipts[key]).total_seconds()
             for key in ready_for_support:
                 body = {"message": "Where is my order?", "order_ref": "#" + key,
                         "email": "scheduled@example.test", "request_key": key}
@@ -104,6 +109,8 @@ def run():
                 replay = client.post("/api/support", json=body, headers=headers)
                 assert replay.status_code == 202 and replay.json()["case_id"] == response.json()["case_id"]
                 inquiries.add(key)
+            peak_orders = max(peak_orders, len(submitted) - len(order_wait))
+            peak_support = max(peak_support, len(inquiries) - len(support_wait))
             if len(order_wait) == COUNT and len(support_wait) == COUNT and exception_seen:
                 break
             time.sleep(2)
@@ -118,10 +125,13 @@ def run():
         "elapsed_seconds": round(elapsed, 3), "combined_completions_per_minute": round(2*COUNT*60/elapsed, 3),
         "network_ack_ms": {"p50": percentile_ms(ack, .5), "p95": percentile_ms(ack, .95)},
         "order_queue": timing(order_wait.values()), "support_queue": timing(support_wait.values()),
-        "delayed_exception_pending": exception_seen,
-        "scope": "low-rate synthetic Compose HTTP plus real scheduled n8n; not a saturation test or SLA"
+        "end_to_end": timing(end_to_end.values()), "peak_observed_order_backlog": peak_orders,
+        "peak_observed_support_backlog": peak_support, "delayed_exception_pending": exception_seen,
+        "scope": "12 paired synthetic items at 25-second order intervals, actual HTTP and n8n; not merchant capacity or SLA"
     }))
-    assert max(order_wait.values()) <= 120, "Four-order synthetic queue p95 exceeded 120 seconds"
+    assert percentile_ms(list(order_wait.values()), .95) <= 120, "Synthetic order queue p95 exceeded 120 seconds"
+    assert percentile_ms(list(support_wait.values()), .95) <= 120, "Synthetic support queue p95 exceeded 120 seconds"
+    assert percentile_ms(ack, .95) <= 500, "Synthetic HTTP acknowledgement p95 exceeded 500 ms"
 
 
 if __name__ == "__main__":

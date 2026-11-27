@@ -49,7 +49,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "http://api:8000/api/n8n/triage-next",
+        "url": "http://api:8000/api/n8n/triage-next?batch_size=3",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -96,9 +96,9 @@
     "saveDataSuccessExecution": "all",
     "timezone": "UTC"
   },
-  "versionId": "0c19d5b8-877b-4c7a-a191-4cfe6bde51b8",
+  "versionId": "3c4aa944-73fa-4c68-a6cf-6574dd961ffd",
   "meta": {
-    "description": "Every minute, process a durable support inquiry submitted through the operator form or authenticated API. The manual local trigger also drains one queued inquiry. It does not accept customer payloads. Replies always require human approval."
+    "description": "Every minute, process up to three due mock support inquiries with independent transactions. External AI mode stays single-item. Manual local trigger uses the same worker. No customer payload accepted by n8n; replies require human approval."
   },
   "tags": [],
   "id": "KUEMGUb4u6em38fm"
