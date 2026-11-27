@@ -15,10 +15,11 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 from app import main
 from app.config import settings
 from app.db import Base, engine, get_db
-from app.identity import manage_account
+from app.identity import manage_account, managed_login, session_account
 from app.models import Approval, Audit, Case, ActionExecution, ExecutionReconciliation, Delivery, Order, utcnow
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 PASSWORD = "synthetic-production-test-password"
 
@@ -180,6 +181,31 @@ def verify_recovery(sessions, worker, support, support_token, reviewer, reviewer
         settings.mock_action_ambiguous, settings.mock_action_failures, settings.retry_base_seconds = old_ambiguous, old_failures, old_delay
 
 
+def verify_mutation_revocation_order(sessions):
+    with sessions() as db:
+        manage_account(db, "ci-race-reviewer", "create", role="reviewer", password=PASSWORD)
+        _, token, wait = managed_login(db, "ci-race-reviewer", PASSWORD, "synthetic-race")
+        assert token and not wait
+    attempting = Event()
+    finished = Event()
+    def revoke():
+        with sessions() as db:
+            attempting.set()
+            manage_account(db, "ci-race-reviewer", "role", role="auditor")
+        finished.set()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with sessions() as db:
+            assert session_account(db, token, lock_mutation=True).role == "reviewer"
+            future = pool.submit(revoke)
+            assert attempting.wait(5)
+            assert not finished.wait(.3), "Revocation did not wait for in-flight authorized transaction"
+            db.commit()
+        future.result(timeout=10)
+    with sessions() as db:
+        assert session_account(db, token, lock_mutation=True) is None
+    print("PASS: revocation serialized with authorized mutation; stale session denied after commit")
+
+
 def run():
     if os.environ.get("POPIFY_CONFIRM_DISPOSABLE") != "1" or not settings.managed_identity or engine.dialect.name != "postgresql" or os.environ.get("POPIFY_ENV") != "production":
         raise RuntimeError("Requires explicit disposable PostgreSQL and production managed-identity configuration.")
@@ -210,6 +236,7 @@ def run():
             assert admin.post("/api/demo/order", data={"csrf_token": admin_token}).status_code == 404
             support = TestClient(main.app, base_url="https://testserver", follow_redirects=False)
             support_token = sign_in(support, "ci-support")
+            assert support.post("/support", headers={"Sec-Fetch-Site": "cross-site"}, data={"csrf_token": support_token, "message": "Synthetic blocked", "request_key": "cross-site"}).status_code == 403
             response = support.post("/support", data={"csrf_token": support_token, "message": "Where is my synthetic order?", "request_key": "production-identity-test"})
             assert response.status_code == 303
             worker = admin.post("/api/n8n/triage-next", headers={"X-N8N-Secret": settings.n8n_webhook_secret})
@@ -232,6 +259,7 @@ def run():
                 execution = db.scalar(select(ActionExecution).where(ActionExecution.idempotency_key == f"approval:{approval_id}"))
                 assert approval.actor == "ci-reviewer" and approval.status == "approved"
                 assert execution and execution.state == "succeeded"
+            verify_mutation_revocation_order(sessions)
             verify_delivery_batches(sessions)
             verify_support_batches(sessions)
             verify_recovery(sessions, admin, support, support_token, reviewer, reviewer_token)

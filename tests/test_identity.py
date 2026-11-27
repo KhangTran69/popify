@@ -169,3 +169,24 @@ def test_admin_mutation_rechecks_revoked_session(identity_db):
         db.rollback()
         account = db.scalar(select(OperatorAccount).where(OperatorAccount.username == "test-support"))
         assert account.active
+
+
+def test_managed_cross_site_form_denied_even_with_valid_token(identity_db):
+    from app.models import Case
+    client = TestClient(main.app, follow_redirects=False)
+    token = login(client, "support")
+    response = client.post("/support", headers={"Sec-Fetch-Site": "cross-site"},
+                           data={"csrf_token": token, "message": "Synthetic",
+                                 "request_key": "cross-site"})
+    assert response.status_code == 403
+    with identity_db() as db:
+        assert db.scalar(select(Case).where(Case.request_key == "cross-site")) is None
+
+
+def test_session_lookup_refreshes_role_and_revocation(identity_db):
+    with identity_db() as db:
+        _, token, wait = managed_login(db, "test-reviewer", PASSWORD, "synthetic-freshness")
+        assert not wait and session_account(db, token).role == "reviewer"
+        with identity_db() as other:
+            manage_account(other, "test-reviewer", "role", role="auditor")
+        assert session_account(db, token) is None

@@ -119,14 +119,31 @@ def managed_login(db, username, password, client_address, *, previous_token=None
     return account, token, 0
 
 
-def session_account(db, token, *, refresh=False):
+def session_account(db, token, *, refresh=False, lock_mutation=False):
+    """Resolve current identity in one snapshot; optionally lock through mutation commit.
+
+    Lock account before session, matching account-management order. Revalidate the
+    token after acquiring the account lock, because revocation may have won the race.
+    """
     if not isinstance(token, str) or not 32 <= len(token) <= 128 or not token.isascii():
         return None
-    session = db.get(OperatorSession, _digest(token), populate_existing=refresh)
-    if not session or _aware(session.expires_at) <= utcnow():
+    digest = _digest(token)
+    query = select(OperatorAccount).join(
+        OperatorSession, OperatorSession.account_id == OperatorAccount.id
+    ).where(OperatorSession.token_hash == digest, OperatorSession.expires_at > utcnow(),
+            OperatorAccount.active.is_(True)).execution_options(populate_existing=True)
+    account = db.scalar(query)
+    if account is None or not lock_mutation or db.get_bind().dialect.name != "postgresql":
+        return account
+    account = db.scalar(select(OperatorAccount).where(OperatorAccount.id == account.id)
+                        .with_for_update(read=True).execution_options(populate_existing=True))
+    if not account or not account.active:
         return None
-    account = db.get(OperatorAccount, session.account_id, populate_existing=refresh)
-    return account if account and account.active else None
+    session = db.scalar(select(OperatorSession).where(
+        OperatorSession.token_hash == digest, OperatorSession.account_id == account.id,
+        OperatorSession.expires_at > utcnow()
+    ).with_for_update(read=True).execution_options(populate_existing=True))
+    return account if session else None
 
 
 def revoke_session(db, token, account):

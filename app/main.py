@@ -206,7 +206,12 @@ async def block_live_integrations_in_preview(request: Request, call_next):
 
 def operator(request: Request, db: Session = Depends(get_db)):
     if settings.managed_identity and not settings.preview_mode:
-        account = session_account(db, request.session.get("identity_token"))
+        # Ordinary managed mutations hold account/session read locks through the
+        # business transaction. Account administration uses its own serialized
+        # revalidation instead, avoiding inverted account lock order.
+        lock_mutation = request.method in {"POST", "PUT", "PATCH", "DELETE"} and not (
+            request.url.path.startswith("/operators/") or request.url.path == "/logout")
+        account = session_account(db, request.session.get("identity_token"), lock_mutation=lock_mutation)
         if account:
             request.state.operator_account = account
             request.state.operator_role = account.role
@@ -244,6 +249,8 @@ def csrf(request):
 
 
 def verify_csrf(request, token):
+    if settings.managed_identity and request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        raise HTTPException(403, "Cross-site form submission denied")
     expected = request.session.get("csrf", "")
     if not expected or not secure_equal(expected, token):
         raise HTTPException(403, "invalid CSRF token")
