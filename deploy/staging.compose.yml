@@ -2,6 +2,7 @@
 services:
   api:
     ports: !reset []
+    networks: [data_plane, worker_plane, operator_plane]
     environment:
       POPIFY_ENV: production
       MANAGED_IDENTITY: "true"
@@ -15,11 +16,14 @@ services:
       MOCK_ACTION_AMBIGUOUS: "false"
     restart: unless-stopped
   n8n:
+    networks: [worker_plane]
     ports: !reset []
     restart: unless-stopped
   db:
+    networks: [data_plane]
     restart: unless-stopped
   operator-gateway:
+    networks: [operator_plane]
     image: nginx:1.28-alpine
     ports: ["127.0.0.1:8444:8443"]
     volumes:
@@ -28,3 +32,10 @@ services:
     depends_on:
       api: {condition: service_healthy}
     restart: unless-stopped
+
+networks:
+  data_plane:
+    internal: true
+  worker_plane:
+    internal: true
+  operator_plane: {}

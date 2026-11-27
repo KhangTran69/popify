@@ -4,6 +4,7 @@ import json
 import os
 import time
 from sqlalchemy import select
+from datetime import timedelta
 from app.db import SessionLocal
 from app.models import Delivery, Order, utcnow
 from app.services import audit, as_utc
@@ -26,7 +27,9 @@ def run():
                 raise RuntimeError("Fixture already exists; use a fresh disposable stack")
             now = utcnow()
             delivery = Delivery(webhook_id=key, topic="orders/create", shop_domain="demo.myshopify.com",
-                payload={"id": key, "name": "#OUTAGE-CHECK", "created_at": now.isoformat(),
+                payload={"id": key, "name": "#N8N-RESTORE" if key == "ci-n8n-restored-volume" else "#OUTAGE-CHECK",
+                         "email": "restore@example.test",
+                         "created_at": (now - timedelta(hours=72) if key == "ci-n8n-restored-volume" else now).isoformat(),
                          "updated_at": now.isoformat()}, status="received")
             db.add(delivery)
             db.flush()

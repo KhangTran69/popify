@@ -7,7 +7,7 @@ Before handing over, record the exact revision and CI run, image versions, appro
 
 ## Start and verify
 1. Review the PR and require every exact-head CI job to pass. Review migration changes and dependency updates; do not merge automatically.
-2. Follow OPERATIONS.md to provision unique secrets and the private TLS profile. Keep API, n8n and PostgreSQL ports private. Use the trusted CLI to provision separate operator accounts. The staging profile remains mock-only.
+2. Follow OPERATIONS.md to provision unique secrets and the private TLS profile. Keep API, n8n and PostgreSQL ports private and confirm the separate data, worker and operator networks. Use the trusted CLI to provision separate operator accounts. The staging profile remains mock-only.
 3. Verify /live, /ready, signed-intake boundary (disposable environment only), managed login/role permissions, session revocation, and the Operations screen. Confirm actual scheduled worker polls, no unresolved queue failures, and no external provider calls.
 4. Configure the approved scheduler and local alert outbox; test opened, reminder and resolved notifications with the approved relay, deduplicating event IDs. Confirm escalation on monitor unavailability or a full outbox. Do not mark alert delivery verified based solely on local output.
 

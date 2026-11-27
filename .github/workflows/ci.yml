@@ -218,6 +218,25 @@ jobs:
             bindings=$(docker inspect --format '{{json .HostConfig.PortBindings}}' "$id")
             test "$bindings" = '{}' || test "$bindings" = 'null'
           done
+      - name: Verify private staging network separation
+        run: |
+          for service in db n8n operator-gateway; do
+            id=$(docker compose -f docker-compose.yml -f deploy/staging.compose.yml ps -q "$service")
+            docker inspect --format '{{json .NetworkSettings.Networks}}' "$id" > "$RUNNER_TEMP/$service.network.json"
+          done
+          id=$(docker compose -f docker-compose.yml -f deploy/staging.compose.yml ps -q api)
+          docker inspect --format '{{json .NetworkSettings.Networks}}' "$id" > "$RUNNER_TEMP/api.network.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          networks = {name: set(json.loads((root / (name + ".network.json")).read_text())) for name in ("api","db","n8n","operator-gateway")}
+          peers = [networks[name] for name in ("db","n8n","operator-gateway")]
+          assert all(len(peer) == 1 for peer in peers)
+          assert len(set.union(*peers)) == 3 and networks["api"] == set.union(*peers)
+          print("PASS: database, worker and operator network membership isolated; API is sole shared service")
+          PY
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T n8n node -e 'const dns=require("node:dns").promises; (async()=>{await dns.lookup("api");try{await dns.lookup("db")}catch(e){if(e.code==="ENOTFOUND"||e.code==="EAI_AGAIN")return;throw e}throw Error("database resolved from worker network")})().catch(()=>process.exit(1))'
       - name: Provision synthetic accounts
         run: |
           docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'

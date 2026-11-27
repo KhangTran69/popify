@@ -54,5 +54,6 @@ restored_id=$(docker compose ps -q n8n)
 actual=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.n8n"}}{{.Name}}{{end}}{{end}}' "$restored_id")
 [[ "$actual" == "$volume" ]]
 docker compose exec -T api python -m scripts.verify_outage recovered --key ci-n8n-restored-volume --confirm-disposable
+docker compose exec -T api python -m scripts.verify_restored_workflows --confirm-disposable
 [[ "$(digest "$source")" == "$original" ]]
 echo "PASS: encrypted n8n state recovered onto a separate volume; actual scheduled processing resumed; source unchanged; elapsed_seconds=$(($(date +%s)-started))"
