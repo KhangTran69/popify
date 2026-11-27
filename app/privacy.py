@@ -34,6 +34,12 @@ def minimized_order_payload(payload):
 def valid_text_fields(*values):
     """Accept database-safe text without silently rewriting signed or idempotent data."""
     try:
-        return all(value is None or ("\x00" not in value and bool(value.encode("utf-8", errors="strict") or value == "")) for value in values)
+        for value in values:
+            if value is None:
+                continue
+            if not isinstance(value, str) or "\x00" in value:
+                return False
+            value.encode("utf-8", errors="strict")
+        return True
     except (UnicodeError, TypeError, AttributeError):
         return False

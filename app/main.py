@@ -161,6 +161,8 @@ async def lifespan(app):
             raise RuntimeError(
                 "Production values are too short for: " + ", ".join(weak)
             )
+        if len(set(required.values())) != len(required):
+            raise RuntimeError("Production application, worker and n8n encryption secrets must be distinct.")
         if os.environ.get("COOKIE_SECURE", "false").lower() != "true":
             raise RuntimeError("COOKIE_SECURE=true is required in production.")
     with engine.connect() as connection:
@@ -1975,6 +1977,12 @@ async def request_log(request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Cache-Control"] = "no-store"
+    if settings.managed_identity and os.environ.get("POPIFY_ENV", "production").lower() == "production":
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     log.info(
         json.dumps(
             {

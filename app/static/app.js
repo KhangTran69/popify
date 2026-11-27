@@ -25,3 +25,8 @@ if (runPage) {
     if (!editing && !submitting && document.visibilityState === 'visible') location.reload();
   }, 5000);
 }
+
+// Keep production scripts compatible with a strict same-origin Content Security Policy.
+document.addEventListener('click', event => {
+  if (event.target.closest('[data-refresh-page]')) location.reload();
+});

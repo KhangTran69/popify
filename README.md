@@ -287,6 +287,8 @@ Managed administrators can use the operator accounts screen to inspect roles and
 
 See [Operations and recovery runbook](docs/OPERATIONS.md) for readiness, protected metrics, privacy and restoration procedures.
 
+For a private, mock-only staging configuration, see the staging profile in [the operations runbook](docs/OPERATIONS.md). It is separate from the local demonstration and does not enable live integrations.
+
 ## Production-readiness boundary
 
 PoPify is a single-store portfolio demonstration. Its operator login uses one configured username/password, a signed session cookie, CSRF protection, and login rate limiting; managed identity mode provides individual accounts, roles and revocable sessions. MFA and SSO are not implemented. Worker events and failures appear in application audit history, but the protected operations endpoint provides queue and worker summaries; a centralized metrics backend, alerts and formal service objectives are still required. Docker named volumes preserve data across restarts, but the project has no scheduled offsite backup or tested point-in-time restore process.

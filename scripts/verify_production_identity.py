@@ -54,7 +54,10 @@ def run():
                     manage_account(db, "ci-" + role, "create", role=role, password=PASSWORD)
             assert admin.get("/ready").status_code == 200
             admin_token = sign_in(admin, "ci-admin")
-            assert admin.get("/operators").status_code == 200
+            operators = admin.get("/operators")
+            assert operators.status_code == 200
+            assert "script-src 'self'" in operators.headers["Content-Security-Policy"]
+            assert "unsafe-inline" not in operators.headers["Content-Security-Policy"]
             assert admin.get("/docs").status_code == 404
             assert admin.get("/demo").status_code == 404
             assert admin.post("/api/demo/order", data={"csrf_token": admin_token}).status_code == 404

@@ -151,3 +151,49 @@ jobs:
           name: accessibility-report
           path: accessibility-report.json
           if-no-files-found: ignore
+
+  private-staging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Configure disposable mock-only staging
+        run: |
+          cp .env.example .env
+          python - <<'PY'
+          from pathlib import Path
+          from secrets import token_hex
+          p = Path(".env")
+          keys = {"POSTGRES_PASSWORD", "APP_SECRET", "N8N_WEBHOOK_SECRET", "N8N_ENCRYPTION_KEY"}
+          lines = p.read_text().splitlines()
+          p.write_text("\n".join(line.split("=", 1)[0] + "=" + token_hex(32) if line.split("=", 1)[0] in keys else line for line in lines) + "\n")
+          PY
+          mkdir -m 700 "$RUNNER_TEMP/popify-tls"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout "$RUNNER_TEMP/popify-tls/tls.key" -out "$RUNNER_TEMP/popify-tls/tls.crt" >/dev/null 2>&1
+          echo "POPIFY_STAGING_TLS_DIR=$RUNNER_TEMP/popify-tls" >> "$GITHUB_ENV"
+      - name: Start private mock-only staging
+        run: docker compose -f docker-compose.yml -f deploy/staging.compose.yml up --build --detach --wait --wait-timeout 240
+      - name: Verify no API, n8n or database host ports
+        run: |
+          for service in api n8n db; do
+            id=$(docker compose -f docker-compose.yml -f deploy/staging.compose.yml ps -q "$service")
+            bindings=$(docker inspect --format '{{json .HostConfig.PortBindings}}' "$id")
+            test "$bindings" = '{}' || test "$bindings" = 'null'
+          done
+      - name: Provision synthetic accounts
+        run: |
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'
+          from app.db import SessionLocal
+          from app.identity import manage_account
+          with SessionLocal() as db:
+              for role in ("admin", "auditor"):
+                  manage_account(db, "ci-staging-" + role, "create", role=role, password="synthetic-staging-test-password")
+          PY
+      - name: Validate actual HTTPS identity and route isolation
+        run: python -m scripts.verify_staging --ca "$POPIFY_STAGING_TLS_DIR/tls.crt" --confirm-disposable
+      - name: Clean disposable staging
+        if: always()
+        run: docker compose -f docker-compose.yml -f deploy/staging.compose.yml down --volumes --remove-orphans

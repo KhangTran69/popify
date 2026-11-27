@@ -4,7 +4,7 @@
   <a class="back" href="{{ back_url }}">← Back to {{ 'guided run' if back_url.startswith('/demo/') else 'queue' }}</a>
   <div class="headline">
     <div><div class="eyebrow">{{ kind|upper }} RECORD · MOCK MODE</div><h1>{{ title }}</h1><p class="sub">Recorded facts, human decisions, and a traceable outcome.</p></div>
-    <button class="secondary" type="button" onclick="location.reload()">Refresh status ↻</button>
+    <button class="secondary" type="button" data-refresh-page>Refresh status ↻</button>
   </div>
   <section class="notice {{ record_guidance.tone }} record-guidance" aria-labelledby="record-guidance-title">
     <span class="eyebrow">CURRENT STATE · PERSISTED RECORD</span>
