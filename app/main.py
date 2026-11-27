@@ -1933,7 +1933,23 @@ async def request_log(request, call_next):
     correlation = str(uuid.uuid4())
     started = time.monotonic()
     request.state.correlation_id = correlation
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        if not settings.managed_identity or os.environ.get("POPIFY_ENV", "production").lower() != "production":
+            raise
+        # Do not let production ASGI exception logging expose request values,
+        # SQL parameters or integration payloads. Preserve type and trace ID.
+        log.error(json.dumps({"event": "unexpected_request_failure", "correlation_id": correlation,
+                             "error_type": type(exc).__name__}))
+        message = "The request could not be completed. Check its recorded state before retrying."
+        if not request.url.path.startswith(("/api/", "/webhooks/")) and "text/html" in request.headers.get("accept", ""):
+            response = templates.TemplateResponse(request, "error.html", {
+                "request": request, "title": "Request unavailable", "message": message,
+                "actor": None, "correlation_id": correlation,
+            }, status_code=500)
+        else:
+            response = JSONResponse({"detail": message}, status_code=500)
     response.headers["X-Correlation-ID"] = correlation
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"

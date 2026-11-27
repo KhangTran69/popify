@@ -193,3 +193,17 @@ def test_invalid_support_text_rejected_before_database(boundary_client, monkeypa
     monkeypatch.setattr(settings, "n8n_webhook_secret", "synthetic-secret")
     response = boundary_client.post("/api/support", json={"message": "invalid\x00text"}, headers={"X-N8N-Secret": "synthetic-secret"})
     assert response.status_code == 422
+
+
+def test_production_unexpected_failure_is_sanitized(boundary_client, monkeypatch, caplog):
+    monkeypatch.setattr(settings, "managed_identity", True)
+    monkeypatch.setenv("POPIFY_ENV", "production")
+    def broken():
+        raise RuntimeError("private synthetic payload must never appear")
+    monkeypatch.setitem(main.app.dependency_overrides, get_db, broken)
+    response = boundary_client.get("/api/ops/status")
+    assert response.status_code == 500
+    assert response.headers["x-correlation-id"] and response.headers["cache-control"] == "no-store"
+    assert "private synthetic payload" not in response.text
+    assert "private synthetic payload" not in caplog.text
+    assert "unexpected_request_failure" in caplog.text

@@ -123,6 +123,7 @@ def process_delivery(db: Session, delivery_id: int):
         return {"status": "exhausted"}
     if delivery.next_attempt_at and as_utc(delivery.next_attempt_at) > utcnow():
         return {"status": "deferred"}
+    attempts_before = delivery.attempts
     delivery.attempts += 1
     try:
         data = normalize_order(delivery.payload, delivery.shop_domain)
@@ -198,8 +199,14 @@ def process_delivery(db: Session, delivery_id: int):
         delivery = db.scalar(
             select(Delivery).where(Delivery.id == delivery_id).with_for_update()
         )
-        if delivery.status == "processed":
+        if not delivery or delivery.status == "processed":
             return {"status": "duplicate"}
+        # Rollback releases the row lock. A competing worker can finish or
+        # schedule a retry before we reacquire it; never consume its attempt.
+        if delivery.status == "exhausted":
+            return {"status": "exhausted"}
+        if delivery.attempts != attempts_before or (delivery.next_attempt_at and as_utc(delivery.next_attempt_at) > utcnow()):
+            return {"status": "deferred"}
         delivery.attempts += 1
         delivery.status = (
             "exhausted"

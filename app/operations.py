@@ -76,18 +76,28 @@ def queue_summary(db):
     ]:
         due = or_(model.next_attempt_at.is_(None), model.next_attempt_at <= now)
         eligible_since = case((model.next_attempt_at > timestamp, model.next_attempt_at), else_=timestamp)
-        total, oldest = db.execute(select(func.count(), func.min(timestamp)).where(pending)).one()
-        due_count, oldest_due = db.execute(select(func.count(), func.min(eligible_since)).where(pending, due)).one()
+        # One statement per queue gives a consistent count/age snapshot under
+        # PostgreSQL READ COMMITTED, including concurrent enqueue and drain.
+        total, oldest, due_count, oldest_due, exhausted_count = db.execute(select(
+            func.count().filter(pending),
+            func.min(timestamp).filter(pending),
+            func.count().filter(pending, due),
+            func.min(eligible_since).filter(pending, due),
+            func.count().filter(exhausted),
+        ).select_from(model)).one()
         result[label] = {
             "queued": total,
             "oldest_seconds": max(0, int((now - as_utc(oldest)).total_seconds())) if oldest else None,
             "due": due_count,
             "scheduled": total - due_count,
             "oldest_due_seconds": max(0, int((now - as_utc(oldest_due)).total_seconds())) if oldest_due else None,
-            "exhausted": db.scalar(select(func.count()).select_from(model).where(exhausted)) or 0,
+            "exhausted": exhausted_count,
         }
     result["uncertain_actions"] = db.scalar(select(func.count()).select_from(Approval).where(
         Approval.execution_status.in_(["ambiguous", "disputed", "blocked_prior_outcome"]))) or 0
+    pending_count, oldest_pending = db.execute(select(func.count(), func.min(Approval.created_at)).where(
+        Approval.status == "pending", Approval.replacement_approval_id.is_(None))).one()
+    result["pending_review"] = {"count": pending_count, "oldest_seconds": max(0, int((now - as_utc(oldest_pending)).total_seconds())) if oldest_pending else None}
     return result
 
 
@@ -116,5 +126,5 @@ def operational_snapshot(db, *, preview=False):
     if queues["uncertain_actions"]:
         alert("uncertain_actions", "critical", "Provider outcome requires reconciliation.",
               "Inspect saved evidence; never blindly replay an uncertain action.")
-    return {"mode": "isolated_preview" if preview else "mock_actions", "queues": queues, "workers": workers,
+    return {"observed_at": utcnow().isoformat(), "mode": "isolated_preview" if preview else "mock_actions", "queues": queues, "workers": workers,
             "alerts": alerts, "status": "attention" if alerts else "healthy"}

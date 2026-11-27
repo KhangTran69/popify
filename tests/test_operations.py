@@ -21,6 +21,7 @@ def test_due_scheduled_exhausted_and_uncertain_are_distinct():
                      status="approved", execution_status="ambiguous"),
             Approval(kind="support", subject_type="case", subject_id=2, proposed_action="send_reply",
                      status="approved", execution_status="disputed"),
+            Approval(kind="support", subject_type="case", subject_id=3, proposed_action="send_reply", status="pending"),
             Audit(entity_type="workflow", entity_id=1, event="work_failed", correlation_id="synthetic"),
             Audit(entity_type="workflow", entity_id=2, event="poll_completed", correlation_id="synthetic"),
         ])
@@ -31,6 +32,8 @@ def test_due_scheduled_exhausted_and_uncertain_are_distinct():
         assert 150 <= orders["oldest_due_seconds"] < 160
         assert result["queues"]["support"]["exhausted"] == 1
         assert result["queues"]["uncertain_actions"] == 2
+        assert result["queues"]["pending_review"]["count"] == 1
+        assert result["observed_at"]
         assert {a["code"] for a in result["alerts"]} == {
             "orders_overdue", "support_exhausted", "uncertain_actions", "worker_1_failed", "worker_3_stale"}
         assert all(w["state"] == "disabled" for w in operational_snapshot(db, preview=True)["workers"])
