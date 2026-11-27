@@ -18,7 +18,7 @@ from app.db import Base, engine, get_db
 from app.config import settings
 from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integration_secret
 from app.identity import managed_login, session_account, revoke_session
-from app.models import OperatorAccount
+from app.models import OperatorAccount, OperatorSession, LoginBucket
 from app.privacy import minimized_order_payload
 from app.operations import queue_summary
 from app.models import (
@@ -276,6 +276,8 @@ def readiness(db: Session = Depends(get_db)):
     try:
         db.execute(select(Order.id).limit(1))
         if settings.managed_identity and not settings.preview_mode:
+            db.execute(select(OperatorSession.token_hash).limit(1))
+            db.execute(select(LoginBucket.key).limit(1))
             if not db.scalar(select(OperatorAccount.id).where(OperatorAccount.active.is_(True), OperatorAccount.role == "admin").limit(1)):
                 return JSONResponse({"status": "not_ready"}, status_code=503)
     except Exception:

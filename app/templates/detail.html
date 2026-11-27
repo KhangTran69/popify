@@ -1,6 +1,6 @@
 {% extends 'base.html' %}
 {% block content %}
-<main id="main" class="wrap">
+<main id="main" tabindex="-1" class="wrap">
   <a class="back" href="{{ back_url }}">← Back to {{ 'guided run' if back_url.startswith('/demo/') else 'queue' }}</a>
   <div class="headline">
     <div><div class="eyebrow">{{ kind|upper }} RECORD · MOCK MODE</div><h1>{{ title }}</h1><p class="sub">Recorded facts, human decisions, and a traceable outcome.</p></div>

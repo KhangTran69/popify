@@ -103,3 +103,20 @@ def test_shared_login_budget_and_revocation(identity_db):
         assert session_account(db, token).username == "test-support"
         manage_account(db, "test-support", "disable")
         assert session_account(db, token) is None
+
+
+def test_authenticated_operations_and_role_ui(identity_db):
+    client = TestClient(main.app, follow_redirects=False)
+    login(client, "auditor")
+    response = client.get("/api/ops/status")
+    assert response.status_code == 200
+    assert response.json()["queues"]["orders"]["queued"] == 0
+    assert all(not worker["recent_poll"] for worker in response.json()["workers"])
+    page = client.get("/")
+    assert page.status_code == 200
+    assert 'action="/api/demo/order"' not in page.text
+    assert 'href="/support"' not in page.text
+    assert client.get("/ready").status_code == 200
+    with identity_db() as db:
+        manage_account(db, "test-admin", "disable")
+    assert client.get("/ready").status_code == 503

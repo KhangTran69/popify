@@ -134,3 +134,30 @@ def test_stale_operator_session_is_rejected(boundary_client, monkeypatch):
     }).status_code == 303
     monkeypatch.setattr(settings, "operator_username", "replacement-operator")
     assert client.get("/support").status_code == 401
+
+
+def test_body_timeout_and_capacity_rejection(monkeypatch):
+    import app.security as security
+    responses = []
+    async def receive():
+        await asyncio.sleep(1)
+        return {"type": "http.request", "body": b"x", "more_body": False}
+    async def send(message):
+        responses.append(message)
+    async def downstream(scope, receive, send):
+        raise AssertionError("Rejected request reached downstream")
+    scope = {"type": "http", "method": "POST", "path": "/login", "headers": []}
+    middleware = RequestBodyLimitMiddleware(downstream)
+    monkeypatch.setattr(security, "BODY_TIMEOUT_SECONDS", 0.001)
+    asyncio.run(middleware(scope, receive, send))
+    assert responses[0]["status"] == 408
+    responses.clear()
+    for _ in range(security.MAX_CONCURRENT_MUTATIONS):
+        assert middleware._slots.acquire(blocking=False)
+    try:
+        asyncio.run(middleware(scope, receive, send))
+        assert responses[0]["status"] == 503
+        assert (b"retry-after", b"1") in responses[0]["headers"]
+    finally:
+        for _ in range(security.MAX_CONCURRENT_MUTATIONS):
+            middleware._slots.release()

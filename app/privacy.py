@@ -21,6 +21,7 @@ def minimized_order_payload(payload):
                 raise ValueError("Invalid order field")
             if isinstance(value, float) and not math.isfinite(value):
                 raise ValueError("Invalid order number")
+            str(value).encode("utf-8", errors="strict")
             if len(str(value)) > limit or "\x00" in str(value):
                 raise ValueError("Invalid order field")
             # These fields are consumed as strings by the database or timestamp parser.

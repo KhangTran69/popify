@@ -32,6 +32,7 @@ services:
       N8N_PORT: 5678
       N8N_PROTOCOL: http
       N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_UNVERIFIED_PACKAGES_ENABLED: "false"
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       N8N_WEBHOOK_SECRET: ${N8N_WEBHOOK_SECRET}
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
@@ -40,7 +41,7 @@ services:
     volumes: ["n8n_data:/home/node/.n8n", "./workflows:/workflows:ro", "./scripts:/commerceops-scripts:ro"]
     depends_on: [api]
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch(\"http://127.0.0.1:5678/healthz\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch(\"http://127.0.0.1:5678/healthz/readiness\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 5

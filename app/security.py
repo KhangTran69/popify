@@ -1,11 +1,15 @@
 """Request boundary protections shared by the operator and integration APIs."""
 
+import asyncio
 import secrets
+import threading
 
 from starlette.responses import JSONResponse
 
 WEBHOOK_BODY_LIMIT = 1_000_000
 FORM_API_BODY_LIMIT = 128 * 1024
+MAX_CONCURRENT_MUTATIONS = 64
+BODY_TIMEOUT_SECONDS = 15
 
 
 def secure_equal(left: str, right: str) -> bool:
@@ -25,6 +29,7 @@ class RequestBodyLimitMiddleware:
 
     def __init__(self, app):
         self.app = app
+        self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_MUTATIONS)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] not in {
@@ -32,6 +37,15 @@ class RequestBodyLimitMiddleware:
         }:
             return await self.app(scope, receive, send)
 
+        if not self._slots.acquire(blocking=False):
+            return await JSONResponse({"detail": "Service busy; retry later"}, status_code=503,
+                                      headers={"Retry-After": "1"})(scope, receive, send)
+        try:
+            return await self._bounded_request(scope, receive, send)
+        finally:
+            self._slots.release()
+
+    async def _bounded_request(self, scope, receive, send):
         limit = (
             WEBHOOK_BODY_LIMIT
             if scope["path"] == "/webhooks/shopify/orders"
@@ -52,18 +66,22 @@ class RequestBodyLimitMiddleware:
                 return await reject(413, "Request body exceeds the allowed size")
 
         body = bytearray()
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                return
-            if message["type"] != "http.request":
-                continue
-            chunk = message.get("body", b"")
-            if len(body) + len(chunk) > limit:
-                return await reject(413, "Request body exceeds the allowed size")
-            body.extend(chunk)
-            if not message.get("more_body", False):
-                break
+        try:
+            async with asyncio.timeout(BODY_TIMEOUT_SECONDS):
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
+                    if message["type"] != "http.request":
+                        continue
+                    chunk = message.get("body", b"")
+                    if len(body) + len(chunk) > limit:
+                        return await reject(413, "Request body exceeds the allowed size")
+                    body.extend(chunk)
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            return await reject(408, "Request body timed out")
 
         # Replay the exact bytes; signed webhook verification must see the original body.
         buffered = bytes(body)
