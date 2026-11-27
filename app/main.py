@@ -1526,9 +1526,13 @@ def preview_run(
     return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 
 
+async def webhook_body(request: Request):
+    return await request.body()
+
+
 @app.post("/webhooks/shopify/orders")
-async def shopify_order(request: Request, db: Session = Depends(get_db)):
-    raw = await request.body()
+def shopify_order(request: Request, raw: bytes = Depends(webhook_body), db: Session = Depends(get_db)):
+    # Database operations run in the sync worker pool, not on the ASGI event loop.
     if not verify_shopify(raw, request.headers.get("x-shopify-hmac-sha256")):
         raise HTTPException(401, "invalid webhook signature")
     try:

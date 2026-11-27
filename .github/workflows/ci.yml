@@ -2,7 +2,9 @@ name: CommerceOps checks
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -117,8 +119,10 @@ jobs:
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 200
       - name: Seed synthetic managed identity for restore verification
         run: docker compose exec -T api python -m scripts.seed_restore_identity --confirm-disposable
-      - name: Verify disposable PostgreSQL backup restoration
-        run: docker compose exec -T -e POPIFY_CONFIRM_DISPOSABLE=1 db sh -s < scripts/verify_restore.sh
+      - name: Verify encrypted disposable PostgreSQL backup restoration
+        env:
+          POPIFY_CONFIRM_DISPOSABLE: "1"
+        run: bash scripts/verify_encrypted_restore.sh
       - name: Show service logs on failure and clean up
         if: always()
         run: |

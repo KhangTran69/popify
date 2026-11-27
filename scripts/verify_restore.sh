@@ -16,7 +16,11 @@ trap cleanup EXIT
 started=$(date +%s)
 createdb -U "$user" "$target"
 created=1
-pg_dump -U "$user" -d "$source_db" -Fc -f "$work/backup.dump"
+if [ "${POPIFY_RESTORE_FROM_STDIN:-}" = 1 ]; then
+  cat > "$work/backup.dump"
+else
+  pg_dump -U "$user" -d "$source_db" -Fc -f "$work/backup.dump"
+fi
 pg_restore -U "$user" --exit-on-error -d "$target" "$work/backup.dump"
 # The CI source is quiescent apart from workflow heartbeat rows. Compare business data.
 for table in orders deliveries support_cases approvals action_executions execution_reconciliations audit_events operator_accounts; do

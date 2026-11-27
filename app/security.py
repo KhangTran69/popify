@@ -9,6 +9,7 @@ from starlette.responses import JSONResponse
 WEBHOOK_BODY_LIMIT = 1_000_000
 FORM_API_BODY_LIMIT = 128 * 1024
 MAX_CONCURRENT_MUTATIONS = 64
+MAX_CONCURRENT_LOGINS = 4
 BODY_TIMEOUT_SECONDS = 15
 
 
@@ -32,6 +33,7 @@ class RequestBodyLimitMiddleware:
     def __init__(self, app):
         self.app = app
         self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_MUTATIONS)
+        self._login_slots = threading.BoundedSemaphore(MAX_CONCURRENT_LOGINS)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] not in {
@@ -39,13 +41,21 @@ class RequestBodyLimitMiddleware:
         }:
             return await self.app(scope, receive, send)
 
-        if not self._slots.acquire(blocking=False):
-            return await JSONResponse({"detail": "Service busy; retry later"}, status_code=503,
+        login = scope["path"] == "/login"
+        if login and not self._login_slots.acquire(blocking=False):
+            return await JSONResponse({"detail": "Sign-in service busy; retry later"}, status_code=503,
                                       headers={"Retry-After": "1"})(scope, receive, send)
         try:
-            return await self._bounded_request(scope, receive, send)
+            if not self._slots.acquire(blocking=False):
+                return await JSONResponse({"detail": "Service busy; retry later"}, status_code=503,
+                                          headers={"Retry-After": "1"})(scope, receive, send)
+            try:
+                return await self._bounded_request(scope, receive, send)
+            finally:
+                self._slots.release()
         finally:
-            self._slots.release()
+            if login:
+                self._login_slots.release()
 
     async def _bounded_request(self, scope, receive, send):
         limit = (

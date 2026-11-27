@@ -161,3 +161,35 @@ def test_body_timeout_and_capacity_rejection(monkeypatch):
     finally:
         for _ in range(security.MAX_CONCURRENT_MUTATIONS):
             middleware._slots.release()
+
+
+def test_login_capacity_preserves_other_mutations():
+    from app.security import MAX_CONCURRENT_LOGINS
+    responses = []
+    async def receive():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+    async def send(message):
+        responses.append(message)
+    async def downstream(scope, receive, send):
+        assert (await receive())["body"] == b"{}"
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+    middleware = RequestBodyLimitMiddleware(downstream)
+    for _ in range(MAX_CONCURRENT_LOGINS):
+        assert middleware._login_slots.acquire(blocking=False)
+    try:
+        scope = {"type": "http", "method": "POST", "path": "/login", "headers": []}
+        asyncio.run(middleware(scope, receive, send))
+        assert responses[0]["status"] == 503
+        responses.clear()
+        asyncio.run(middleware({**scope, "path": "/webhooks/shopify/orders"}, receive, send))
+        assert responses[0]["status"] == 204
+    finally:
+        for _ in range(MAX_CONCURRENT_LOGINS):
+            middleware._login_slots.release()
+
+
+def test_invalid_support_text_rejected_before_database(boundary_client, monkeypatch):
+    monkeypatch.setattr(settings, "n8n_webhook_secret", "synthetic-secret")
+    response = boundary_client.post("/api/support", json={"message": "invalid\x00text"}, headers={"X-N8N-Secret": "synthetic-secret"})
+    assert response.status_code == 422
