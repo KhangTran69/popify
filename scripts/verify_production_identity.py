@@ -8,13 +8,15 @@ import re
 import uuid
 import time
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 from app import main
 from app.config import settings
-from app.db import Base, engine, get_db
+from app.db import engine, get_db
+from app.schema import migration_paths
+from scripts.migrate import migrate
 from app.identity import manage_account, managed_login, session_account
 from app.models import Approval, Audit, Case, ActionExecution, ExecutionReconciliation, Delivery, Order, utcnow
 from datetime import timedelta
@@ -40,7 +42,7 @@ def sign_in(client, username):
 def verify_delivery_batches(sessions):
     """Competing HTTP batch calls must preserve per-delivery transaction boundaries."""
     now = utcnow()
-    keys = [f"production-batch-{i}" for i in range(5)]
+    keys = [f"production-batch-{i}" for i in range(9)]
     with sessions() as db:
         for key in keys:
             db.add(Delivery(webhook_id=key, topic="orders/create", shop_domain="demo.myshopify.com",
@@ -52,7 +54,7 @@ def verify_delivery_batches(sessions):
     def poll():
         client = TestClient(main.app, base_url="https://testserver", follow_redirects=False)
         try:
-            response = client.post("/api/n8n/process-next?batch_size=3", headers={"X-N8N-Secret": settings.n8n_webhook_secret})
+            response = client.post("/api/n8n/process-next?batch_size=5", headers={"X-N8N-Secret": settings.n8n_webhook_secret})
             assert response.status_code == 200
             return response.json()["outcomes"]["processed"]
         finally:
@@ -66,11 +68,11 @@ def verify_delivery_batches(sessions):
         assert all(d.status == "processed" and d.attempts == 1 for d in deliveries)
         future = db.scalar(select(Delivery).where(Delivery.webhook_id == "production-batch-future"))
         assert future.status == "failed" and future.attempts == 1
-    print("PASS: competing bounded batch requests persisted five orders exactly once and skipped scheduled retry")
+    print("PASS: competing bounded batch requests persisted nine orders exactly once at five-item limit and skipped scheduled retry")
 
 
 def verify_support_batches(sessions):
-    keys = [f"production-support-batch-{i}" for i in range(5)]
+    keys = [f"production-support-batch-{i}" for i in range(9)]
     with sessions() as db:
         for key in keys:
             db.add(Case(request_key=key, correlation_id=key, message="Synthetic inquiry", status="queued"))
@@ -80,22 +82,22 @@ def verify_support_batches(sessions):
     def poll():
         client = TestClient(main.app, base_url="https://testserver", follow_redirects=False)
         try:
-            response = client.post("/api/n8n/triage-next?batch_size=3", headers={"X-N8N-Secret": settings.n8n_webhook_secret})
+            response = client.post("/api/n8n/triage-next?batch_size=5", headers={"X-N8N-Secret": settings.n8n_webhook_secret})
             assert response.status_code == 200
             return response.json()["outcomes"]["needs_review"]
         finally:
             client.close()
     with ThreadPoolExecutor(max_workers=2) as pool:
-        assert sum(pool.map(lambda _: poll(), range(2))) == 5
+        assert sum(pool.map(lambda _: poll(), range(2))) == len(keys)
     with sessions() as db:
         cases = list(db.scalars(select(Case).where(Case.request_key.in_(keys))))
-        assert len(cases) == 5 and all(c.status == "needs_review" and c.attempts == 1 for c in cases)
+        assert len(cases) == len(keys) and all(c.status == "needs_review" and c.attempts == 1 for c in cases)
         for case in cases:
             approvals = list(db.scalars(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id)))
             assert len(approvals) == 1 and approvals[0].status == "pending"
         future = db.scalar(select(Case).where(Case.request_key == "production-support-future"))
         assert future.status == "failed" and future.attempts == 1
-    print("PASS: competing support batches created five pending approvals exactly once and skipped future retry")
+    print("PASS: competing support batches created nine pending approvals exactly once at five-item limit and skipped future retry")
 
 
 def verify_recovery(sessions, worker, support, support_token, reviewer, reviewer_token):
@@ -219,13 +221,23 @@ def run():
             yield db
     main.app.dependency_overrides[get_db] = override
     try:
-        Base.metadata.create_all(isolated)
+        migrate(isolated)
         with TestClient(main.app, base_url="https://testserver", follow_redirects=False) as admin:
             assert admin.get("/ready").status_code == 503
             with sessions() as db:
                 for role in ("admin", "support", "reviewer", "auditor"):
                     manage_account(db, "ci-" + role, "create", role=role, password=PASSWORD)
             assert admin.get("/ready").status_code == 200
+            latest = migration_paths()[-1].name
+            with sessions() as db:
+                db.execute(text("DELETE FROM schema_migrations WHERE version=:v"), {"v":latest})
+                db.commit()
+            assert admin.get("/ready").status_code == 503
+            with sessions() as db:
+                db.execute(text("INSERT INTO schema_migrations(version) VALUES (:v)"), {"v":latest})
+                db.commit()
+            assert admin.get("/ready").status_code == 200
+            print("PASS: managed readiness rejects missing migration ledger entry on actual migrated schema")
             admin_token = sign_in(admin, "ci-admin")
             operators = admin.get("/operators")
             assert operators.status_code == 200

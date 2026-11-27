@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, text
 from app.config import settings
 from app.db import engine
 from scripts.migrate import migrate
+from app.schema import ledger_is_current
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations" / "versions"
 
@@ -125,6 +126,26 @@ def run():
             versions = connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").scalars().all()
             assert versions == [migration.name for migration in migrations]
             assert connection.exec_driver_sql("SELECT count(*) FROM operator_accounts").scalar_one() == 0
+        with concurrent.begin() as connection:
+            assert ledger_is_current(connection)
+            connection.execute(text("INSERT INTO schema_migrations(version) VALUES ('9999_future.sql')"))
+        try:
+            migrate(concurrent)
+        except RuntimeError as exc:
+            assert "not a prefix" in str(exc)
+        else:
+            raise AssertionError("Unknown newer migration was accepted")
+        with concurrent.begin() as connection:
+            assert not ledger_is_current(connection)
+            connection.execute(text("DELETE FROM schema_migrations WHERE version='9999_future.sql'"))
+            connection.execute(text("DELETE FROM schema_migrations WHERE version=:v"), {"v":migrations[0].name})
+        try:
+            migrate(concurrent)
+        except RuntimeError as exc:
+            assert "not a prefix" in str(exc)
+        else:
+            raise AssertionError("Noncontiguous migration history was accepted")
+        print("PASS: newer and noncontiguous ledgers rejected before migration; exact compatibility required")
         print("PASS: competing migrators serialized; each ordered migration recorded exactly once")
         print("PASS: identity schema and migration 0008 apply to a fresh schema and upgrades populated 0007 data, preserving historical ambiguous decisions and allowing an append-only follow-up.")
     finally:

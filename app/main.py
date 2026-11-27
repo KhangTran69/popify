@@ -21,6 +21,7 @@ from app.identity import managed_login, session_account, revoke_session, manage_
 from app.models import OperatorAccount, OperatorSession, LoginBucket
 from app.privacy import minimized_order_payload, valid_text_fields
 from app.operations import operational_snapshot, workflow_activity
+from app.schema import ledger_is_current
 from app.workers import heartbeat, run_batch, process_next_delivery, process_next_support
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
@@ -288,6 +289,8 @@ def readiness(db: Session = Depends(get_db)):
             # Validate mapped columns as well as table existence without reading customer records.
             db.execute(select(model).limit(0))
         if settings.managed_identity and not settings.preview_mode:
+            if db.get_bind().dialect.name == "postgresql" and not ledger_is_current(db):
+                return JSONResponse({"status": "not_ready"}, status_code=503)
             for model in (OperatorAccount, OperatorSession, LoginBucket):
                 db.execute(select(model).limit(0))
             if not db.scalar(select(OperatorAccount.id).where(OperatorAccount.active.is_(True), OperatorAccount.role == "admin").limit(1)):
