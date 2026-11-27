@@ -83,6 +83,9 @@ jobs:
         run: docker compose up --build --detach --wait --wait-timeout 240
       - name: Run the real local workflow walkthrough
         run: python -m scripts.verify demo
+      # Pause scheduled consumers so the targeted sequential benchmark owns its queue.
+      - name: Pause scheduled n8n workers for isolated measurement
+        run: docker compose stop n8n
       - name: Benchmark signed intake and PostgreSQL queue processing
         run: >-
           docker compose exec -T -e POPIFY_BENCHMARK_COMMIT=${GITHUB_SHA} api
