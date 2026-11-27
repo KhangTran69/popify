@@ -22,7 +22,7 @@ from app.models import OperatorAccount, OperatorSession, LoginBucket
 from app.privacy import minimized_order_payload, valid_text_fields
 from app.operations import operational_snapshot, workflow_activity
 from app.schema import ledger_is_current
-from app.workers import heartbeat, run_batch, process_next_delivery, process_next_support
+from app.workers import heartbeat, run_batch, process_next_delivery, process_next_support, scan_delayed_orders
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
     ExecutionReconciliation, utcnow,
@@ -1798,54 +1798,9 @@ def demo_order(
 def scan_delayed(
     x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db)
 ):
-    from app.services import create_approval
-
     if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
-    cutoff = utcnow() - timedelta(hours=settings.order_delay_hours)
-    already_approved = exists(
-        select(Approval.id).where(
-            Approval.kind == "exception",
-            Approval.subject_type == "order",
-            Approval.subject_id == Order.id,
-            Approval.proposed_action == "review_delayed_order",
-        )
-    )
-    delayed_condition = (
-        (Order.fulfillment_status == "unfulfilled")
-        & (Order.created_at < cutoff)
-        & ~already_approved
-    )
-    rows = db.scalars(
-        select(Order)
-        .where(delayed_condition)
-        .order_by(Order.created_at, Order.id)
-        .limit(100)
-    ).all()
-    created = []
-    before = db.scalar(select(func.count(Approval.id)))
-    for o in rows:
-        a = create_approval(
-            db,
-            "exception",
-            "order",
-            o.id,
-            "review_delayed_order",
-            {
-                "order_number": o.order_number,
-                "order_id": o.id,
-                "hours_threshold": settings.order_delay_hours,
-                "created_at": o.created_at.isoformat(),
-                "order_fulfillment_status": o.fulfillment_status,
-                "order_financial_status": o.financial_status,
-                "order_total": f"{o.currency} {o.total}",
-                "order_source_updated_at": o.source_updated_at.isoformat(),
-            },
-        )
-        created.append(a.id)
-    db.commit()
-    new_exceptions = (db.scalar(select(func.count(Approval.id))) or 0) - before
-    delayed_scan_has_more = bool(db.scalar(select(exists().where(delayed_condition))))
+    scanned, new_exceptions, delayed_scan_has_more = scan_delayed_orders(db)
     # Select candidates without row locks: execute_approved acquires the shared
     # subject advisory lock before locking any revision, keeping the lock order
     # consistent with decision, refresh, and manual retry requests.
@@ -1878,7 +1833,7 @@ def scan_delayed(
         db,
         3,
         {
-            "open_delayed_orders": len(created),
+            "open_delayed_orders": scanned,
             "new_exceptions": new_exceptions,
             "delayed_scan_has_more": delayed_scan_has_more,
             "actions_processed": len(pending),

@@ -224,9 +224,11 @@ def test_delayed_order_scan_is_bounded_and_continues_without_starvation():
         db.commit()
     headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
     first = client.post("/api/n8n/delayed-exceptions", headers=headers).json()
-    assert first["open_delayed_orders"] == 100 and first["delayed_scan_has_more"] is True
+    assert first["open_delayed_orders"] == 100 and first["new_exceptions"] == 100 and first["delayed_scan_has_more"] is True
     second = client.post("/api/n8n/delayed-exceptions", headers=headers).json()
-    assert second["open_delayed_orders"] == 5 and second["delayed_scan_has_more"] is False
+    assert second["open_delayed_orders"] == 5 and second["new_exceptions"] == 5 and second["delayed_scan_has_more"] is False
+    third = client.post("/api/n8n/delayed-exceptions", headers=headers).json()
+    assert third["new_exceptions"] == 0 and third["open_delayed_orders"] == 0
     with TestingSession() as db:
         assert db.scalar(
             select(func.count()).select_from(Approval).where(

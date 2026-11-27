@@ -363,6 +363,12 @@ def classify(text):
 
 
 def create_approval(db, kind, subject_type, subject_id, action, facts, revision=None):
+    approval, _ = create_approval_with_status(db, kind, subject_type, subject_id, action, facts, revision)
+    return approval
+
+
+def create_approval_with_status(db, kind, subject_type, subject_id, action, facts, revision=None):
+    """Return the persisted approval and whether this transaction inserted it."""
     existing_query = select(Approval).where(
         Approval.kind == kind,
         Approval.subject_type == subject_type,
@@ -372,7 +378,7 @@ def create_approval(db, kind, subject_type, subject_id, action, facts, revision=
     if revision is None:
         existing = db.scalar(existing_query.order_by(Approval.revision.desc()).limit(1))
         if existing:
-            return existing
+            return existing, False
         revision = 1
     approval = Approval(
         kind=kind,
@@ -394,7 +400,7 @@ def create_approval(db, kind, subject_type, subject_id, action, facts, revision=
             existing_query.order_by(Approval.revision.desc()).limit(1)
         )
         if existing:
-            return existing
+            return existing, False
         raise
     audit(
         db,
@@ -404,7 +410,7 @@ def create_approval(db, kind, subject_type, subject_id, action, facts, revision=
         details={"action": action, "revision": revision},
         correlation_id=facts.get("correlation_id"),
     )
-    return approval
+    return approval, True
 
 
 def current_approval_facts(db, approval):

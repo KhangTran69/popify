@@ -147,6 +147,37 @@ def verify_worker_lock_contention(sessions):
     print("PASS: PostgreSQL worker lock timeout returns retryable 503, preserves committed batch items and retry budgets, then drains exactly once")
 
 
+def verify_delayed_scan_contention(sessions):
+    keys = [f"ci-delayed-scan-{i}" for i in range(8)]
+    locked_key = keys[-1]
+    with sessions() as db:
+        for key in keys:
+            db.add(Order(external_id=key, order_number=key, created_at=utcnow()-timedelta(hours=settings.order_delay_hours+1)))
+        db.commit()
+    def scan():
+        with sessions() as db:
+            from app.workers import scan_delayed_orders
+            return scan_delayed_orders(db)
+    with sessions() as blocker:
+        locked = blocker.scalar(select(Order).where(Order.external_id == locked_key).with_for_update())
+        locked.fulfillment_status = "fulfilled"
+        blocker.flush()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: scan(), range(2)))
+        assert sum(result[1] for result in results) == len(keys)-1, results
+        blocker.commit()
+    assert scan()[1] == 0
+    with sessions() as db:
+        orders = list(db.scalars(select(Order).where(Order.external_id.in_(keys))))
+        for order in orders:
+            approvals = list(db.scalars(select(Approval).where(
+                Approval.subject_type == "order", Approval.subject_id == order.id,
+                Approval.proposed_action == "review_delayed_order")))
+            assert len(approvals) == (0 if order.external_id == locked_key else 1)
+            assert all(a.status == "pending" for a in approvals)
+    print("PASS: competing delayed scans report only their own inserts and skip an order being fulfilled")
+
+
 def verify_recovery(sessions, worker, support, support_token, reviewer, reviewer_token):
     """Exercise actual HTTP contracts and PostgreSQL state, all provider outcomes synthetic."""
     headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
@@ -392,6 +423,7 @@ def run():
             verify_delivery_batches(sessions)
             verify_support_batches(sessions)
             verify_worker_lock_contention(sessions)
+            verify_delayed_scan_contention(sessions)
             verify_recovery(sessions, admin, support, support_token, reviewer, reviewer_token)
             cookie = reviewer.cookies.get("session")
             assert admin.post("/operators/ci-reviewer", data={"action": "revoke", "csrf_token": admin_token}).status_code == 303

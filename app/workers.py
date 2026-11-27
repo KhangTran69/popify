@@ -1,10 +1,11 @@
 """Queue selection and bounded independent-transaction worker invocations."""
 import time
-from sqlalchemy import or_, select
+from datetime import timedelta
+from sqlalchemy import exists, or_, select
 from app.config import settings
 from app.db import bound_worker_lock_wait
-from app.models import Delivery, Case, utcnow
-from app.services import process_delivery, process_support, audit
+from app.models import Delivery, Case, Order, Approval, utcnow
+from app.services import process_delivery, process_support, audit, create_approval_with_status
 
 
 def process_next_delivery(db):
@@ -78,3 +79,29 @@ def run_batch(db, number, process_next, batch_size, success_status):
     result = {"status": "failed" if failed else success_status if processed else "idle",
               "batch_size": batch_size, "outcomes": counts}
     return heartbeat(db, number, result, completed=bool(processed), failed=failed)
+
+
+def scan_delayed_orders(db):
+    """Claim a bounded set of eligible orders and count only our own inserts."""
+    bound_worker_lock_wait(db)
+    cutoff = utcnow() - timedelta(hours=settings.order_delay_hours)
+    existing = exists(select(Approval.id).where(
+        Approval.kind == "exception", Approval.subject_type == "order",
+        Approval.subject_id == Order.id, Approval.proposed_action == "review_delayed_order",
+    ))
+    eligible = ((Order.fulfillment_status == "unfulfilled") & (Order.created_at < cutoff) & ~existing)
+    orders = list(db.scalars(select(Order).where(eligible).order_by(Order.created_at, Order.id)
+                            .with_for_update(of=Order, skip_locked=True).limit(100)))
+    inserted = 0
+    for order in orders:
+        _, created = create_approval_with_status(db, "exception", "order", order.id, "review_delayed_order", {
+            "order_number": order.order_number, "order_id": order.id,
+            "hours_threshold": settings.order_delay_hours, "created_at": order.created_at.isoformat(),
+            "order_fulfillment_status": order.fulfillment_status,
+            "order_financial_status": order.financial_status,
+            "order_total": f"{order.currency} {order.total}",
+            "order_source_updated_at": order.source_updated_at.isoformat(),
+        })
+        inserted += int(created)
+    db.commit()
+    return len(orders), inserted, bool(db.scalar(select(exists().where(eligible))))
