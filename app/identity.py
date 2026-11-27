@@ -73,8 +73,10 @@ def managed_login(db, username, password, client_address):
         db.execute(text("SELECT pg_advisory_xact_lock(607291041)"))
     now = utcnow()
     db.execute(delete(LoginBucket).where(LoginBucket.expires_at <= now))
+    normalized = canonical_username(username)
+    bucket_account = normalized if USERNAME.fullmatch(normalized) else "invalid-username"
     keys = [hmac.new(settings.app_secret.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()
-            for value in ("ip:" + client_address, "account:" + canonical_username(username))]
+            for value in ("ip:" + client_address, "account:" + bucket_account)]
     buckets = [db.get(LoginBucket, key) for key in keys]
     waits = [max(1, int((_aware(b.expires_at) - now).total_seconds()) + 1)
              for b in buckets if b and b.failures >= MAX_FAILURES]
@@ -82,7 +84,7 @@ def managed_login(db, username, password, client_address):
         db.commit()
         return None, None, max(waits)
     account = db.scalar(select(OperatorAccount).where(
-        OperatorAccount.username == canonical_username(username)))
+        OperatorAccount.username == normalized)) if USERNAME.fullmatch(normalized) else None
     valid = verify_password(password, account.password_hash if account else DUMMY_HASH)
     if not account or not account.active or not valid:
         count = db.scalar(select(func.count()).select_from(LoginBucket)) or 0

@@ -6,7 +6,11 @@ tmp=$(mktemp -d)
 name="popify-gateway-$(basename "$tmp" | tr -cd 'a-zA-Z0-9')"
 started=0
 cleanup() {
-  if [ "$started" = 1 ]; then docker rm -f "$name" >/dev/null; fi
+  result=$?
+  if [ "$started" = 1 ]; then
+    if [ "$result" != 0 ]; then docker logs --tail 50 "$name" >&2 || true; fi
+    docker rm -f "$name" >/dev/null
+  fi
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -22,15 +26,28 @@ for i in $(seq 1 20); do
   [ "$code" = 404 ] && break
   sleep 1
 done
-[ "$code" = 404 ]
+[ "$code" = 404 ] || { echo "Gateway readiness expected 404, got $code" >&2; exit 1; }
+expect_code() {
+  expected=$1; shift
+  code=$(curl -ksS --max-time 10 -o /dev/null -w "%{http_code}" "$@" || true)
+  echo "Ingress probe: expected $expected, got $code"
+  [ "$code" = "$expected" ]
+}
 for path in /api/n8n/process-next /api/support / /docs /ready; do
-  [ "$(curl -ks -o /dev/null -w '%{http_code}' "https://127.0.0.1:8443$path")" = 404 ]
+  expect_code 404 "https://127.0.0.1:8443$path"
 done
 base=https://127.0.0.1:8443/webhooks/shopify/orders
-[ "$(curl -ks -o /dev/null -w '%{http_code}' -X POST -d '{}' "$base")" = 401 ]
+expect_code 401 -X POST -d '{}' "$base"
 head -c 1000001 /dev/zero > "$tmp/large"
-[ "$(curl -ks -o /dev/null -w '%{http_code}' -H 'Expect:' --data-binary @"$tmp/large" "$base")" = 413 ]
+expect_code 413 -H "Expect: 100-continue" --expect100-timeout 5 --data-binary @"$tmp/large" "$base"
 # Bounded synthetic burst against the isolated ingress, no valid signatures.
 seq 1 40 | xargs -P 8 -I '%' sh -c 'curl -ks --max-time 10 -o /dev/null -w "%{http_code}\n" -X POST -d "{}" "$1"' _ "$base" '%' > "$tmp/status"
-grep -q '^429$' "$tmp/status"
+sort "$tmp/status" | uniq -c
+[ "$(wc -l < "$tmp/status")" -eq 40 ]
+if grep -Ev '^(401|429)
+echo "PASS: TLS ingress route isolation, body limit, invalid signature and bounded burst rejection"
+ "$tmp/status"; then echo 'Unexpected ingress burst response' >&2; exit 1; fi
+grep -q '^429
+echo "PASS: TLS ingress route isolation, body limit, invalid signature and bounded burst rejection"
+ "$tmp/status"
 echo "PASS: TLS ingress route isolation, body limit, invalid signature and bounded burst rejection"

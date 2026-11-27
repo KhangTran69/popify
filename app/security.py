@@ -14,6 +14,8 @@ BODY_TIMEOUT_SECONDS = 15
 
 def secure_equal(left: str, right: str) -> bool:
     """Compare UTF-8 text without raising for non-ASCII or invalid Unicode."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
     try:
         return secrets.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
     except UnicodeError:
