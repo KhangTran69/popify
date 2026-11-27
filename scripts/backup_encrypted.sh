@@ -19,5 +19,5 @@ docker compose exec -T db sh -c 'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_
   gpg --batch --yes --trust-model always --recipient "$recipient" --encrypt --output "$temp"
 test -s "$temp"
 # Atomic no-clobber publication within the destination filesystem.
-ln -T -- "$temp" "$output"
+python3 "$(dirname "${BASH_SOURCE[0]}")/publish_encrypted_archive.py" "$temp" "$output"
 echo "Encrypted PostgreSQL archive created; validate restore and approved offsite transfer separately."

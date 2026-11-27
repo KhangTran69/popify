@@ -31,11 +31,12 @@ original=$(digest "$source")
 gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "PoPify CI n8n <n8n@example.test>" rsa2048 encr 1d >/dev/null 2>&1
 recipient=$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10;exit}')
 started=$(date +%s)
+source scripts/verify_recovery_keyring.sh
+prepare_backup_keyring "$work" "$recipient"
 bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/n8n.gpg"
 if bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/n8n.gpg"; then
   echo "Archive overwrite unexpectedly allowed" >&2; exit 1
 fi
-source scripts/verify_recovery_keyring.sh
 prepare_recovery_keyring "$work" "$recipient" "$work/n8n.gpg"
 volume="popify-ci-n8n-$(basename "$work" | tr -cd 'a-zA-Z0-9')"
 docker volume create "$volume" >/dev/null
