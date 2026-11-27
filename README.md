@@ -47,7 +47,7 @@ There is no custom scheduler. Each workflow runs once per minute in n8n. FastAPI
 
 | Workflow | Work per run | Local POST trigger |
 | --- | --- | --- |
-| 01 — Order intake | Process one due delivery | `/webhook/commerceops/orders/process` |
+| 01 — Order intake | Process up to three due deliveries | `/webhook/commerceops/orders/process` |
 | 02 — Support triage | Process one due inquiry | `/webhook/commerceops/support/triage` |
 | 03 — Exceptions and actions | Detect delayed orders; process up to 20 due approved actions | `/webhook/commerceops/exceptions/scan` |
 

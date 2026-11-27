@@ -121,6 +121,7 @@ def run():
         "delayed_exception_pending": exception_seen,
         "scope": "low-rate synthetic Compose HTTP plus real scheduled n8n; not a saturation test or SLA"
     }))
+    assert max(order_wait.values()) <= 120, "Four-order synthetic queue p95 exceeded 120 seconds"
 
 
 if __name__ == "__main__":

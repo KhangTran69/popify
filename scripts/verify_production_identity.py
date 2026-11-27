@@ -16,7 +16,9 @@ from app import main
 from app.config import settings
 from app.db import Base, engine, get_db
 from app.identity import manage_account
-from app.models import Approval, Audit, Case, ActionExecution, ExecutionReconciliation
+from app.models import Approval, Audit, Case, ActionExecution, ExecutionReconciliation, Delivery, Order, utcnow
+from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 PASSWORD = "synthetic-production-test-password"
 
@@ -32,6 +34,38 @@ def sign_in(client, username):
     assert "secure" in response.headers["set-cookie"].lower()
     assert "httponly" in response.headers["set-cookie"].lower()
     return token(client)
+
+
+def verify_delivery_batches(sessions):
+    """Competing HTTP batch calls must preserve per-delivery transaction boundaries."""
+    now = utcnow()
+    keys = [f"production-batch-{i}" for i in range(5)]
+    with sessions() as db:
+        for key in keys:
+            db.add(Delivery(webhook_id=key, topic="orders/create", shop_domain="demo.myshopify.com",
+                            payload={"id": key, "created_at": now.isoformat(), "updated_at": now.isoformat()},
+                            status="received"))
+        db.add(Delivery(webhook_id="production-batch-future", topic="orders/create", shop_domain="demo.myshopify.com",
+                        payload={}, status="failed", attempts=1, next_attempt_at=now+timedelta(hours=1)))
+        db.commit()
+    def poll():
+        client = TestClient(main.app, base_url="https://testserver", follow_redirects=False)
+        try:
+            response = client.post("/api/n8n/process-next?batch_size=3", headers={"X-N8N-Secret": settings.n8n_webhook_secret})
+            assert response.status_code == 200
+            return response.json()["outcomes"]["processed"]
+        finally:
+            client.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        counts = list(pool.map(lambda _: poll(), range(2)))
+    assert sum(counts) == len(keys), counts
+    with sessions() as db:
+        assert len(list(db.scalars(select(Order).where(Order.external_id.in_(keys))))) == len(keys)
+        deliveries = list(db.scalars(select(Delivery).where(Delivery.webhook_id.in_(keys))))
+        assert all(d.status == "processed" and d.attempts == 1 for d in deliveries)
+        future = db.scalar(select(Delivery).where(Delivery.webhook_id == "production-batch-future"))
+        assert future.status == "failed" and future.attempts == 1
+    print("PASS: competing bounded batch requests persisted five orders exactly once and skipped scheduled retry")
 
 
 def verify_recovery(sessions, worker, support, support_token, reviewer, reviewer_token):
@@ -169,6 +203,7 @@ def run():
                 execution = db.scalar(select(ActionExecution).where(ActionExecution.idempotency_key == f"approval:{approval_id}"))
                 assert approval.actor == "ci-reviewer" and approval.status == "approved"
                 assert execution and execution.state == "succeeded"
+            verify_delivery_batches(sessions)
             verify_recovery(sessions, admin, support, support_token, reviewer, reviewer_token)
             cookie = reviewer.cookies.get("session")
             assert admin.post("/operators/ci-reviewer", data={"action": "revoke", "csrf_token": admin_token}).status_code == 303

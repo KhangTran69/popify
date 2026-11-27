@@ -1625,12 +1625,7 @@ def n8n_process(
     return process_delivery(db, delivery_id)
 
 
-@app.post("/api/n8n/process-next")
-def n8n_next(
-    x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db)
-):
-    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
-        raise HTTPException(401)
+def process_next_delivery(db):
     pending = db.scalar(
         select(Delivery)
         .where(
@@ -1647,12 +1642,39 @@ def n8n_next(
         .with_for_update(skip_locked=True)
         .limit(1)
     )
-    result = process_delivery(db, pending.id) if pending else {"status": "idle"}
-    return heartbeat(
-        db, 1, result,
-        completed=result["status"] == "processed",
-        failed=result["status"] in ("failed", "exhausted"),
-    )
+    return process_delivery(db, pending.id) if pending else {"status": "idle"}
+
+
+@app.post("/api/n8n/process-next")
+def n8n_next(
+    x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db),
+    batch_size: int = Query(1, ge=1, le=5),
+):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
+        raise HTTPException(401)
+    if batch_size == 1:
+        result = process_next_delivery(db)
+        return heartbeat(db, 1, result, completed=result["status"] == "processed",
+                         failed=result["status"] in ("failed", "exhausted"))
+    # Each delivery retains its own transaction, row lock and retry schedule.
+    # The time budget is checked between items; it is not a database statement timeout.
+    deadline = time.monotonic() + 7
+    counts = {"processed": 0, "failed": 0, "exhausted": 0, "duplicate": 0, "deferred": 0}
+    for _ in range(batch_size):
+        if time.monotonic() >= deadline:
+            break
+        result = process_next_delivery(db)
+        status = result["status"]
+        if status == "idle":
+            break
+        counts[status] += 1
+        # Record each result even if a later item encounters a database outage.
+        heartbeat(db, 1, result, completed=status == "processed", failed=status in ("failed", "exhausted"))
+    failed = bool(counts["failed"] or counts["exhausted"])
+    processed = counts["processed"]
+    result = {"status": "failed" if failed else "processed" if processed else "idle",
+              "batch_size": batch_size, "outcomes": counts}
+    return heartbeat(db, 1, result, completed=bool(processed), failed=failed)
 
 
 class Inquiry(BaseModel):

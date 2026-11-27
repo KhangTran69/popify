@@ -28,7 +28,7 @@ for table in orders deliveries support_cases approvals action_executions executi
   restored=$(psql -X -U "$user" -d "$target" -Atc "SELECT count(*) FROM $table")
   [ "$original" = "$restored" ] || { echo "Restore count mismatch: $table" >&2; exit 1; }
   # CI data is small and quiescent. Compare deterministic row-content digests, never print them.
-  query="SELECT md5(coalesce(string_agg(to_jsonb(t)::text, '', ORDER BY id), '')) FROM $table t"
+  query="SELECT md5(coalesce(string_agg(to_jsonb(t)::text, '' ORDER BY id), '')) FROM $table t"
   original_digest=$(psql -X -U "$user" -d "$source_db" -v ON_ERROR_STOP=1 -Atc "$query")
   restored_digest=$(psql -X -U "$user" -d "$target" -v ON_ERROR_STOP=1 -Atc "$query")
   [ "$original_digest" = "$restored_digest" ] || { echo "Restore content mismatch: $table" >&2; exit 1; }
