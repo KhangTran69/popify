@@ -81,6 +81,7 @@ def run():
     support_ack = []
     last_support_submission = None
     start = time.monotonic()
+    started_at = utcnow()
     submitted, inquiries, order_wait, support_wait, ack = set(), set(), {}, {}, []
     exception_seen = False
     peak_orders = peak_support = 0
@@ -167,7 +168,33 @@ def run():
         else:
             raise RuntimeError(f"Scheduled drain exceeded {deadline}s: orders={len(order_wait)}, paired_support={len(support_wait)}, independent_support={len(independent_wait)}, delayed_exception={exception_seen}")
     elapsed = time.monotonic() - start
+    poll_metrics = {}
     with SessionLocal() as db:
+        deliveries = list(db.scalars(select(Delivery).where(Delivery.webhook_id.in_(keys))))
+        cases = list(db.scalars(select(Case).where(Case.request_key.in_(keys + independent_keys))))
+        assert len(deliveries) == count and all(d.status == "processed" and d.attempts == 1 for d in deliveries)
+        assert len(cases) == count + len(independent_keys) and all(c.status == "needs_review" and c.attempts == 1 for c in cases)
+        for case in cases:
+            events = list(db.scalars(select(Audit.id).where(Audit.entity_type == "case", Audit.entity_id == case.id,
+                                                          Audit.event == "draft_created")))
+            assert len(events) == 1
+        # Aggregate heartbeat rows distinguish one poll from its per-item records.
+        # Observe the actual cadence and outcomes, not just configured intervals.
+        for number, name in ((1, "orders"), (2, "support")):
+            rows = list(db.scalars(select(Audit).where(Audit.entity_type == "workflow",
+                Audit.entity_id == number, Audit.created_at >= started_at).order_by(Audit.created_at, Audit.id)))
+            polls = [row for row in rows if isinstance(row.details, dict) and "batch_size" in row.details
+                     and isinstance(row.details.get("outcomes"), dict)]
+            assert polls and all(row.details["batch_size"] == 5 for row in polls)
+            gaps = [(as_utc(right.created_at) - as_utc(left.created_at)).total_seconds()
+                    for left, right in zip(polls, polls[1:])]
+            outcomes = {}
+            for row in polls:
+                for status, value in row.details["outcomes"].items():
+                    outcomes[status] = outcomes.get(status, 0) + value
+            poll_metrics[name] = {"observed_polls": len(polls), "max_interpoll_seconds": round(max(gaps), 3) if gaps else None,
+                                  "median_interpoll_seconds": percentile_ms(gaps, .5) if gaps else None,
+                                  "outcomes": outcomes}
         assert len(approval_ids) == count + len(independent_keys) + 1
         assert not list(db.scalars(select(ActionExecution).where(ActionExecution.idempotency_key.in_([f"approval:{i}" for i in approval_ids]))))
         assert all(db.get(Approval, i).status == "pending" for i in approval_ids)
@@ -190,6 +217,9 @@ def run():
         "drain_seconds_after_last_arrival": round(time.monotonic()-max(last_submission, last_support_submission), 3),
         "final_backlog": {"orders": backlog_trace[-1][1], "support": backlog_trace[-1][2]},
         "backlog_samples": backlog_trace[::15] + [backlog_trace[-1]],
+        "worker_polls": poll_metrics,
+        "delivery_attempts": {"records": count, "retried": 0},
+        "support_attempts": {"records": count + len(independent_keys), "retried": 0},
         "scope": "Synthetic items, actual HTTP and n8n; not merchant capacity or SLA"
     }))
     if args.profile == "steady":

@@ -11,6 +11,8 @@ required_roles = {
 
 for path in paths:
     workflow = json.loads(path.read_text())
+    assert workflow["settings"]["saveDataErrorExecution"] == "none", f"{path}: do not retain error execution payloads"
+    assert workflow["settings"]["timezone"] == "UTC"
     names = {node["name"] for node in workflow["nodes"]}
     node_types = {node["type"] for node in workflow["nodes"]}
     assert len(names) == len(workflow["nodes"]), f"{path}: duplicate node names"
