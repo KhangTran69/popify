@@ -78,7 +78,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Configure disposable mock stack
-        run: cp .env.example .env
+        run: |
+          cp .env.example .env
+          sed -i 's/^SHOPIFY_WEBHOOK_SECRET=$/SHOPIFY_WEBHOOK_SECRET=synthetic-ci-scheduled-intake-only/' .env
       - name: Start PostgreSQL, FastAPI, and n8n
         run: docker compose up --build --detach --wait --wait-timeout 240
       - name: Run the real local workflow walkthrough
@@ -104,6 +106,8 @@ jobs:
           docker compose exec -T api python -m scripts.verify_outage pending --confirm-disposable
           docker compose start n8n
           docker compose exec -T api python -m scripts.verify_outage recovered --confirm-disposable
+      - name: Measure real scheduled order and support queue latency
+        run: docker compose exec -T api python -m scripts.verify_scheduled_workload --confirm-disposable
       - name: Verify database outage and readiness recovery
         run: |
           docker compose stop n8n db
@@ -111,6 +115,8 @@ jobs:
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 503
           docker compose up -d --wait --wait-timeout 120 db
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 200
+      - name: Seed synthetic managed identity for restore verification
+        run: docker compose exec -T api python -m scripts.seed_restore_identity --confirm-disposable
       - name: Verify disposable PostgreSQL backup restoration
         run: docker compose exec -T -e POPIFY_CONFIRM_DISPOSABLE=1 db sh -s < scripts/verify_restore.sh
       - name: Show service logs on failure and clean up

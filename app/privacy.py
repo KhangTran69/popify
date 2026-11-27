@@ -29,3 +29,11 @@ def minimized_order_payload(payload):
                 raise ValueError("Invalid order field")
         result[key] = value
     return result
+
+
+def valid_text_fields(*values):
+    """Accept database-safe text without silently rewriting signed or idempotent data."""
+    try:
+        return all(value is None or ("\x00" not in value and bool(value.encode("utf-8", errors="strict") or value == "")) for value in values)
+    except (UnicodeError, TypeError, AttributeError):
+        return False

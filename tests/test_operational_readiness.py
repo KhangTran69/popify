@@ -52,3 +52,10 @@ def test_minimized_signed_order_and_private_status(monkeypatch):
     assert client.post("/webhooks/shopify/orders", content=raw, headers={**headers,
         "X-Shopify-Hmac-SHA256": "invalid", "Accept": "text/html"}).status_code == 401
     engine.dispose()
+
+
+def test_database_safe_text_fields():
+    from app.privacy import valid_text_fields
+    assert valid_text_fields("synthetic café", "", None)
+    assert not valid_text_fields("bad\x00text")
+    assert not valid_text_fields("\ud800")

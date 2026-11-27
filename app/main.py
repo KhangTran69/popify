@@ -19,7 +19,7 @@ from app.config import settings
 from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integration_secret
 from app.identity import managed_login, session_account, revoke_session, manage_account, ROLES
 from app.models import OperatorAccount, OperatorSession, LoginBucket
-from app.privacy import minimized_order_payload
+from app.privacy import minimized_order_payload, valid_text_fields
 from app.operations import operational_snapshot, workflow_activity
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
@@ -1552,7 +1552,7 @@ async def shopify_order(request: Request, db: Session = Depends(get_db)):
     if topic not in ("orders/create", "orders/updated"):
         raise HTTPException(422, "unsupported Shopify topic")
     event_id = request.headers.get("x-shopify-event-id")
-    if len(webhook_id) > 150 or len(shop) > 255 or (event_id and len(event_id) > 150):
+    if not valid_text_fields(webhook_id, shop, event_id) or len(webhook_id) > 150 or len(shop) > 255 or (event_id and len(event_id) > 150):
         raise HTTPException(422, "Invalid header length")
     shop = shop.lower()
     existing = db.scalar(select(Delivery).where(Delivery.webhook_id == webhook_id))
@@ -1662,8 +1662,8 @@ def support_api(
 ):
     if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
-    if not data.message.strip():
-        raise HTTPException(422, "Message is required")
+    if not data.message.strip() or not valid_text_fields(data.message, data.order_ref, data.email, data.request_key):
+        raise HTTPException(422, "Invalid inquiry fields")
     try:
         case = queue_support(db, data.message, data.order_ref, data.email, data.request_key, actor="integration")
     except SupportRequestKeyConflict:
@@ -1759,6 +1759,7 @@ def support_submit(
     verify_csrf(request, csrf_token)
     if (
         not message.strip()
+        or not valid_text_fields(message, order_ref, email, request_key)
         or len(message) > 5000
         or len(order_ref) > 100
         or len(email) > 320
