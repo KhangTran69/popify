@@ -1674,9 +1674,13 @@ def support_api(
 def triage_next(
     x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db),
     batch_size: int = Query(1, ge=1, le=5),
+    mock_only: bool = Query(False),
 ):
     if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
+    # The extra scheduled poll must never increase external AI invocation cadence.
+    if mock_only and settings.llm_mode != "mock":
+        return {"status": "disabled", "reason": "mock_only"}
     # External AI can take substantially longer than mock triage. Retain the
     # existing single-item behavior there until a separate capacity test.
     return run_batch(db, 2, process_next_support, batch_size if settings.llm_mode == "mock" else 1, "needs_review")

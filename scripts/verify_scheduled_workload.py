@@ -21,11 +21,13 @@ from app.models import ActionExecution, Approval, Audit, Case, Delivery, Order, 
 from app.services import as_utc
 from scripts.benchmark import percentile_ms
 
-PROFILES = {"steady": (12, 25, 540), "overload": (18, 10, 540), "mixed": (12, 15, 660)}
-# Mixed profile adds an independent support arrival stream, including cases
-# without a matching order. The existing paired profiles remain comparable.
-MIXED_SUPPORT_COUNT = 24
-MIXED_SUPPORT_INTERVAL = 8
+# orders, order interval, deadline, independent support count and interval.
+PROFILES = {
+    "steady": (12, 25, 540, 0, None),
+    "overload": (18, 10, 540, 0, None),
+    "mixed": (12, 15, 660, 24, 8),
+    "sustained": (24, 20, 900, 36, 15),
+}
 
 
 def signed_order(client, key, *, delayed=False):
@@ -69,12 +71,12 @@ def run():
     parser.add_argument("--confirm-disposable", action="store_true", required=True)
     parser.add_argument("--profile", choices=PROFILES, default="steady")
     args = parser.parse_args()
-    count, interval, deadline = PROFILES[args.profile]
+    count, interval, deadline, independent_count, independent_interval = PROFILES[args.profile]
     assert os.environ.get("POPIFY_ENV") == "development" and settings.llm_mode == "mock"
     assert settings.shopify_webhook_secret and not settings.shopify_admin_token and not settings.openai_api_key
     prefix = "scheduled-" + uuid.uuid4().hex[:12]
     keys = [f"{prefix}-{i}" for i in range(count)]
-    independent_keys = [f"{prefix}-independent-{i}" for i in range(MIXED_SUPPORT_COUNT)] if args.profile == "mixed" else []
+    independent_keys = [f"{prefix}-independent-{i}" for i in range(independent_count)]
     independent_submitted, independent_wait = set(), {}
     support_ack = []
     last_support_submission = None
@@ -96,7 +98,7 @@ def run():
                     submitted.add(key)
                     last_submission = time.monotonic()
             for i, key in enumerate(independent_keys):
-                if key not in independent_submitted and elapsed >= i * MIXED_SUPPORT_INTERVAL:
+                if key not in independent_submitted and elapsed >= i * independent_interval:
                     support_ack.append(submit_support(client, key, paired=False))
                     independent_submitted.add(key)
                     last_support_submission = time.monotonic()
@@ -175,7 +177,7 @@ def run():
     print("SCHEDULED WORKLOAD " + json.dumps({
         "profile": args.profile, "orders": count, "support_cases": count + len(independent_keys), "arrival_interval_seconds": interval,
         "independent_support_cases": len(independent_keys),
-        "independent_support_interval_seconds": MIXED_SUPPORT_INTERVAL if independent_keys else None,
+        "independent_support_interval_seconds": independent_interval,
         "elapsed_seconds": round(elapsed, 3), "combined_completions_per_minute": round((2*count+len(independent_keys))*60/elapsed, 3),
         "network_ack_ms": {"p50": percentile_ms(ack, .5), "p95": percentile_ms(ack, .95)},
         "support_ack_ms": {"p50": percentile_ms(support_ack, .5), "p95": percentile_ms(support_ack, .95)},
@@ -200,10 +202,17 @@ def run():
         assert backlog_trace[-1][1:] == (0, 0)
         assert elapsed <= deadline
         assert percentile_ms(list(order_wait.values()), .95) <= 180, "Overload order p95 exceeded provisional 180-second regression gate"
-    else:
-        assert peak_support > 3, "Mixed profile did not exercise support backlog growth"
+    elif args.profile == "mixed":
         assert backlog_trace[-1][1:] == (0, 0)
         assert elapsed <= deadline
+        # Measured before the added mock-only poll: support p95 226.038s.
+        # Require an improvement, not a minimum backlog (which rewards slowness).
+        assert percentile_ms(list(support_wait.values()) + list(independent_wait.values()), .95) <= 180, "Mixed support p95 exceeded provisional regression gate"
+    else:
+        assert backlog_trace[-1][1:] == (0, 0)
+        assert elapsed <= deadline
+        assert percentile_ms(list(order_wait.values()), .95) <= 120, "Sustained order p95 exceeded 120 seconds"
+        assert percentile_ms(list(support_wait.values()) + list(independent_wait.values()), .95) <= 120, "Sustained support p95 exceeded 120 seconds"
     assert percentile_ms(ack, .95) <= 500, "Synthetic HTTP acknowledgement p95 exceeded 500 ms"
     assert percentile_ms(support_ack, .95) <= 500, "Synthetic support acknowledgement p95 exceeded 500 ms"
 

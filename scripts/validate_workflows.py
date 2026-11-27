@@ -26,9 +26,21 @@ for path in paths:
                     ), f"{path}: unknown target {connection['node']}"
     workers = [n for n in workflow["nodes"] if n["type"] == required_roles["worker"]]
     if path.name in ("01-order-intake.json", "02-support-triage.json"):
-        assert len(workers) == 1
         expected = "process-next" if path.name.startswith("01") else "triage-next"
-        assert workers[0]["parameters"]["url"] == f"http://api:8000/api/n8n/{expected}?batch_size=5"
+        regular_url = f"http://api:8000/api/n8n/{expected}?batch_size=5"
+        by_url = {worker["parameters"]["url"]: worker["name"] for worker in workers}
+        expected_urls = {regular_url} if path.name.startswith("01") else {regular_url, regular_url + "&mock_only=true"}
+        assert len(workers) == len(expected_urls) and set(by_url) == expected_urls
         schedules = [n for n in workflow["nodes"] if n["type"] == required_roles["scheduleTrigger"]]
-        assert len(schedules) == 1 and schedules[0]["parameters"]["rule"]["interval"] == [{"field":"minutes", "minutesInterval":1}]
+        assert len(schedules) == len(expected_urls)
+        for schedule in schedules:
+            interval = schedule["parameters"]["rule"]["interval"]
+            if interval == [{"field":"minutes", "minutesInterval":1}]:
+                url = regular_url
+            else:
+                assert path.name == "02-support-triage.json"
+                assert interval == [{"field":"cronExpression", "expression":"30 * * * * *"}]
+                url = regular_url + "&mock_only=true"
+            assert workflow["connections"][schedule["name"]]["main"] == [[{"node": by_url[url], "type":"main", "index":0}]]
+        assert sum(s["parameters"]["rule"]["interval"] == [{"field":"minutes", "minutesInterval":1}] for s in schedules) == 1
     print(f"{path}: valid JSON; {len(names)} nodes; connections resolve")

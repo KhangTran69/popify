@@ -63,6 +63,52 @@
           "timeout": 60000
         }
       }
+    },
+    {
+      "id": "26b4f6c4-ef68-4eea-9f2a-ad3cfe7594bf",
+      "name": "Poll mock support between regular polls",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        20
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 * * * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "bd1fe747-3c42-42a2-9b0f-a4722936fe87",
+      "name": "Draft mock-only extra batch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        20
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/n8n/triage-next?batch_size=5&mock_only=true",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{$env.N8N_WEBHOOK_SECRET}}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      }
     }
   ],
   "connections": {
@@ -87,6 +133,17 @@
           }
         ]
       ]
+    },
+    "Poll mock support between regular polls": {
+      "main": [
+        [
+          {
+            "node": "Draft mock-only extra batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": false,
@@ -98,7 +155,7 @@
   },
   "versionId": "17049b8e-cc65-4bc0-b83c-0c0afffcfe47",
   "meta": {
-    "description": "Every minute, process up to five due mock support inquiries with independent transactions. External AI mode stays single-item. Manual local trigger uses the same worker. No customer payload accepted by n8n; replies require human approval."
+    "description": "Every minute, process up to five due mock support inquiries with independent transactions, plus a mock-only batch at second 30. External AI stays single-item on the regular schedule; the extra poll is disabled by the API. Manual local trigger uses the regular worker. Replies require human approval."
   },
   "tags": [],
   "id": "KUEMGUb4u6em38fm"
