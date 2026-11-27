@@ -9,7 +9,7 @@ import hmac
 import json
 import uuid
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, func
+from sqlalchemy import create_engine, select, func, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 from app import main
@@ -32,6 +32,28 @@ from app.services import (
 import app.services as services
 from app.preview_scenarios import latest_reconciliations, unresolved_related_approvals, related_approval_ids
 from app.recovery import recovery_counts, recovery_page
+
+
+def measure_workflow_index(isolated):
+    """Compare actual plans on synthetic rows in the verifier-owned schema only."""
+    query = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM audit_events WHERE entity_type='workflow' AND entity_id=999 AND event='work_completed' ORDER BY id DESC LIMIT 1"
+    with isolated.begin() as conn:
+        conn.exec_driver_sql("INSERT INTO audit_events (correlation_id, entity_type, entity_id, event, actor, details, created_at) VALUES ('synthetic-index-check','workflow',999,'work_completed','system','{}',now())")
+        conn.exec_driver_sql("INSERT INTO audit_events (correlation_id, entity_type, entity_id, event, actor, details, created_at) SELECT 'synthetic-index-check','case',i,'inquiry_queued','system','{}',now() FROM generate_series(1, 30000) AS i")
+        conn.exec_driver_sql("ANALYZE audit_events")
+        conn.exec_driver_sql("DROP INDEX ix_audit_workflow_recent")
+        def sample():
+            conn.exec_driver_sql(query).scalar_one()
+            rows = [conn.exec_driver_sql(query).scalar_one()[0] for _ in range(3)]
+            return {"execution_ms": [row["Execution Time"] for row in rows],
+                    "plan": rows[-1]["Plan"]}
+        before = sample()
+        conn.exec_driver_sql("CREATE INDEX ix_audit_workflow_recent ON audit_events(entity_type, entity_id, event, id)")
+        conn.exec_driver_sql("ANALYZE audit_events")
+        after = sample()
+        print("WORKFLOW INDEX BENCHMARK " + json.dumps({"synthetic_rows": 30000,
+             "without_index_ms": before["execution_ms"], "with_index_ms": after["execution_ms"],
+             "without_index_plan": before["plan"], "with_index_plan": after["plan"]}))
 
 
 def run():
@@ -710,6 +732,7 @@ def run():
             ))
             assert original.state == "ambiguous" and original.attempts == 1
 
+        measure_workflow_index(isolated)
         print(
             "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, immutable reconciliation follow-ups, later evidence racing replacement execution, duplicate decision callbacks, concurrent blocker resolution/requeue, and repeated execution."
         )

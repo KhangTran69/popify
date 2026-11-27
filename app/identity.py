@@ -132,13 +132,20 @@ def revoke_session(db, token, account):
     db.commit()
 
 
-def manage_account(db, username, action, role=None, password=None):
-    """Called only by the trusted deployment administrator CLI."""
+def manage_account(db, username, action, role=None, password=None, *, actor="deployment_admin", protect_last_admin=False):
+    """Manage a stable operator identity under a trusted administrator boundary."""
     validate_username(username)
     # Serialize with login to prevent account changes racing new sessions.
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(607291041)"))
     account = db.scalar(select(OperatorAccount).where(OperatorAccount.username == username).with_for_update())
+    if protect_last_admin and account and account.active and account.role == "admin" and (
+        action == "disable" or (action == "role" and role != "admin")
+    ):
+        remaining = db.scalar(select(func.count()).select_from(OperatorAccount).where(
+            OperatorAccount.active.is_(True), OperatorAccount.role == "admin", OperatorAccount.id != account.id))
+        if not remaining:
+            raise ValueError("At least one active administrator must remain.")
     if action == "create":
         if account:
             raise ValueError("Account already exists; usernames cannot be reused.")
@@ -162,5 +169,5 @@ def manage_account(db, username, action, role=None, password=None):
     elif action != "revoke":
         raise ValueError("Unknown account action.")
     db.execute(delete(OperatorSession).where(OperatorSession.account_id == account.id))
-    _event(db, account, "operator_account_" + action, "deployment_admin")
+    _event(db, account, "operator_account_" + action, actor)
     db.commit()

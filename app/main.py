@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.db import Base, engine, get_db
 from app.config import settings
 from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integration_secret
-from app.identity import managed_login, session_account, revoke_session
+from app.identity import managed_login, session_account, revoke_session, manage_account, ROLES
 from app.models import OperatorAccount, OperatorSession, LoginBucket
 from app.privacy import minimized_order_payload
 from app.operations import queue_summary
@@ -364,6 +364,44 @@ def logout(request: Request, csrf_token: str = Form(...), actor=Depends(operator
         revoke_session(db, request.session.get("identity_token"), request.state.operator_account)
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
+
+
+@app.get("/operators", response_class=HTMLResponse)
+def operators_page(request: Request, page: int = Query(1, ge=1, le=1000),
+                   actor=Depends(admin_operator), db: Session = Depends(get_db)):
+    if not settings.managed_identity or settings.preview_mode:
+        raise HTTPException(404)
+    size = 30
+    rows = db.execute(select(OperatorAccount.id, OperatorAccount.username,
+                             OperatorAccount.role, OperatorAccount.active,
+                             func.count(OperatorSession.token_hash).label("active_sessions"))
+                      .outerjoin(OperatorSession, (OperatorSession.account_id == OperatorAccount.id) &
+                                 (OperatorSession.expires_at > utcnow()))
+                      .group_by(OperatorAccount.id, OperatorAccount.username, OperatorAccount.role, OperatorAccount.active)
+                      .order_by(OperatorAccount.username).offset((page - 1) * size).limit(size + 1)).all()
+    return templates.TemplateResponse(request, "operators.html", {
+        "request": request, "actor": actor, "csrf": csrf(request), "title": "Operator accounts",
+        "operators": rows[:size], "page": page, "has_next": len(rows) > size, "roles": ROLES,
+    })
+
+
+@app.post("/operators/{username}")
+def operator_update(username: str, request: Request, action: str = Form(...),
+                    role: str = Form(""), csrf_token: str = Form(...),
+                    actor=Depends(admin_operator), db: Session = Depends(get_db)):
+    verify_csrf(request, csrf_token)
+    if not settings.managed_identity or settings.preview_mode:
+        raise HTTPException(404)
+    if action not in ("role", "disable", "enable", "revoke"):
+        raise HTTPException(422, "Unsupported operator action.")
+    if username == actor:
+        raise HTTPException(409, "Use sign out for your own session; another administrator must change your account.")
+    try:
+        manage_account(db, username, action, role=role, actor=actor, protect_last_admin=True)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc))
+    return RedirectResponse("/operators", status_code=303)
 
 
 def workflow_activity(db):

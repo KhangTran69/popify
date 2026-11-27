@@ -120,3 +120,29 @@ def test_authenticated_operations_and_role_ui(identity_db):
     with identity_db() as db:
         manage_account(db, "test-admin", "disable")
     assert client.get("/ready").status_code == 503
+
+
+def test_admin_account_controls_and_audit(identity_db):
+    auditor = TestClient(main.app, follow_redirects=False)
+    auditor_token = login(auditor, "auditor")
+    assert auditor.get("/operators").status_code == 403
+    assert auditor.post("/operators/test-support", data={"action": "revoke", "csrf_token": auditor_token}).status_code == 403
+    admin = TestClient(main.app, follow_redirects=False)
+    token = login(admin, "admin")
+    page = admin.get("/operators")
+    assert page.status_code == 200 and "test-support" in page.text
+    assert "pbkdf2_sha256" not in page.text
+    support = TestClient(main.app, follow_redirects=False)
+    login(support, "support")
+    assert admin.post("/operators/test-support", data={"action": "role", "role": "reviewer",
+        "csrf_token": "invalid"}).status_code == 403
+    assert admin.post("/operators/test-support", data={"action": "role", "role": "reviewer",
+        "csrf_token": token}).status_code == 303
+    assert support.get("/").status_code == 401
+    assert admin.post("/operators/test-admin", data={"action": "disable", "csrf_token": token}).status_code == 409
+    with identity_db() as db:
+        account = db.scalar(select(OperatorAccount).where(OperatorAccount.username == "test-support"))
+        assert account.role == "reviewer"
+        event = db.scalar(select(Audit).where(Audit.entity_type == "operator",
+                    Audit.entity_id == account.id, Audit.event == "operator_account_role"))
+        assert event.actor == "test-admin"

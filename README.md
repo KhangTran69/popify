@@ -283,6 +283,8 @@ GitHub Actions runs the SQLite behavior suite, validates all three workflow expo
 
 See [Managed operator identities](docs/OPERATOR_IDENTITY.md) for account provisioning, role boundaries and session revocation. Production requires managed identity and PostgreSQL; the shared configured login remains for local development and isolated preview only.
 
+Managed administrators can use the operator accounts screen to inspect roles and revoke access; provisioning and password resets use the trusted CLI.
+
 See [Operations and recovery runbook](docs/OPERATIONS.md) for readiness, protected metrics, privacy and restoration procedures.
 
 ## Production-readiness boundary

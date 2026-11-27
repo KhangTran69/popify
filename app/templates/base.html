@@ -22,6 +22,7 @@
           {% for href,label,icon in [('/','Overview','◫'),('/demo','Guided demo','▶'),('/recovery','Recovery','!'),('/queues/orders','Orders','▣'),('/queues/cases','Support cases','◷'),('/queues/approvals','Approvals','✓'),('/queues/deliveries','Deliveries','↳')] %}
             {% if href != "/demo" or demo_enabled %}<a href="{{ href }}" {% if request.url.path == href %}aria-current="page"{% endif %} class="{{ 'active' if request.url.path==href or (href=='/demo' and request.url.path.startswith('/demo')) }}"><span aria-hidden="true">{{ icon }}</span>{{ label }}</a>{% endif %}
           {% endfor %}
+          {% if request.state.operator_account and request.state.operator_role == "admin" %}<a href="/operators" {% if request.url.path == "/operators" %}aria-current="page" class="active"{% endif %}><span aria-hidden="true">♙</span>Operator accounts</a>{% endif %}
         </nav>
         <div class="sidebar-bottom">
           <span class="mode"><i></i> Mock actions only</span>

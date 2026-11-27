@@ -107,7 +107,8 @@ jobs:
           docker compose down --remove-orphans
 
   browser-accessibility:
-    runs-on: ubuntu-latest
+    # Playwright 1.51 is supported on Ubuntu 24.04, not the latest 26.04 runner.
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     env:
       POPIFY_ENV: development
