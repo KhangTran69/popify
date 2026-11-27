@@ -5,9 +5,11 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from scripts.relay_alerts import relay_pending, LocalReceiptSink
 
 STATE = Path("/tmp/popify-ci-monitor-outbox.json")
 MARKER = Path("/tmp/popify-ci-monitor-event")
+RECEIPTS = Path("/tmp/popify-ci-monitor-receipts")
 
 
 def poll(*args):
@@ -23,7 +25,8 @@ def run():
     args = parser.parse_args()
     assert os.environ.get("POPIFY_ENV") == "development"
     if args.stage == "unavailable":
-        assert not STATE.exists() and not MARKER.exists()
+        assert not STATE.exists() and not MARKER.exists() and not RECEIPTS.exists()
+        RECEIPTS.mkdir(mode=0o700)
         code, first = poll()
         assert code == 2 and first["status"] == "unavailable"
         event = next(e for e in first["pending_events"] if e["code"] == "database_unavailable")
@@ -32,7 +35,12 @@ def run():
         assert code == 2 and repeat["pending_events"] == first["pending_events"]
         code, listed = poll("--list-pending")
         assert code == 1 and listed["pending_events"] == first["pending_events"]
-        assert poll("--ack-event", event["event_id"])[0] == 0
+        # Simulate a relay crash after durable receipt but before acknowledgement.
+        sink = LocalReceiptSink(RECEIPTS)
+        sink(event)
+        assert poll("--list-pending")[1]["pending_events"] == first["pending_events"]
+        assert relay_pending(STATE, sink, limit=1) == 1
+        assert json.loads((RECEIPTS / (event["event_id"] + ".json")).read_text()) == event
         assert poll("--ack-event", event["event_id"])[0] == 0
         code, listed = poll("--list-pending")
         assert code == 0 and listed["pending_events"] == []
@@ -47,8 +55,12 @@ def run():
         assert len(resolved) == 1 and resolved[0]["transition"] == "resolved"
         assert resolved[0]["event_id"] != MARKER.read_text()
         assert result["handoff"]["pending_count"] >= 1
-        assert poll("--ack-event", resolved[0]["event_id"])[0] == 0
+        assert relay_pending(STATE, LocalReceiptSink(RECEIPTS), limit=500) >= 1
+        assert json.loads((RECEIPTS / (resolved[0]["event_id"] + ".json")).read_text()) == resolved[0]
         assert not any(e["code"] == "database_unavailable" for e in poll()[1]["pending_events"])
+        for receipt in RECEIPTS.iterdir():
+            receipt.unlink()
+        RECEIPTS.rmdir()
         print("PASS: recovered database generates distinct durable resolution event and acknowledgement")
         STATE.unlink()
         STATE.with_name(STATE.name + ".lock").unlink()
