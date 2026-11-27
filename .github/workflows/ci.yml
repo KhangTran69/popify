@@ -271,6 +271,24 @@ jobs:
           PY
       - name: Validate actual HTTPS identity and route isolation
         run: python -m scripts.verify_staging --ca "$POPIFY_STAGING_TLS_DIR/tls.crt" --confirm-disposable
+      - name: Verify gateway recovers after API replacement without gateway restart
+        run: |
+          dc() { docker compose -f docker-compose.yml -f deploy/staging.compose.yml "$@"; }
+          gateway=$(dc ps -q operator-gateway)
+          old=$(dc ps -q api)
+          dc stop api
+          status=$(curl --silent --max-time 10 --cacert "$POPIFY_STAGING_TLS_DIR/tls.crt" -o /dev/null -w '%{http_code}' https://localhost:8444/live)
+          test "$status" = 502 || test "$status" = 504
+          dc up -d --no-deps --force-recreate --wait --wait-timeout 120 api
+          test "$(dc ps -q api)" != "$old"
+          for i in $(seq 1 30); do
+            if curl --silent --fail --max-time 5 --cacert "$POPIFY_STAGING_TLS_DIR/tls.crt" https://localhost:8444/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --silent --fail --max-time 5 --cacert "$POPIFY_STAGING_TLS_DIR/tls.crt" https://localhost:8444/ready >/dev/null
+          test "$(dc ps -q operator-gateway)" = "$gateway"
+          test "$(curl --silent --max-time 5 --cacert "$POPIFY_STAGING_TLS_DIR/tls.crt" -o /dev/null -w '%{http_code}' https://localhost:8444/api/n8n/triage-next)" = 404
+          echo "PASS: private gateway fails closed during API outage and recovers after replacement without restart"
       - name: Install isolated pinned browser tools
         run: |
           npm install --prefix "$RUNNER_TEMP/popify-browser" --no-audit --no-fund --ignore-scripts playwright@1.51.1 axe-core@4.10.3

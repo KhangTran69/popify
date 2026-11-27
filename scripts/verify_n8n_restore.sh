@@ -18,6 +18,8 @@ cleanup() {
   rm -rf -- "$work"
 }
 trap cleanup EXIT
+# The preceding PostgreSQL outage/restore exercise leaves n8n stopped.
+docker compose up -d --no-deps --wait --wait-timeout 180 n8n
 id=$(docker compose ps -aq n8n)
 source=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.n8n"}}{{.Name}}{{end}}{{end}}' "$id")
 image=$(docker inspect --format '{{.Image}}' "$id")
@@ -26,12 +28,20 @@ digest() {
   # Compare every regular file in the stopped synthetic volume, not only the
   # database and import marker. Hash filenames and contents without printing them.
   docker run --rm --network none --user 0 --mount "type=volume,source=$1,target=/state,readonly" \
-    --entrypoint sh "$image" -ec 'cd /state; test -s database.sqlite; test -s commerceops-workflows-sha; find . -type f -exec sha256sum {} \; | LC_ALL=C sort | sha256sum'
+    --entrypoint sh "$image" -ec 'set -o pipefail; cd /state; test -s database.sqlite; test -s commerceops-workflows-sha; find . -type f -exec sha256sum {} \; | LC_ALL=C sort | sha256sum'
 }
 api_image=$(docker inspect --format '{{.Image}}' "$(docker compose ps -q api)")
 sqlite_integrity() {
-  docker run --rm --network none --read-only --user 0 --mount "type=volume,source=$1,target=/state,readonly" \
-    --entrypoint python "$api_image" -c 'import sqlite3; db = sqlite3.connect("file:/state/database.sqlite?mode=ro&immutable=1", uri=True); assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)]; db.close()'
+  docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m --user 0 \
+    --mount "type=volume,source=$1,target=/state,readonly" --entrypoint python "$api_image" -c '
+import pathlib, shutil, sqlite3
+for name in ("database.sqlite", "database.sqlite-wal", "database.sqlite-journal"):
+    source = pathlib.Path("/state") / name
+    if source.exists():
+        shutil.copyfile(source, pathlib.Path("/tmp") / name)
+with sqlite3.connect("/tmp/database.sqlite") as db:
+    assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+'
 }
 gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "PoPify CI n8n <n8n@example.test>" rsa2048 encr 1d >/dev/null 2>&1
 recipient=$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10;exit}')
@@ -43,10 +53,8 @@ if bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/running.gpg"; then
 fi
 [[ ! -e "$work/running.gpg" ]]
 docker compose stop n8n
-# immutable SQLite reads are valid only on the stopped, checkpointed state.
-# Refuse a nonempty WAL rather than overlooking uncheckpointed records.
-docker run --rm --network none --user 0 --mount "type=volume,source=$source,target=/state,readonly" \
-  --entrypoint sh "$image" -ec 'test ! -s /state/database.sqlite-wal'
+# Verify a private temporary copy including any stopped WAL/journal.
+# SQLite may replay a journal on that copy, never on the source volume.
 sqlite_integrity "$source"
 original=$(digest "$source")
 bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/n8n.gpg"
