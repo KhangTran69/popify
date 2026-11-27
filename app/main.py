@@ -1454,6 +1454,8 @@ def reconcile_approval_route(
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
+    if not valid_text_fields(outcome, explanation, reference):
+        raise HTTPException(422, "Invalid reconciliation fields")
     try:
         reconcile_approval_execution(
             db, approval_id, outcome, explanation, reference, actor,

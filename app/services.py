@@ -1074,6 +1074,18 @@ def execute_approved(db, approval, mock_outcome=None, *, adapter=None):
         )
         db.flush()
         return
+    if execution and execution.state == "started":
+        execution.state = "ambiguous"
+        execution.detail = "A prior attempt was recorded without a terminal result. Reconcile before any new action."
+        execution.updated_at = utcnow()
+        approval.execution_status = "ambiguous"
+        approval.failure_detail = execution.detail
+        approval.next_attempt_at = None
+        audit(db, "approval", approval.id, "action_execution_ambiguous",
+              details={"reason": "persisted_started_attempt"},
+              correlation_id=(approval.supporting_facts or {}).get("correlation_id"))
+        db.flush()
+        return
     if execution and execution.state in ("succeeded", "ambiguous"):
         if approval.execution_status not in ("disputed", "reconciled_completed", "reconciled_not_executed"):
             approval.execution_status = execution.state

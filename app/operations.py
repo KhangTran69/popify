@@ -87,7 +87,7 @@ def queue_summary(db):
             "exhausted": db.scalar(select(func.count()).select_from(model).where(exhausted)) or 0,
         }
     result["uncertain_actions"] = db.scalar(select(func.count()).select_from(Approval).where(
-        Approval.execution_status.in_(["ambiguous", "blocked_prior_outcome"]))) or 0
+        Approval.execution_status.in_(["ambiguous", "disputed", "blocked_prior_outcome"]))) or 0
     return result
 
 

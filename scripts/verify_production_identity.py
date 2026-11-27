@@ -6,6 +6,7 @@ Run only on an explicitly disposable database; each run owns a unique schema.
 import os
 import re
 import uuid
+import time
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -15,7 +16,7 @@ from app import main
 from app.config import settings
 from app.db import Base, engine, get_db
 from app.identity import manage_account
-from app.models import Approval, Audit, Case, ActionExecution
+from app.models import Approval, Audit, Case, ActionExecution, ExecutionReconciliation
 
 PASSWORD = "synthetic-production-test-password"
 
@@ -31,6 +32,89 @@ def sign_in(client, username):
     assert "secure" in response.headers["set-cookie"].lower()
     assert "httponly" in response.headers["set-cookie"].lower()
     return token(client)
+
+
+def verify_recovery(sessions, worker, support, support_token, reviewer, reviewer_token):
+    """Exercise actual HTTP contracts and PostgreSQL state, all provider outcomes synthetic."""
+    headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
+    def queue_case(key):
+        assert support.post("/support", data={"csrf_token": support_token, "message": "Synthetic order status inquiry", "request_key": key}).status_code == 303
+        assert worker.post("/api/n8n/triage-next", headers=headers).json()["status"] == "needs_review"
+        with sessions() as db:
+            case = db.scalar(select(Case).where(Case.request_key == key))
+            return db.scalar(select(Approval.id).where(Approval.subject_type == "case",
+                Approval.subject_id == case.id, Approval.proposed_action == "send_reply"))
+    def decide(approval_id):
+        path = f"/approvals/{approval_id}/decision"
+        assert reviewer.post(path, data={"decision": "approved", "csrf_token": reviewer_token}).status_code == 303
+    def scan():
+        assert worker.post("/api/n8n/delayed-exceptions", headers=headers).status_code == 200
+    def execution(db, approval_id):
+        return db.scalar(select(ActionExecution).where(ActionExecution.idempotency_key == f"approval:{approval_id}"))
+    old_ambiguous, old_failures, old_delay = settings.mock_action_ambiguous, settings.mock_action_failures, settings.retry_base_seconds
+    try:
+        ambiguous = queue_case("production-uncertain")
+        decide(ambiguous)
+        settings.mock_action_ambiguous = True
+        scan()
+        scan()
+        with sessions() as db:
+            assert db.get(Approval, ambiguous).execution_status == "ambiguous"
+            assert execution(db, ambiguous).attempts == 1
+        retry_path = f"/approvals/{ambiguous}/retry"
+        assert reviewer.post(retry_path, data={"csrf_token": reviewer_token}).status_code == 409
+        reconcile_path = f"/approvals/{ambiguous}/reconcile"
+        data = {"outcome": "still_unknown", "explanation": "Synthetic evidence remains inconclusive.", "reference": "", "csrf_token": reviewer_token}
+        assert support.post(reconcile_path, data={**data, "csrf_token": support_token}).status_code == 403
+        assert reviewer.post(reconcile_path, data=data).status_code == 303
+        assert reviewer.post(reconcile_path, data=data).status_code == 303
+        assert reviewer.post(retry_path, data={"csrf_token": reviewer_token}).status_code == 409
+        data.update(outcome="confirmed_not_executed", explanation="Synthetic fixture confirms no external action occurred.", reference="CI-SYNTHETIC-EVIDENCE")
+        assert reviewer.post(reconcile_path, data=data).status_code == 303
+        assert reviewer.post(f"/approvals/{ambiguous}/refresh", data={"csrf_token": reviewer_token}).status_code == 303
+        with sessions() as db:
+            original = db.get(Approval, ambiguous)
+            replacement = original.replacement_approval_id
+            assert replacement and db.get(Approval, replacement).status == "pending"
+            assert execution(db, ambiguous).state == "ambiguous" and execution(db, ambiguous).attempts == 1
+            rows = list(db.scalars(select(ExecutionReconciliation).where(ExecutionReconciliation.approval_id == ambiguous)))
+            assert len(rows) == 2 and all(row.actor == "ci-reviewer" for row in rows)
+        settings.mock_action_ambiguous = False
+        scan()
+        with sessions() as db:
+            assert execution(db, replacement) is None
+        decide(replacement)
+        scan()
+        with sessions() as db:
+            assert execution(db, replacement).state == "succeeded"
+        transient = queue_case("production-transient")
+        decide(transient)
+        settings.mock_action_failures = 1
+        settings.retry_base_seconds = 2
+        scan()
+        scan()
+        with sessions() as db:
+            assert execution(db, transient).state == "retryable" and execution(db, transient).attempts == 1
+        time.sleep(2.2)
+        scan()
+        scan()
+        with sessions() as db:
+            assert execution(db, transient).state == "succeeded" and execution(db, transient).attempts == 2
+        started = queue_case("production-started")
+        decide(started)
+        with sessions() as db:
+            approval = db.get(Approval, started)
+            db.add(ActionExecution(idempotency_key=f"approval:{started}", proposed_action=approval.proposed_action,
+                evidence_hash=approval.evidence_hash, state="started", attempts=1))
+            db.commit()
+        scan()
+        scan()
+        with sessions() as db:
+            assert execution(db, started).state == "ambiguous" and execution(db, started).attempts == 1
+            assert db.get(Approval, started).execution_status == "ambiguous"
+        print("PASS: PostgreSQL HTTP recovery: uncertainty blocked, reconciliation idempotent, fresh approval required, due retry only, persisted started attempt fails closed")
+    finally:
+        settings.mock_action_ambiguous, settings.mock_action_failures, settings.retry_base_seconds = old_ambiguous, old_failures, old_delay
 
 
 def run():
@@ -85,6 +169,7 @@ def run():
                 execution = db.scalar(select(ActionExecution).where(ActionExecution.idempotency_key == f"approval:{approval_id}"))
                 assert approval.actor == "ci-reviewer" and approval.status == "approved"
                 assert execution and execution.state == "succeeded"
+            verify_recovery(sessions, admin, support, support_token, reviewer, reviewer_token)
             cookie = reviewer.cookies.get("session")
             assert admin.post("/operators/ci-reviewer", data={"action": "revoke", "csrf_token": admin_token}).status_code == 303
             replay = TestClient(main.app, base_url="https://testserver", follow_redirects=False)
