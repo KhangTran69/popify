@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 from app.config import settings
 from app.integrations import verify_shopify, generate_support_content
+from app.privacy import minimized_order_payload
 from app.action_provider import ActionRequest, MockActionAdapter, normalize_adapter_result
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
@@ -93,7 +94,7 @@ def normalize_order(payload, shop="demo.myshopify.com"):
         source_updated_at=parse_dt(
             payload.get("updated_at") or payload.get("created_at")
         ),
-        payload=payload,
+        payload=minimized_order_payload(payload),
     )
 
 
@@ -122,6 +123,7 @@ def process_delivery(db: Session, delivery_id: int):
         return {"status": "exhausted"}
     if delivery.next_attempt_at and as_utc(delivery.next_attempt_at) > utcnow():
         return {"status": "deferred"}
+    attempts_before = delivery.attempts
     delivery.attempts += 1
     try:
         data = normalize_order(delivery.payload, delivery.shop_domain)
@@ -197,8 +199,14 @@ def process_delivery(db: Session, delivery_id: int):
         delivery = db.scalar(
             select(Delivery).where(Delivery.id == delivery_id).with_for_update()
         )
-        if delivery.status == "processed":
+        if not delivery or delivery.status == "processed":
             return {"status": "duplicate"}
+        # Rollback releases the row lock. A competing worker can finish or
+        # schedule a retry before we reacquire it; never consume its attempt.
+        if delivery.status == "exhausted":
+            return {"status": "exhausted"}
+        if delivery.attempts != attempts_before or (delivery.next_attempt_at and as_utc(delivery.next_attempt_at) > utcnow()):
+            return {"status": "deferred"}
         delivery.attempts += 1
         delivery.status = (
             "exhausted"
@@ -237,14 +245,17 @@ def create_support_case(
 ):
     order = None
     if order_ref and email:
-        order = db.scalar(
+        matches = list(db.scalars(
             select(Order).where(
                 (Order.order_number == order_ref) | (Order.external_id == order_ref),
                 func.lower(Order.email) == email.strip().lower(),
                 Order.shop_domain
                 == (settings.shopify_store_domain or "demo.myshopify.com"),
-            )
-        )
+            ).limit(2)
+        ))
+        # A reference can match one external ID and another display number.
+        # Never disclose facts or bind an approval to an arbitrary match.
+        order = matches[0] if len(matches) == 1 else None
     category, confidence = classify(message)
     facts = (
         f"Order {order.order_number} is {order.fulfillment_status}; total {order.currency} {order.total}."
@@ -1073,6 +1084,18 @@ def execute_approved(db, approval, mock_outcome=None, *, adapter=None):
         )
         db.flush()
         return
+    if execution and execution.state == "started":
+        execution.state = "ambiguous"
+        execution.detail = "A prior attempt was recorded without a terminal result. Reconcile before any new action."
+        execution.updated_at = utcnow()
+        approval.execution_status = "ambiguous"
+        approval.failure_detail = execution.detail
+        approval.next_attempt_at = None
+        audit(db, "approval", approval.id, "action_execution_ambiguous",
+              details={"reason": "persisted_started_attempt"},
+              correlation_id=(approval.supporting_facts or {}).get("correlation_id"))
+        db.flush()
+        return
     if execution and execution.state in ("succeeded", "ambiguous"):
         if approval.execution_status not in ("disputed", "reconciled_completed", "reconciled_not_executed"):
             approval.execution_status = execution.state
@@ -1203,7 +1226,7 @@ def execute_approved(db, approval, mock_outcome=None, *, adapter=None):
     db.flush()
 
 
-def queue_support(db, message, order_ref, email, request_key=None):
+def queue_support(db, message, order_ref, email, request_key=None, *, actor="system"):
     key = request_key or str(uuid.uuid4())
     existing = db.scalar(select(Case).where(Case.request_key == key))
     if existing:
@@ -1231,7 +1254,7 @@ def queue_support(db, message, order_ref, email, request_key=None):
         raise SupportRequestKeyConflict(
             "request_key is already associated with different inquiry details"
         )
-    audit(db, "case", case.id, "inquiry_queued", correlation_id=key)
+    audit(db, "case", case.id, "inquiry_queued", actor=actor, correlation_id=key)
     db.commit()
     return case
 

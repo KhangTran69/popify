@@ -2,7 +2,9 @@ name: CommerceOps checks
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -58,6 +60,16 @@ jobs:
       - run: python -m scripts.migrate
       - run: python -m scripts.verify_migrations
       - run: python -m scripts.verify_postgres
+      - name: Verify production managed identity using isolated PostgreSQL
+        env:
+          POPIFY_CONFIRM_DISPOSABLE: "1"
+          POPIFY_ENV: production
+          MANAGED_IDENTITY: "true"
+          COOKIE_SECURE: "true"
+          APP_SECRET: synthetic-ci-only-app-secret-32-characters
+          N8N_WEBHOOK_SECRET: synthetic-ci-only-worker-secret-32-characters
+          N8N_ENCRYPTION_KEY: synthetic-ci-only-encryption-key-32-characters
+        run: python -m scripts.verify_production_identity
 
   live-compose-demo:
     runs-on: ubuntu-latest
@@ -68,18 +80,212 @@ jobs:
         with:
           python-version: "3.12"
       - name: Configure disposable mock stack
-        run: cp .env.example .env
+        run: |
+          cp .env.example .env
+          sed -i 's/^SHOPIFY_WEBHOOK_SECRET=$/SHOPIFY_WEBHOOK_SECRET=synthetic-ci-scheduled-intake-only/' .env
       - name: Start PostgreSQL, FastAPI, and n8n
         run: docker compose up --build --detach --wait --wait-timeout 240
       - name: Run the real local workflow walkthrough
         run: python -m scripts.verify demo
+      # Pause scheduled consumers so the targeted sequential benchmark owns its queue.
+      - name: Pause scheduled n8n workers for isolated measurement
+        run: docker compose stop n8n
       - name: Benchmark signed intake and PostgreSQL queue processing
         run: >-
           docker compose exec -T -e POPIFY_BENCHMARK_COMMIT=${GITHUB_SHA} api
           python -m scripts.benchmark --count 100
           --use-configured-database --confirm-disposable-db
+      - name: Verify public webhook ingress controls
+        env:
+          POPIFY_CONFIRM_DISPOSABLE: "1"
+        run: sh scripts/verify_ingress.sh
+      - name: Verify durable work through n8n and API interruption
+        run: |
+          docker compose stop n8n
+          docker compose exec -T api python -m scripts.verify_outage queue --confirm-disposable
+          docker compose restart api
+          docker compose up -d --wait --wait-timeout 120 api
+          docker compose exec -T api python -m scripts.verify_outage pending --confirm-disposable
+          docker compose start n8n
+          docker compose exec -T api python -m scripts.verify_outage recovered --confirm-disposable
+      - name: Verify database outage and readiness recovery
+        run: |
+          docker compose stop n8n db
+          test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/live)" = 200
+          test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 503
+          docker compose exec -T api python -m scripts.verify_db_outage unavailable --confirm-disposable
+          docker compose exec -T api python -m scripts.verify_monitor_outage unavailable --confirm-disposable
+          docker compose up -d --wait --wait-timeout 120 db
+          test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 200
+          docker compose exec -T api python -m scripts.verify_db_outage recovered --confirm-disposable
+          docker compose exec -T api python -m scripts.verify_monitor_outage recovered --confirm-disposable
+      - name: Seed synthetic managed identity for restore verification
+        run: docker compose exec -T api python -m scripts.seed_restore_identity --confirm-disposable
+      - name: Verify encrypted disposable PostgreSQL backup restoration
+        env:
+          POPIFY_CONFIRM_DISPOSABLE: "1"
+        run: bash scripts/verify_encrypted_restore.sh
+      - name: Recover encrypted n8n state on separate volume
+        env:
+          POPIFY_CONFIRM_DISPOSABLE: "1"
+        run: bash scripts/verify_n8n_restore.sh
       - name: Show service logs on failure and clean up
         if: always()
         run: |
           docker compose logs --no-color --tail=120 || true
           docker compose down --remove-orphans
+
+  scheduled-workload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [steady, overload]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure disposable mock stack
+        run: |
+          cp .env.example .env
+          sed -i 's/^SHOPIFY_WEBHOOK_SECRET=$/SHOPIFY_WEBHOOK_SECRET=synthetic-ci-scheduled-intake-only/' .env
+      - name: Start actual scheduled n8n workers
+        run: docker compose up --build --detach --wait --wait-timeout 240
+      - name: Measure real scheduled order and support queue latency
+        run: |
+          set -o pipefail
+          docker compose exec -T api python -m scripts.verify_scheduled_workload --confirm-disposable --profile ${{ matrix.profile }} | tee scheduled-workload.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scheduled-workload-${{ matrix.profile }}
+          path: scheduled-workload.log
+          if-no-files-found: ignore
+      - name: Clean disposable scheduled stack
+        if: always()
+        run: |
+          docker compose logs --no-color --tail=80 || true
+          docker compose down --volumes --remove-orphans
+
+  browser-accessibility:
+    # Playwright 1.51 is supported on Ubuntu 24.04, not the latest 26.04 runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      POPIFY_ENV: development
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-test.lock
+      - run: python -m pip install -r requirements-test.lock -e '.[test]'
+      - name: Install isolated pinned browser tools
+        run: |
+          npm install --prefix "$RUNNER_TEMP/popify-browser" --no-audit --no-fund --ignore-scripts playwright@1.51.1 axe-core@4.10.3
+          "$RUNNER_TEMP/popify-browser/node_modules/.bin/playwright" install chromium
+      - name: Run browser and accessibility checks
+        run: POPIFY_BROWSER_MODULES="$RUNNER_TEMP/popify-browser" node scripts/verify_browser.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accessibility-report
+          path: accessibility-report.json
+          if-no-files-found: ignore
+
+  private-staging:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Configure disposable mock-only staging
+        run: |
+          cp .env.example .env
+          python - <<'PY'
+          from pathlib import Path
+          from secrets import token_hex
+          p = Path(".env")
+          keys = {"POSTGRES_PASSWORD", "APP_SECRET", "N8N_WEBHOOK_SECRET", "N8N_ENCRYPTION_KEY"}
+          lines = p.read_text().splitlines()
+          p.write_text("\n".join(line.split("=", 1)[0] + "=" + token_hex(32) if line.split("=", 1)[0] in keys else line for line in lines) + "\n")
+          PY
+          mkdir -m 700 "$RUNNER_TEMP/popify-tls"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout "$RUNNER_TEMP/popify-tls/tls.key" -out "$RUNNER_TEMP/popify-tls/tls.crt" >/dev/null 2>&1
+          echo "POPIFY_STAGING_TLS_DIR=$RUNNER_TEMP/popify-tls" >> "$GITHUB_ENV"
+      - name: Start private mock-only staging
+        run: docker compose -f docker-compose.yml -f deploy/staging.compose.yml up --build --detach --wait --wait-timeout 240
+      - name: Verify no API, n8n or database host ports
+        run: |
+          for service in api n8n db; do
+            id=$(docker compose -f docker-compose.yml -f deploy/staging.compose.yml ps -q "$service")
+            bindings=$(docker inspect --format '{{json .HostConfig.PortBindings}}' "$id")
+            test "$bindings" = '{}' || test "$bindings" = 'null'
+          done
+      - name: Verify private staging network separation
+        run: |
+          for service in db n8n operator-gateway; do
+            id=$(docker compose -f docker-compose.yml -f deploy/staging.compose.yml ps -q "$service")
+            docker inspect --format '{{json .NetworkSettings.Networks}}' "$id" > "$RUNNER_TEMP/$service.network.json"
+          done
+          id=$(docker compose -f docker-compose.yml -f deploy/staging.compose.yml ps -q api)
+          docker inspect --format '{{json .NetworkSettings.Networks}}' "$id" > "$RUNNER_TEMP/api.network.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          networks = {name: set(json.loads((root / (name + ".network.json")).read_text())) for name in ("api","db","n8n","operator-gateway")}
+          peers = [networks[name] for name in ("db","n8n","operator-gateway")]
+          assert all(len(peer) == 1 for peer in peers)
+          assert len(set.union(*peers)) == 3 and networks["api"] == set.union(*peers)
+          print("PASS: database, worker and operator network membership isolated; API is sole shared service")
+          PY
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T n8n node -e 'const dns=require("node:dns").promises; (async()=>{await dns.lookup("api");try{await dns.lookup("db")}catch(e){if(e.code==="ENOTFOUND"||e.code==="EAI_AGAIN")return;throw e}throw Error("database resolved from worker network")})().catch(()=>process.exit(1))'
+      - name: Provision synthetic accounts
+        run: |
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'
+          from app.db import SessionLocal
+          from app.identity import manage_account
+          with SessionLocal() as db:
+              for role in ("admin", "auditor", "support", "reviewer"):
+                  manage_account(db, "ci-staging-" + role, "create", role=role, password="synthetic-staging-test-password")
+          PY
+      - name: Validate actual HTTPS identity and route isolation
+        run: python -m scripts.verify_staging --ca "$POPIFY_STAGING_TLS_DIR/tls.crt" --confirm-disposable
+      - name: Install isolated pinned browser tools
+        run: |
+          npm install --prefix "$RUNNER_TEMP/popify-browser" --no-audit --no-fund --ignore-scripts playwright@1.51.1 axe-core@4.10.3
+          "$RUNNER_TEMP/popify-browser/node_modules/.bin/playwright" install chromium
+      - name: Verify managed role browser journeys
+        run: POPIFY_BROWSER_MODULES="$RUNNER_TEMP/popify-browser" node scripts/verify_managed_browser.mjs
+      - name: Verify managed browser business and audit records
+        run: |
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'
+          from sqlalchemy import select
+          from app.db import SessionLocal
+          from app.models import Case, Approval, ActionExecution, Audit
+          with SessionLocal() as db:
+              for suffix, expected in (("approved", "approved"), ("rejected", "rejected")):
+                  case = db.scalar(select(Case).where(Case.message == "Synthetic staging inquiry " + suffix))
+                  assert case and case.attempts == 1
+                  approval = db.scalar(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id, Approval.proposed_action == "send_reply"))
+                  assert approval and approval.status == expected and approval.actor == "ci-staging-reviewer"
+                  rows = list(db.scalars(select(ActionExecution).where(ActionExecution.idempotency_key == f"approval:{approval.id}")))
+                  assert len(rows) == (1 if expected == "approved" else 0)
+                  if rows:
+                      assert rows[0].state == "succeeded" and rows[0].attempts == 1
+                  event = db.scalar(select(Audit).where(Audit.entity_type == "case", Audit.entity_id == case.id, Audit.event == "inquiry_queued"))
+                  assert event and event.actor == "ci-staging-support"
+          print("PASS: real staging browser actions persisted correct roles, one approved execution and no rejected execution")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: managed-accessibility-report
+          path: managed-accessibility-report.json
+          if-no-files-found: ignore
+      - name: Clean disposable staging
+        if: always()
+        run: docker compose -f docker-compose.yml -f deploy/staging.compose.yml down --volumes --remove-orphans

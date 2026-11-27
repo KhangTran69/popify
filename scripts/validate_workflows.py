@@ -24,4 +24,11 @@ for path in paths:
                     assert (
                         connection["node"] in names
                     ), f"{path}: unknown target {connection['node']}"
+    workers = [n for n in workflow["nodes"] if n["type"] == required_roles["worker"]]
+    if path.name in ("01-order-intake.json", "02-support-triage.json"):
+        assert len(workers) == 1
+        expected = "process-next" if path.name.startswith("01") else "triage-next"
+        assert workers[0]["parameters"]["url"] == f"http://api:8000/api/n8n/{expected}?batch_size=5"
+        schedules = [n for n in workflow["nodes"] if n["type"] == required_roles["scheduleTrigger"]]
+        assert len(schedules) == 1 and schedules[0]["parameters"]["rule"]["interval"] == [{"field":"minutes", "minutesInterval":1}]
     print(f"{path}: valid JSON; {len(names)} nodes; connections resolve")

@@ -47,8 +47,8 @@ There is no custom scheduler. Each workflow runs once per minute in n8n. FastAPI
 
 | Workflow | Work per run | Local POST trigger |
 | --- | --- | --- |
-| 01 — Order intake | Process one due delivery | `/webhook/commerceops/orders/process` |
-| 02 — Support triage | Process one due inquiry | `/webhook/commerceops/support/triage` |
+| 01 — Order intake | Process up to five due deliveries | `/webhook/commerceops/orders/process` |
+| 02 — Support triage | Process up to five due mock inquiries | `/webhook/commerceops/support/triage` |
 | 03 — Exceptions and actions | Detect delayed orders; process up to 20 due approved actions | `/webhook/commerceops/exceptions/scan` |
 
 The trigger URLs use port 5678 and are local demo conveniences. They return worker summaries and do not accept customer payloads. The n8n editor shows its own execution history. Successful workflow data contains worker summaries; error payload persistence is disabled. Original customer messages remain in the protected operator application.
@@ -69,9 +69,9 @@ fi
 docker compose up --build -d
 ```
 
-Before the **first** start, replace `POSTGRES_PASSWORD`, `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env` with unique values. Use a long URL-safe password for PostgreSQL; Compose builds the matching database URL from the configured database name, username, and password. Production requires at least 32 characters for `APP_SECRET`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY`, and at least 12 for `OPERATOR_PASSWORD`. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
+Before the **first** start, replace `POSTGRES_PASSWORD`, `APP_SECRET`, `OPERATOR_PASSWORD`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY` in `.env` with unique values. Use a long URL-safe password for PostgreSQL; Compose builds the matching database URL from the configured database name, username, and password. Production requires at least 32 characters for `APP_SECRET`, `N8N_WEBHOOK_SECRET`, and `N8N_ENCRYPTION_KEY`, ; production accounts are provisioned with passwords of 12–256 characters. Keep an existing n8n encryption key stable: changing it breaks decryption of existing encrypted state. Do not expose this stack publicly. Published ports bind to `127.0.0.1`.
 
-The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. A correct operator password can still sign in while a failure bucket is limited. The isolated preview keeps its fixed demonstration login behavior.
+The operator login is limited to five failed attempts per client address and account in a 15-minute window; another failed request while limited returns HTTP 429 with a `Retry-After` header. In legacy local mode a correct password can still sign in while limited; managed identity mode enforces the persisted budget before password verification. The isolated preview keeps its fixed demonstration login behavior.
 
 No Shopify or LLM credentials are needed for mock mode. Named volumes preserve PostgreSQL and n8n across ordinary restarts. Do not use `docker compose down -v` to troubleshoot.
 
@@ -279,11 +279,21 @@ GitHub Actions runs the SQLite behavior suite, validates all three workflow expo
 5. For optional OpenAI verification, configure a key, restart the API, and submit representative inquiries. Review categories, uncertainty, policy, and approved mock outcomes. This incurs provider usage and was not performed here.
 6. External messaging/refunds/cancellations are not implemented and remain disabled. Connecting a live action adapter requires separate authorization and provider-specific idempotency/reconciliation work.
 
+## Managed operator accounts
+
+See [Managed operator identities](docs/OPERATOR_IDENTITY.md) for account provisioning, role boundaries and session revocation. Production requires managed identity and PostgreSQL; the shared configured login remains for local development and isolated preview only.
+
+Managed administrators can use the operator accounts screen to inspect roles and revoke access; provisioning and password resets use the trusted CLI.
+
+See [Operations and recovery runbook](docs/OPERATIONS.md) for readiness, protected metrics, privacy and restoration procedures.
+
+For a private, mock-only staging configuration, see the staging profile in [the operations runbook](docs/OPERATIONS.md). It is separate from the local demonstration and does not enable live integrations.
+
 ## Production-readiness boundary
 
-PoPify is a single-store portfolio demonstration. Its operator login uses one configured username/password, a signed session cookie, CSRF protection, and login rate limiting; it has no per-person accounts, MFA, SSO, or role management. Worker events and failures appear in application audit history, but there is no centralized metrics backend, alerting, or defined service-level objective. Docker named volumes preserve data across restarts, but the project has no scheduled offsite backup or tested point-in-time restore process.
+PoPify is a single-store portfolio demonstration. Its operator login uses one configured username/password, a signed session cookie, CSRF protection, and login rate limiting; managed identity mode provides individual accounts, roles and revocable sessions. MFA and SSO are not implemented. Worker events and failures appear in application audit history, but the protected operations endpoint provides queue and worker summaries; a centralized metrics backend, alerts and formal service objectives are still required. Docker named volumes preserve data across restarts, but the project has no scheduled offsite backup or tested point-in-time restore process.
 
-Before production, add managed identity and per-operator authorization, managed secret storage and rotation, encrypted backups with restore drills, centralized logs/metrics/alerts, retention and privacy controls, and store isolation. Before connecting a live commerce or messaging provider, implement a least-privilege provider adapter, provider-specific idempotency and reconciliation, rate-limit handling, sandbox tests, and explicit operator authorization. Real messages, refunds, and cancellations are not implemented.
+Before production, verify managed identity and per-operator authorization, managed secret storage and rotation, encrypted backups with restore drills, centralized logs/metrics/alerts, retention and privacy controls, and store isolation. Before connecting a live commerce or messaging provider, implement a least-privilege provider adapter, provider-specific idempotency and reconciliation, rate-limit handling, sandbox tests, and explicit operator authorization. Real messages, refunds, and cancellations are not implemented.
 
 Official documentation consulted for this implementation:
 
@@ -307,4 +317,6 @@ Official documentation consulted for this implementation:
 | n8n encryption-key mismatch | Restore the original configured key; do not rotate it or delete volumes |
 | Migration error | Read API startup logs and `schema_migrations`; preserve the database and fix the failing migration |
 
-This is a single-operator local portfolio system. Production identity, secret rotation, retention, high-volume worker throughput, multi-store isolation, and real outbound adapters require additional work.
+This is a single-operator local portfolio system. Production identity verification, secret rotation, retention, high-volume worker throughput, multi-store isolation, and real outbound adapters require additional work.
+
+Operational ownership and handover: [single-store mock staging handover](docs/OPERATIONAL_HANDOVER.md) and [release gates](docs/RELEASE_GATES.md).

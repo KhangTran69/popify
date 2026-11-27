@@ -1,6 +1,6 @@
 {% extends 'base.html' %}
 {% block content %}
-<main id="main" class="wrap scenario-page">
+<main id="main" tabindex="-1" class="wrap scenario-page">
   <a class="back" href="/demo">← Back to scenario workspace</a>
   <div class="headline">
     <div>
@@ -68,7 +68,7 @@
 
     <section class="box" aria-labelledby="scenario-action-title">
       <div class="panelhead"><div><h2 id="scenario-action-title">Continue this scenario</h2><p>Choose the action supported by the current persisted state. Starting another run preserves this one.</p></div></div>
-      <form method="post" action="/demo/preview/scenarios" class="inline-actions"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="{{ scenario.scenario_key }}"><button class="secondary">Start another {{ scenario.name }} run</button></form>
+      {% if request.state.operator_role == "admin" and demo_enabled %}<form method="post" action="/demo/preview/scenarios" class="inline-actions"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="{{ scenario.scenario_key }}"><button class="secondary">Start another {{ scenario.name }} run</button></form>{% else %}<p class="field-help">This action requires an authorized operator.</p>{% endif %}
       {% if blocking_approval %}
         <div class="notice warn"><strong>Related outcome needs review</strong><p>Current approval: {{ current.status }} · {{ current.execution_status.replace('_', ' ') }}. Inspect the related execution before taking further action; completed results remain recorded.</p></div>
         <a class="button" href="/approvals/{{ blocking_approval.id }}?from_scenario={{ scenario.scenario_id }}">Review related approval #{{ blocking_approval.id }} ↗</a>
@@ -78,22 +78,22 @@
       {% elif reconciliable %}
         {% if reconciliation %}<div class="notice {{ 'good' if reconciliation.outcome == 'confirmed_completed' else 'warn' }}"><strong>{% if reconciliation.outcome == 'conflicting_evidence' %}Conflicting evidence · recovery remains blocked{% elif reconciliation.outcome == 'still_unknown' %}Outcome remains unknown{% else %}Current conclusion · {{ reconciliation.outcome.replace('_', ' ') }}{% endif %}</strong><p>The original execution remains ambiguous. This is an operator assertion; no provider was queried. {% if reconciliation.outcome in ['still_unknown', 'conflicting_evidence'] %}Append newly supported evidence below; do not retry while the outcome is uncertain.{% endif %} {{ reconciliation.explanation }}</p></div>
         {% else %}<div class="notice warn"><strong>Outcome uncertain · no automatic retry</strong><p>A timeout alone cannot establish whether the action completed. Record an operator conclusion and a reference for either definite outcome. No provider is queried.</p></div>{% endif %}
-        <form class="reconciliation-form" method="post" action="/approvals/{{ current.id }}/reconcile?from_scenario={{ scenario.scenario_id }}">
+        {% if request.state.operator_role in ["admin", "reviewer"] %}<form class="reconciliation-form" method="post" action="/approvals/{{ current.id }}/reconcile?from_scenario={{ scenario.scenario_id }}">
           <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario_id" value="{{ scenario.scenario_id }}">
           <label for="scenario-outcome">New operator conclusion</label>
           <select id="scenario-outcome" name="outcome" required><option value="still_unknown">Still unknown · keep recovery blocked</option><option value="confirmed_completed">Confirmed completed · close recovery</option><option value="confirmed_not_executed">Confirmed not executed · require a fresh approval</option></select>
           <label for="scenario-explanation">Evidence and explanation</label><textarea id="scenario-explanation" name="explanation" minlength="10" maxlength="2000" required></textarea>
           <label for="scenario-reference">Supporting reference</label><input id="scenario-reference" name="reference" maxlength="240"><p class="field-help">Required for either definite conclusion. Saved as provided and not externally verified.</p>
           <button>Append operator reconciliation</button>
-        </form>
-        {% if current.execution_status == 'reconciled_not_executed' and not current.replacement_approval_id %}<form method="post" action="/approvals/{{ current.id }}/refresh?from_scenario={{ scenario.scenario_id }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="secondary">Create a fresh pending approval</button></form>{% endif %}
+        </form>{% else %}<p class="field-help">This action requires an authorized operator.</p>{% endif %}
+        {% if current.execution_status == 'reconciled_not_executed' and not current.replacement_approval_id %}{% if request.state.operator_role in ["admin", "reviewer"] %}<form method="post" action="/approvals/{{ current.id }}/refresh?from_scenario={{ scenario.scenario_id }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="secondary">Create a fresh pending approval</button></form>{% else %}<p class="field-help">This action requires an authorized operator.</p>{% endif %}{% endif %}
       {% elif current.execution_status in ['ambiguous', 'disputed', 'reconciled_completed', 'reconciled_not_executed'] and reconciliation %}
         <div class="notice warn"><strong>Recovery is blocked</strong><p>A supported action is unavailable for this approval. Inspect the recorded evidence and approval revision history.</p></div>
       {% elif current.execution_status in ['queued', 'retryable'] and preview_waiting %}
         <div class="notice warn"><strong>Waiting for backoff</strong><p>Next eligible attempt: {{ current.next_attempt_at|utc }}. Preview does not run background workers.</p></div>
         <a class="record-link" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Inspect retry details ↗</a>
       {% elif current.execution_status in ['queued', 'retryable'] %}
-        <form method="post" action="/approvals/{{ current.id }}/preview-run?from_scenario={{ scenario.scenario_id }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario_id" value="{{ scenario.scenario_id }}"><button>Run one due local mock attempt</button></form>
+        {% if request.state.operator_role == "admin" and demo_enabled %}<form method="post" action="/approvals/{{ current.id }}/preview-run?from_scenario={{ scenario.scenario_id }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario_id" value="{{ scenario.scenario_id }}"><button>Run one due local mock attempt</button></form>{% else %}<p class="field-help">This action requires an authorized operator.</p>{% endif %}
       {% elif current.execution_status == 'exhausted' %}
         <a class="button" href="/approvals/{{ current.id }}?from_scenario={{ scenario.scenario_id }}">Review attempts and queue recovery ↗</a>
       {% elif current.execution_status == 'evidence_changed' %}

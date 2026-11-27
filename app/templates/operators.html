@@ -1,0 +1,31 @@
+{% extends 'base.html' %}
+{% block content %}
+<main id="main" tabindex="-1" class="wrap">
+  <div class="headline"><div><div class="eyebrow">ADMINISTRATION / IDENTITY</div><h1>Operator accounts</h1>
+    <p class="sub">Review access and revoke sessions. New accounts and password resets are provisioned through the trusted deployment terminal.</p></div></div>
+  <section class="panel">
+    <div class="table-scroll"><table><caption class="field-help">Managed single-store operators</caption>
+      <thead><tr><th scope="col">Operator</th><th scope="col">Role</th><th scope="col">Access</th><th scope="col">Active sessions</th><th scope="col">Actions</th></tr></thead>
+      <tbody>{% for row in operators %}<tr>
+        <td>{{ row.username }}{% if row.username == actor %} (you){% endif %}</td>
+        <td>{{ row.role }}</td><td>{{ 'Enabled' if row.active else 'Disabled' }}</td><td>{{ row.active_sessions }}</td>
+        <td>{% if row.username != actor %}
+          <form method="post" action="/operators/{{ row.username }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf }}">
+            <label for="role-{{ row.id }}">Role for {{ row.username }}</label>
+            <select id="role-{{ row.id }}" name="role">{% for role in roles %}<option value="{{ role }}" {% if role == row.role %}selected{% endif %}>{{ role }}</option>{% endfor %}</select>
+            <button class="secondary" name="action" value="role">Change role</button>
+            <button class="secondary" name="action" value="{{ 'disable' if row.active else 'enable' }}">{{ 'Disable access' if row.active else 'Enable access' }}</button>
+            <button class="secondary" name="action" value="revoke">Revoke sessions</button>
+          </form>
+        {% else %}<p>Another administrator must change this account.</p>{% endif %}</td>
+      </tr>{% else %}<tr><td colspan="5">No operator accounts on this page.</td></tr>{% endfor %}</tbody>
+    </table></div>
+    <nav class="pagination" aria-label="Operator account pages">
+      {% if page > 1 %}<a href="?page={{ page - 1 }}">Previous</a>{% endif %}
+      <span>Page {{ page }}</span>
+      {% if has_next %}<a href="?page={{ page + 1 }}">Next</a>{% endif %}
+    </nav>
+  </section>
+</main>
+{% endblock %}

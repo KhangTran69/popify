@@ -1,0 +1,41 @@
+# Private mock-only staging profile; use current Docker Compose supporting !reset.
+services:
+  api:
+    ports: !reset []
+    networks: [data_plane, worker_plane, operator_plane]
+    environment:
+      POPIFY_ENV: production
+      MANAGED_IDENTITY: "true"
+      COOKIE_SECURE: "true"
+      LLM_MODE: mock
+      ALLOW_EXTERNAL_AI: "false"
+      OPENAI_API_KEY: ""
+      SHOPIFY_WEBHOOK_SECRET: ""
+      SHOPIFY_ADMIN_TOKEN: ""
+      MOCK_ACTION_FAILURES: "0"
+      MOCK_ACTION_AMBIGUOUS: "false"
+    restart: unless-stopped
+  n8n:
+    networks: [worker_plane]
+    ports: !reset []
+    restart: unless-stopped
+  db:
+    networks: [data_plane]
+    restart: unless-stopped
+  operator-gateway:
+    networks: [operator_plane]
+    image: nginx:1.28-alpine
+    ports: ["127.0.0.1:8444:8443"]
+    volumes:
+      - "./deploy/private-operator.nginx.conf:/etc/nginx/nginx.conf:ro"
+      - "${POPIFY_STAGING_TLS_DIR:?Set the staging TLS certificate directory}:/etc/nginx/tls:ro"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+networks:
+  data_plane:
+    internal: true
+  worker_plane:
+    internal: true
+  operator_plane: {}

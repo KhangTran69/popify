@@ -9,7 +9,7 @@
   .preview-example p{font-size:13px;line-height:1.5}.preview-step{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--brand)}
   @media(max-width:620px){.preview-example-grid{grid-template-columns:1fr;padding:12px}}
 </style>
-<main id="main" class="wrap">
+<main id="main" tabindex="-1" class="wrap">
   <div class="headline">
     <div>
       <div class="eyebrow">PORTFOLIO WALKTHROUGH · ISOLATED PREVIEW</div>
@@ -35,19 +35,19 @@
   <section class="panel reviewer-path" aria-labelledby="reviewer-path-title">
     <div class="panelhead"><div><h2 id="reviewer-path-title">Five-minute reviewer path</h2><p>Run these two synthetic scenarios in order. Each begins with an operator decision and keeps its own saved records.</p></div></div>
     <div class="reviewer-path-grid">
-      <article><span class="preview-step">01 · Successful action</span><h3>Approve a grounded reply</h3><p>Open the saved inquiry and order facts, approve the draft, then inspect the mock execution and audit history.</p><form method="post" action="/demo/preview/scenarios"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="success"><button>Start success run</button></form></article>
-      <article><span class="preview-step">02 · Human recovery</span><h3>Resolve an uncertain outcome</h3><p>Approve once to create a simulated timeout. Review the original execution, record a supported conclusion, and see why blind retry stays blocked.</p><form method="post" action="/demo/preview/scenarios"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="ambiguous"><button class="secondary">Start recovery run</button></form></article>
+      <article><span class="preview-step">01 · Successful action</span><h3>Approve a grounded reply</h3><p>Open the saved inquiry and order facts, approve the draft, then inspect the mock execution and audit history.</p>{% if request.state.operator_role == "admin" and demo_enabled %}<form method="post" action="/demo/preview/scenarios"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="success"><button>Start success run</button></form>{% else %}<p class="field-help">This action requires an authorized operator.</p>{% endif %}</article>
+      <article><span class="preview-step">02 · Human recovery</span><h3>Resolve an uncertain outcome</h3><p>Approve once to create a simulated timeout. Review the original execution, record a supported conclusion, and see why blind retry stays blocked.</p>{% if request.state.operator_role == "admin" and demo_enabled %}<form method="post" action="/demo/preview/scenarios"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="scenario" value="ambiguous"><button class="secondary">Start recovery run</button></form>{% else %}<p class="field-help">This action requires an authorized operator.</p>{% endif %}</article>
     </div>
     <p class="field-help">These actions use the temporary SQLite preview. The real n8n walkthrough is available only in the local Docker stack.</p>
   </section>
   <section class="panel">
     <div class="panelhead"><div><h2>Scenario workspace</h2><p>{{ preview_total }} saved scenarios · newest first. Saved examples show historical outcomes. Creating a run starts at a pending human decision.</p></div></div>
-    <form method="post" action="/demo/preview/scenarios" class="inline-actions">
+    {% if request.state.operator_role == "admin" and demo_enabled %}<form method="post" action="/demo/preview/scenarios" class="inline-actions">
       <input type="hidden" name="csrf_token" value="{{ csrf }}">
       <label for="scenario">Start a new guided run (pending human decision)</label>
       <select id="scenario" name="scenario">{% for scenario in preview_scenarios %}<option value="{{ scenario }}">{{ scenario.replace('_', ' ')|capitalize }} · {{ preview_scenario_descriptions[scenario] }}</option>{% endfor %}</select>
       <button>Start guided run</button>
-    </form>
+    </form>{% else %}<p class="field-help">This action requires an authorized operator.</p>{% endif %}
     <div class="preview-example-grid">
       {% for approval in preview_examples %}
       <article class="preview-example">

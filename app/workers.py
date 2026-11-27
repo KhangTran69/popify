@@ -1,0 +1,77 @@
+"""Queue selection and bounded independent-transaction worker invocations."""
+import time
+from sqlalchemy import or_, select
+from app.config import settings
+from app.models import Delivery, Case, utcnow
+from app.services import process_delivery, process_support, audit
+
+
+def process_next_delivery(db):
+    pending = db.scalar(
+        select(Delivery)
+        .where(
+            or_(
+                Delivery.next_attempt_at.is_(None), Delivery.next_attempt_at <= utcnow()
+            ),
+            (Delivery.status == "received")
+            | (
+                (Delivery.status == "failed")
+                & (Delivery.attempts < settings.max_delivery_attempts)
+            ),
+        )
+        .order_by(Delivery.id)
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    return process_delivery(db, pending.id) if pending else {"status": "idle"}
+
+
+def process_next_support(db):
+    case = db.scalar(
+        select(Case)
+        .where(
+            Case.status.in_(["queued", "failed"]),
+            or_(Case.next_attempt_at.is_(None), Case.next_attempt_at <= utcnow()),
+        )
+        .order_by(Case.id)
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    if not case:
+        return {"status": "idle"}
+    case = process_support(db, case)
+    return {"case_id": case.id, "status": case.status}
+
+
+def heartbeat(db, number, result, completed=False, failed=False):
+    audit(db, "workflow", number,
+          "work_failed" if failed else "work_completed" if completed else "poll_completed",
+          details=result)
+    db.commit()
+    return result
+
+
+def run_batch(db, number, process_next, batch_size, success_status):
+    """Bound each poll; every item commits separately; never pre-lock a batch."""
+    def record(result):
+        status = result["status"]
+        return heartbeat(db, number, result, completed=status == success_status,
+                         failed=status in ("failed", "exhausted"))
+    if batch_size == 1:
+        return record(process_next(db))
+    deadline = time.monotonic() + 7
+    counts = {status: 0 for status in (success_status, "failed", "exhausted", "duplicate", "deferred")}
+    for _ in range(batch_size):
+        if time.monotonic() >= deadline:
+            break
+        result = process_next(db)
+        status = result["status"]
+        if status == "idle":
+            break
+        counts[status] = counts.get(status, 0) + 1
+        record(result)
+    failed = bool(counts["failed"] or counts["exhausted"])
+    processed = counts[success_status]
+    result = {"status": "failed" if failed else success_status if processed else "idle",
+              "batch_size": batch_size, "outcomes": counts}
+    return heartbeat(db, number, result, completed=bool(processed), failed=failed)

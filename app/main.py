@@ -10,12 +10,19 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import select, func, or_, cast, String, exists, literal
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as DatabaseTimeout
 from pydantic import BaseModel, Field
 import httpx
 from sqlalchemy.orm import Session, selectinload
 from app.db import Base, engine, get_db
-from app.config import settings
+from app.config import settings, canonical_shop_domain
+from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integration_secret
+from app.identity import managed_login, session_account, revoke_session, manage_account, ROLES
+from app.models import OperatorAccount, OperatorSession, LoginBucket
+from app.privacy import minimized_order_payload, valid_text_fields
+from app.operations import operational_snapshot, workflow_activity
+from app.schema import ledger_is_current
+from app.workers import heartbeat, run_batch, process_next_delivery, process_next_support
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
     ExecutionReconciliation, utcnow,
@@ -60,6 +67,7 @@ templates.env.filters["utc"] = lambda value: (
 )
 templates.env.filters["snapshot_utc"] = snapshot_utc
 templates.env.globals["preview_mode"] = settings.preview_mode
+templates.env.globals["demo_enabled"] = settings.preview_mode or not (settings.managed_identity and os.environ.get("POPIFY_ENV", "production").lower() == "production")
 
 _LOGIN_WINDOW_SECONDS = 15 * 60
 _LOGIN_MAX_FAILURES = 5
@@ -88,9 +96,9 @@ def _check_login_attempt(
                 _LOGIN_ATTEMPTS[key] = recent
             else:
                 del _LOGIN_ATTEMPTS[key]
-        valid = secrets.compare_digest(
+        valid = secure_equal(
             username, settings.operator_username
-        ) and secrets.compare_digest(password, settings.operator_password)
+        ) and secure_equal(password, settings.operator_password)
         if valid:
             for key in keys:
                 _LOGIN_ATTEMPTS.pop(key, None)
@@ -115,18 +123,25 @@ def _check_login_attempt(
 
 @asynccontextmanager
 async def lifespan(app):
-    if (
-        not settings.preview_mode
-        and os.environ.get("POPIFY_ENV", "production").lower() == "production"
-    ):
+    environment = os.environ.get("POPIFY_ENV", "production").lower()
+    if not settings.preview_mode and environment not in {"development", "production"}:
+        raise RuntimeError("POPIFY_ENV must be development or production.")
+    if not settings.preview_mode and environment == "production":
+        if not settings.managed_identity or engine.dialect.name != "postgresql":
+            raise RuntimeError("Production requires managed operator identity and PostgreSQL.")
+        if settings.shopify_webhook_secret and not settings.shopify_store_domain:
+            raise RuntimeError("Production Shopify intake requires a store allowlist.")
+        if settings.llm_mode == "openai" and not settings.allow_external_ai:
+            raise RuntimeError("External AI processing requires explicit configuration approval.")
         required = {
             "APP_SECRET": settings.app_secret,
-            "OPERATOR_PASSWORD": settings.operator_password,
             "N8N_WEBHOOK_SECRET": settings.n8n_webhook_secret,
             "N8N_ENCRYPTION_KEY": os.environ.get("N8N_ENCRYPTION_KEY", ""),
         }
         placeholders = {
             "local-development-secret-change-me",
+            "change-me-in-real-use",
+            "replace-with-a-random-url-safe-password",
             "demo-change-me",
             "local-demo-secret",
             "replace-with-random-key-before-sharing",
@@ -136,7 +151,6 @@ async def lifespan(app):
             raise RuntimeError("Production requires non-placeholder values for: " + ", ".join(missing))
         minimum_lengths = {
             "APP_SECRET": (settings.app_secret, 32),
-            "OPERATOR_PASSWORD": (settings.operator_password, 12),
             "N8N_WEBHOOK_SECRET": (settings.n8n_webhook_secret, 32),
             "N8N_ENCRYPTION_KEY": (os.environ.get("N8N_ENCRYPTION_KEY", ""), 32),
         }
@@ -149,6 +163,8 @@ async def lifespan(app):
             raise RuntimeError(
                 "Production values are too short for: " + ", ".join(weak)
             )
+        if len(set(required.values())) != len(required):
+            raise RuntimeError("Production application, worker and n8n encryption secrets must be distinct.")
         if os.environ.get("COOKIE_SECURE", "false").lower() != "true":
             raise RuntimeError("COOKIE_SECURE=true is required in production.")
     with engine.connect() as connection:
@@ -156,13 +172,20 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="CommerceOps", lifespan=lifespan)
+app = FastAPI(title="CommerceOps", lifespan=lifespan,
+              docs_url=None if settings.managed_identity else "/docs",
+              redoc_url=None if settings.managed_identity else "/redoc",
+              openapi_url=None if settings.managed_identity else "/openapi.json")
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.app_secret,
     same_site="lax",
+    max_age=8 * 60 * 60,
     https_only=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
 )
+
+
+app.add_middleware(RequestBodyLimitMiddleware)
 
 
 @app.middleware("http")
@@ -175,13 +198,47 @@ async def block_live_integrations_in_preview(request: Request, call_next):
             {"detail": "Live integrations are disabled in the isolated preview."},
             status_code=409,
         )
+    if settings.managed_identity and not settings.preview_mode and os.environ.get("POPIFY_ENV", "production").lower() == "production" and (
+        request.url.path == "/demo" or request.url.path.startswith(("/demo/", "/api/demo/"))
+    ):
+        return JSONResponse({"detail": "Synthetic demo routes are disabled in production."}, status_code=404)
     return await call_next(request)
 
 
-def operator(request: Request):
-    if not request.session.get("operator"):
-        raise HTTPException(401, "Sign in to access the operator console")
-    return request.session["operator"]
+def operator(request: Request, db: Session = Depends(get_db)):
+    if settings.managed_identity and not settings.preview_mode:
+        # Ordinary managed mutations hold account/session read locks through the
+        # business transaction. Account administration uses its own serialized
+        # revalidation instead, avoiding inverted account lock order.
+        lock_mutation = request.method in {"POST", "PUT", "PATCH", "DELETE"} and not (
+            request.url.path.startswith("/operators/") or request.url.path == "/logout")
+        account = session_account(db, request.session.get("identity_token"), lock_mutation=lock_mutation)
+        if account:
+            request.state.operator_account = account
+            request.state.operator_role = account.role
+            request.state.operator_name = account.username
+            return account.username
+    else:
+        actor = request.session.get("operator")
+        if isinstance(actor, str) and actor and secure_equal(actor, settings.operator_username):
+            request.state.operator_role = "admin"
+            request.state.operator_name = actor
+            return actor
+    request.session.clear()
+    raise HTTPException(401, "Sign in to access the operator console")
+
+
+def require_roles(*roles):
+    def authorized(request: Request, actor=Depends(operator)):
+        if request.state.operator_role not in roles:
+            raise HTTPException(403, "Your operator role cannot perform this action.")
+        return actor
+    return authorized
+
+
+support_operator = require_roles("admin", "support")
+review_operator = require_roles("admin", "reviewer")
+admin_operator = require_roles("admin")
 
 
 def csrf(request):
@@ -193,8 +250,10 @@ def csrf(request):
 
 
 def verify_csrf(request, token):
+    if settings.managed_identity and request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        raise HTTPException(403, "Cross-site form submission denied")
     expected = request.session.get("csrf", "")
-    if not expected or not secrets.compare_digest(expected, token):
+    if not expected or not secure_equal(expected, token):
         raise HTTPException(403, "invalid CSRF token")
 
 
@@ -218,6 +277,42 @@ def health(db: Session = Depends(get_db)):
     }
 
 
+@app.get("/live")
+def liveness():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness(db: Session = Depends(get_db)):
+    try:
+        for model in (Order, Delivery, Case, Approval, ActionExecution, Audit, ExecutionReconciliation):
+            # Validate mapped columns as well as table existence without reading customer records.
+            db.execute(select(model).limit(0))
+        if settings.managed_identity and not settings.preview_mode:
+            if db.get_bind().dialect.name == "postgresql" and not ledger_is_current(db):
+                return JSONResponse({"status": "not_ready"}, status_code=503)
+            for model in (OperatorAccount, OperatorSession, LoginBucket):
+                db.execute(select(model).limit(0))
+            if not db.scalar(select(OperatorAccount.id).where(OperatorAccount.active.is_(True), OperatorAccount.role == "admin").limit(1)):
+                return JSONResponse({"status": "not_ready"}, status_code=503)
+    except Exception:
+        return JSONResponse({"status": "not_ready"}, status_code=503)
+    return {"status": "ready"}
+
+
+@app.get("/api/ops/status")
+def operational_status(actor=Depends(operator), db: Session = Depends(get_db)):
+    return operational_snapshot(db, preview=settings.preview_mode)
+
+
+@app.get("/operations", response_class=HTMLResponse)
+def operations_page(request: Request, actor=Depends(operator), db: Session = Depends(get_db)):
+    return templates.TemplateResponse(request, "operations.html", {
+        "request": request, "actor": actor, "csrf": csrf(request),
+        "title": "Operational status", "snapshot": operational_snapshot(db, preview=settings.preview_mode),
+    })
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     return templates.TemplateResponse(
@@ -231,14 +326,22 @@ def login(
     username: str = Form(...),
     password: str = Form(...),
     csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
     now = time.monotonic()
+    identity_token = None
     if settings.preview_mode:
-        valid = secrets.compare_digest(
+        valid = secure_equal(
             username, settings.operator_username
-        ) and secrets.compare_digest(password, settings.operator_password)
+        ) and secure_equal(password, settings.operator_password)
         retry_after = 0
+    elif settings.managed_identity:
+        account, identity_token, retry_after = managed_login(
+            db, username, password, request.client.host if request.client else "unknown",
+            previous_token=request.session.get("identity_token"),
+        )
+        valid = account is not None
     else:
         valid, retry_after = _check_login_attempt(request, username, password, now)
     if retry_after:
@@ -265,81 +368,67 @@ def login(
             status_code=401,
         )
     request.session.clear()
-    request.session["operator"] = username
+    if identity_token:
+        request.session["identity_token"] = identity_token
+    else:
+        request.session["operator"] = username
     request.session["csrf"] = secrets.token_urlsafe(32)
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/logout")
-def logout(request: Request, csrf_token: str = Form(...), actor=Depends(operator)):
+def logout(request: Request, csrf_token: str = Form(...), actor=Depends(operator), db: Session = Depends(get_db)):
     verify_csrf(request, csrf_token)
+    if settings.managed_identity and not settings.preview_mode:
+        revoke_session(db, request.session.get("identity_token"), request.state.operator_account)
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
 
 
-def workflow_activity(db):
-    result = []
-    for number, label in [
-        (1, "Order intake"),
-        (2, "Support triage"),
-        (3, "Exceptions & actions"),
-    ]:
-        last = db.scalar(
-            select(Audit)
-            .where(
-                Audit.entity_type == "workflow",
-                Audit.entity_id == number,
-                Audit.event.in_(["work_completed", "work_failed", "poll_completed"]),
-            )
-            .order_by(Audit.id.desc())
-            .limit(1)
-        )
-        success = db.scalar(
-            select(Audit)
-            .where(
-                Audit.entity_type == "workflow",
-                Audit.entity_id == number,
-                Audit.event == "work_completed",
-            )
-            .order_by(Audit.id.desc())
-            .limit(1)
-        )
-        failure = db.scalar(
-            select(Audit)
-            .where(
-                Audit.entity_type == "workflow",
-                Audit.entity_id == number,
-                Audit.event == "work_failed",
-            )
-            .order_by(Audit.id.desc())
-            .limit(1)
-        )
-        recent = bool(
-            last and (utcnow() - as_utc(last.created_at)).total_seconds() < 180
-        )
-        result.append(
-            {
-                "number": number,
-                "label": label,
-                "last": last,
-                "success": success,
-                "failure": failure,
-                "recent": recent,
-            }
-        )
-    return result
+@app.get("/operators", response_class=HTMLResponse)
+def operators_page(request: Request, page: int = Query(1, ge=1, le=1000),
+                   actor=Depends(admin_operator), db: Session = Depends(get_db)):
+    if not settings.managed_identity or settings.preview_mode:
+        raise HTTPException(404)
+    size = 30
+    rows = db.execute(select(OperatorAccount.id, OperatorAccount.username,
+                             OperatorAccount.role, OperatorAccount.active,
+                             func.count(OperatorSession.token_hash).label("active_sessions"))
+                      .outerjoin(OperatorSession, (OperatorSession.account_id == OperatorAccount.id) &
+                                 (OperatorSession.expires_at > utcnow()))
+                      .group_by(OperatorAccount.id, OperatorAccount.username, OperatorAccount.role, OperatorAccount.active)
+                      .order_by(OperatorAccount.username).offset((page - 1) * size).limit(size + 1)).all()
+    return templates.TemplateResponse(request, "operators.html", {
+        "request": request, "actor": actor, "csrf": csrf(request), "title": "Operator accounts",
+        "operators": rows[:size], "page": page, "has_next": len(rows) > size, "roles": ROLES,
+    })
 
 
-def heartbeat(db, number, result, completed=False, failed=False):
-    audit(
-        db,
-        "workflow",
-        number,
-        "work_failed" if failed else "work_completed" if completed else "poll_completed",
-        details=result,
-    )
-    db.commit()
-    return result
+@app.post("/operators/{username}")
+def operator_update(username: str, request: Request, action: str = Form(...),
+                    role: str = Form(""), csrf_token: str = Form(...),
+                    actor=Depends(admin_operator), db: Session = Depends(get_db)):
+    verify_csrf(request, csrf_token)
+    if not settings.managed_identity or settings.preview_mode:
+        raise HTTPException(404)
+    if action not in ("role", "disable", "enable", "revoke"):
+        raise HTTPException(422, "Unsupported operator action.")
+    if username == actor:
+        raise HTTPException(409, "Use sign out for your own session; another administrator must change your account.")
+    try:
+        manage_account(db, username, action, role=role, actor=actor, protect_last_admin=True,
+                       administrator_token=request.session.get("identity_token"))
+    except PermissionError:
+        db.rollback()
+        request.session.clear()
+        raise HTTPException(403, "Administrator authorization changed. Sign in again.")
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc))
+    return RedirectResponse("/operators", status_code=303)
+
+
+
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -577,7 +666,7 @@ def preview_scenario_create(
     request: Request,
     scenario: str = Form(...),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -622,7 +711,7 @@ def preview_scenario_detail(
 def guided_demo_start(
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -748,7 +837,7 @@ def guided_demo_support(
     request: Request,
     message: str = Form(...),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session=Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -767,7 +856,7 @@ def guided_demo_support(
             message,
             order.order_number,
             order.email,
-            request_key=f"guided-support:{delivery.id}",
+            request_key=f"guided-support:{delivery.id}", actor=actor,
         )
     except SupportRequestKeyConflict:
         raise HTTPException(409, "This guided run already has a different support inquiry.")
@@ -780,7 +869,7 @@ def guided_demo_run_workflow(
     phase: str,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session=Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1271,7 +1360,7 @@ def retry_delivery(
     delivery_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1303,7 +1392,7 @@ def approval_decision(
     request: Request,
     decision: str = Form(...),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(review_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1333,7 +1422,7 @@ def refresh_approval_route(
     approval_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(review_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1363,10 +1452,12 @@ def reconcile_approval_route(
     reference: str = Form(""),
     scenario_id: int | None = Form(None),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(review_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
+    if not valid_text_fields(outcome, explanation, reference):
+        raise HTTPException(422, "Invalid reconciliation fields")
     try:
         reconcile_approval_execution(
             db, approval_id, outcome, explanation, reference, actor,
@@ -1392,7 +1483,7 @@ def retry(
     approval_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(review_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1411,7 +1502,7 @@ def preview_run(
     approval_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1437,37 +1528,51 @@ def preview_run(
     return RedirectResponse(f"/approvals/{approval_id}{suffix}", status_code=303)
 
 
-@app.post("/webhooks/shopify/orders")
-async def shopify_order(request: Request, db: Session = Depends(get_db)):
-    max_body_bytes = 1_000_000
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            if int(content_length) > max_body_bytes:
-                raise HTTPException(413, "Webhook exceeds 1 MB")
-        except ValueError:
-            raise HTTPException(400, "invalid Content-Length")
+async def webhook_body(request: Request):
+    return await request.body()
 
-    raw = bytearray()
-    async for chunk in request.stream():
-        if len(raw) + len(chunk) > max_body_bytes:
-            raise HTTPException(413, "Webhook exceeds 1 MB")
-        raw.extend(chunk)
-    raw = bytes(raw)
+
+def acknowledge_existing_delivery(db, existing, *, shop, topic, event_id, payload):
+    """A repeated delivery ID is an acknowledgement only for the same stored input."""
+    try:
+        same_payload = minimized_order_payload(existing.payload) == payload
+    except (ValueError, TypeError, UnicodeError):
+        same_payload = False
+    if (existing.shop_domain.lower() != shop or existing.topic != topic or not same_payload
+            or (existing.event_id and event_id and existing.event_id != event_id)):
+        audit(db, "delivery", existing.id, "delivery_id_conflict",
+              correlation_id=existing.webhook_id)
+        db.commit()
+        raise HTTPException(409, "Delivery ID already associated with different order input")
+    audit(db, "delivery", existing.id, "duplicate_delivery_ignored",
+          correlation_id=existing.webhook_id)
+    db.commit()
+    return JSONResponse({"received": True, "duplicate": True}, status_code=200)
+
+
+@app.post("/webhooks/shopify/orders")
+def shopify_order(request: Request, raw: bytes = Depends(webhook_body), db: Session = Depends(get_db)):
+    # Database operations run in the sync worker pool, not on the ASGI event loop.
     if not verify_shopify(raw, request.headers.get("x-shopify-hmac-sha256")):
         raise HTTPException(401, "invalid webhook signature")
     try:
         payload = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise HTTPException(400, "invalid JSON")
     if not isinstance(payload, dict):
         raise HTTPException(422, "Order payload must be an object")
+    try:
+        payload = minimized_order_payload(payload)
+    except (ValueError, UnicodeError):
+        raise HTTPException(422, "Invalid order fields")
     webhook_id = request.headers.get("x-shopify-webhook-id", "")
     topic = request.headers.get("x-shopify-topic", "orders/create")
     shop = request.headers.get("x-shopify-shop-domain")
     if not request.headers.get("x-shopify-webhook-id"):
         raise HTTPException(400, "missing Shopify delivery ID")
-    if not shop or not shop.lower().endswith(".myshopify.com"):
+    try:
+        shop = canonical_shop_domain(shop or "")
+    except ValueError:
         raise HTTPException(400, "missing or invalid Shopify shop domain")
     if (
         settings.shopify_store_domain
@@ -1476,25 +1581,17 @@ async def shopify_order(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(403, "unexpected Shopify shop")
     if topic not in ("orders/create", "orders/updated"):
         raise HTTPException(422, "unsupported Shopify topic")
-    if len(webhook_id) > 150 or len(shop) > 255:
+    event_id = request.headers.get("x-shopify-event-id")
+    if not valid_text_fields(webhook_id, shop, event_id) or len(webhook_id) > 150 or len(shop) > 255 or (event_id and len(event_id) > 150):
         raise HTTPException(422, "Invalid header length")
     shop = shop.lower()
     existing = db.scalar(select(Delivery).where(Delivery.webhook_id == webhook_id))
     if existing:
-        db.add(
-            Audit(
-                correlation_id=webhook_id,
-                entity_type="delivery",
-                entity_id=existing.id,
-                event="duplicate_delivery_ignored",
-                details={"webhook_id": webhook_id},
-            )
-        )
-        db.commit()
-        return JSONResponse({"received": True, "duplicate": True}, status_code=200)
+        return acknowledge_existing_delivery(db, existing, shop=shop, topic=topic,
+                                             event_id=event_id, payload=payload)
     delivery = Delivery(
         webhook_id=webhook_id,
-        event_id=request.headers.get("x-shopify-event-id"),
+        event_id=event_id,
         topic=topic,
         shop_domain=shop,
         payload=payload,
@@ -1516,15 +1613,8 @@ async def shopify_order(request: Request, db: Session = Depends(get_db)):
         db.rollback()
         existing = db.scalar(select(Delivery).where(Delivery.webhook_id == webhook_id))
         if existing:
-            audit(
-                db,
-                "delivery",
-                existing.id,
-                "duplicate_delivery_ignored",
-                correlation_id=webhook_id,
-            )
-            db.commit()
-            return JSONResponse({"received": True, "duplicate": True}, status_code=200)
+            return acknowledge_existing_delivery(db, existing, shop=shop, topic=topic,
+                                                 event_id=event_id, payload=payload)
         raise
     db.refresh(delivery)
     return JSONResponse({"received": True, "delivery_id": delivery.id}, status_code=202)
@@ -1536,39 +1626,19 @@ def n8n_process(
     x_n8n_secret: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
     return process_delivery(db, delivery_id)
 
 
 @app.post("/api/n8n/process-next")
 def n8n_next(
-    x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db)
+    x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db),
+    batch_size: int = Query(1, ge=1, le=5),
 ):
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
-    pending = db.scalar(
-        select(Delivery)
-        .where(
-            or_(
-                Delivery.next_attempt_at.is_(None), Delivery.next_attempt_at <= utcnow()
-            ),
-            (Delivery.status == "received")
-            | (
-                (Delivery.status == "failed")
-                & (Delivery.attempts < settings.max_delivery_attempts)
-            ),
-        )
-        .order_by(Delivery.id)
-        .with_for_update(skip_locked=True)
-        .limit(1)
-    )
-    result = process_delivery(db, pending.id) if pending else {"status": "idle"}
-    return heartbeat(
-        db, 1, result,
-        completed=result["status"] == "processed",
-        failed=result["status"] in ("failed", "exhausted"),
-    )
+    return run_batch(db, 1, process_next_delivery, batch_size, "processed")
 
 
 class Inquiry(BaseModel):
@@ -1584,12 +1654,12 @@ def support_api(
     x_n8n_secret: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
-    if not data.message.strip():
-        raise HTTPException(422, "Message is required")
+    if not data.message.strip() or not valid_text_fields(data.message, data.order_ref, data.email, data.request_key):
+        raise HTTPException(422, "Invalid inquiry fields")
     try:
-        case = queue_support(db, data.message, data.order_ref, data.email, data.request_key)
+        case = queue_support(db, data.message, data.order_ref, data.email, data.request_key, actor="integration")
     except SupportRequestKeyConflict:
         raise HTTPException(409, "request_key is already associated with different inquiry details")
     return {"case_id": case.id, "status": case.status}
@@ -1597,30 +1667,14 @@ def support_api(
 
 @app.post("/api/n8n/triage-next")
 def triage_next(
-    x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db)
+    x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db),
+    batch_size: int = Query(1, ge=1, le=5),
 ):
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
-    case = db.scalar(
-        select(Case)
-        .where(
-            Case.status.in_(["queued", "failed"]),
-            or_(Case.next_attempt_at.is_(None), Case.next_attempt_at <= utcnow()),
-        )
-        .order_by(Case.id)
-        .with_for_update(skip_locked=True)
-        .limit(1)
-    )
-    if not case:
-        return heartbeat(db, 2, {"status": "idle"})
-    case = process_support(db, case)
-    return heartbeat(
-        db,
-        2,
-        {"case_id": case.id, "status": case.status},
-        completed=case.status == "needs_review",
-        failed=case.status in ("failed", "exhausted"),
-    )
+    # External AI can take substantially longer than mock triage. Retain the
+    # existing single-item behavior there until a separate capacity test.
+    return run_batch(db, 2, process_next_support, batch_size if settings.llm_mode == "mock" else 1, "needs_review")
 
 
 @app.post("/cases/{case_id}/retry")
@@ -1628,7 +1682,7 @@ def retry_case(
     case_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(support_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1653,7 +1707,7 @@ def retry_case(
 
 
 @app.get("/support", response_class=HTMLResponse)
-def support_form(request: Request, actor=Depends(operator)):
+def support_form(request: Request, actor=Depends(support_operator)):
     return templates.TemplateResponse(
         request,
         "support.html",
@@ -1677,12 +1731,13 @@ def support_submit(
     email: str = Form(""),
     request_key: str = Form(...),
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(support_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
     if (
         not message.strip()
+        or not valid_text_fields(message, order_ref, email, request_key)
         or len(message) > 5000
         or len(order_ref) > 100
         or len(email) > 320
@@ -1691,7 +1746,7 @@ def support_submit(
         raise HTTPException(422, "Check the inquiry fields")
     try:
         case = queue_support(
-            db, message, order_ref or None, email or None, request_key=request_key
+            db, message, order_ref or None, email or None, request_key=request_key, actor=actor
         )
     except SupportRequestKeyConflict:
         raise HTTPException(409, "This request key is already associated with different inquiry details.")
@@ -1702,7 +1757,7 @@ def support_submit(
 def demo_order(
     request: Request,
     csrf_token: str = Form(...),
-    actor=Depends(operator),
+    actor=Depends(admin_operator),
     db: Session = Depends(get_db),
 ):
     verify_csrf(request, csrf_token)
@@ -1727,6 +1782,8 @@ def demo_order(
         status="received",
     )
     db.add(d)
+    db.flush()
+    audit(db, "delivery", d.id, "synthetic_delivery_received", actor, correlation_id=d.webhook_id)
     db.commit()
     db.refresh(d)
     return RedirectResponse(f"/deliveries/{d.id}", 303)
@@ -1738,7 +1795,7 @@ def scan_delayed(
 ):
     from app.services import create_approval
 
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
     cutoff = utcnow() - timedelta(hours=settings.order_delay_hours)
     already_approved = exists(
@@ -1838,7 +1895,7 @@ def scan_delayed(
 
 @app.exception_handler(HTTPException)
 async def http_error(request, exc):
-    if "text/html" in request.headers.get("accept", ""):
+    if not request.url.path.startswith(("/api/", "/webhooks/")) and "text/html" in request.headers.get("accept", ""):
         if exc.status_code == 401:
             return RedirectResponse("/login", 303)
         return templates.TemplateResponse(
@@ -1848,17 +1905,26 @@ async def http_error(request, exc):
                 "request": request,
                 "title": str(exc.status_code),
                 "message": str(exc.detail),
-                "actor": request.session.get("operator"),
+                "actor": getattr(request.state, "operator_name", None),
                 "csrf": csrf(request),
             },
             status_code=exc.status_code,
+            headers=exc.headers,
         )
-    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(DatabaseTimeout)
+@app.exception_handler(OperationalError)
+async def database_error(request, exc):
+    # Never expose connection strings, SQL parameters or customer records.
+    log.warning(json.dumps({"event": "database_unavailable", "correlation_id": getattr(request.state, "correlation_id", None)}))
+    return await http_error(request, HTTPException(503, "Database temporarily unavailable. Try again later.", headers={"Retry-After": "5"}))
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
-    if "text/html" in request.headers.get("accept", ""):
+    if not request.url.path.startswith(("/api/", "/webhooks/")) and "text/html" in request.headers.get("accept", ""):
         return templates.TemplateResponse(
             request,
             "error.html",
@@ -1866,7 +1932,7 @@ async def validation_error(request, exc):
                 "request": request,
                 "title": "Check your input",
                 "message": "A required field is missing or invalid. Go back and check the form.",
-                "actor": request.session.get("operator"),
+                "actor": getattr(request.state, "operator_name", None),
                 "csrf": csrf(request),
             },
             status_code=422,
@@ -1881,17 +1947,42 @@ async def validation_error(request, exc):
 async def request_log(request, call_next):
     correlation = str(uuid.uuid4())
     started = time.monotonic()
-    response = await call_next(request)
+    request.state.correlation_id = correlation
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        if not settings.managed_identity or os.environ.get("POPIFY_ENV", "production").lower() != "production":
+            raise
+        # Do not let production ASGI exception logging expose request values,
+        # SQL parameters or integration payloads. Preserve type and trace ID.
+        log.error(json.dumps({"event": "unexpected_request_failure", "correlation_id": correlation,
+                             "error_type": type(exc).__name__}))
+        message = "The request could not be completed. Check its recorded state before retrying."
+        if not request.url.path.startswith(("/api/", "/webhooks/")) and "text/html" in request.headers.get("accept", ""):
+            response = templates.TemplateResponse(request, "error.html", {
+                "request": request, "title": "Request unavailable", "message": message,
+                "actor": None, "correlation_id": correlation,
+            }, status_code=500)
+        else:
+            response = JSONResponse({"detail": message}, status_code=500)
     response.headers["X-Correlation-ID"] = correlation
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Cache-Control"] = "no-store"
+    if settings.managed_identity and os.environ.get("POPIFY_ENV", "production").lower() == "production":
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     log.info(
         json.dumps(
             {
                 "event": "http_request",
                 "correlation_id": correlation,
                 "method": request.method,
+                "route": getattr(request.scope.get("route"), "path", "unmatched"),
                 "status": response.status_code,
                 "duration_ms": round((time.monotonic() - started) * 1000),
             }

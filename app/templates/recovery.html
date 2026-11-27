@@ -1,6 +1,6 @@
 {% extends 'base.html' %}
 {% block content %}
-<main id="main" class="wrap">
+<main id="main" tabindex="-1" class="wrap">
   <div class="headline"><div><div class="eyebrow">OPERATIONS / RECOVERY</div><h1>Recovery workspace</h1><p class="sub">One prioritized view of decisions, retries, blocked work, and uncertain outcomes.</p></div></div>
   <nav class="recovery-tabs" aria-label="Recovery categories"><a href="/recovery" class="{{ 'active' if not category }}">All <b>{{ counts.total }}</b></a>{% for name in categories %}<a href="/recovery?category={{ name }}" class="{{ 'active' if category==name }}">{{ name|capitalize }} <b>{{ counts[name] }}</b></a>{% endfor %}</nav>
   <section class="panel"><form class="filters" method="get"><div><label for="search">Search recovery work</label><input id="search" type="search" name="q" value="{{ q }}" maxlength="150" placeholder="Approval, delivery, reason, or status…"></div><input type="hidden" name="category" value="{{ category }}"><button>Search</button><a class="button secondary" href="/recovery">Reset</a></form>

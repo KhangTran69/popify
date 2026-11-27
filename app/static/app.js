@@ -20,8 +20,13 @@ const runPage = document.querySelector('[data-auto-refresh="true"]');
 if (runPage) {
   window.setInterval(() => {
     const active = document.activeElement;
-    const editing = active && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName);
+    const editing = active && (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'A'].includes(active.tagName) || active.isContentEditable);
     const submitting = document.querySelector('form[data-submitting="true"]');
     if (!editing && !submitting && document.visibilityState === 'visible') location.reload();
   }, 5000);
 }
+
+// Keep production scripts compatible with a strict same-origin Content Security Policy.
+document.addEventListener('click', event => {
+  if (event.target.closest('[data-refresh-page]')) location.reload();
+});

@@ -9,11 +9,12 @@ import hmac
 import json
 import uuid
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, func
+from sqlalchemy import create_engine, select, func, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 from app import main
 from app.config import settings
+from app.identity import manage_account, managed_login, session_account
 from app.db import Base, engine, get_db
 from app.models import Order, Delivery, Case, Approval, ActionExecution, ExecutionReconciliation, utcnow
 from app.services import (
@@ -33,6 +34,28 @@ from app.preview_scenarios import latest_reconciliations, unresolved_related_app
 from app.recovery import recovery_counts, recovery_page
 
 
+def measure_workflow_index(isolated):
+    """Compare actual plans on synthetic rows in the verifier-owned schema only."""
+    query = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM audit_events WHERE entity_type='workflow' AND entity_id=999 AND event='work_completed' ORDER BY id DESC LIMIT 1"
+    with isolated.begin() as conn:
+        conn.exec_driver_sql("INSERT INTO audit_events (correlation_id, entity_type, entity_id, event, actor, details, created_at) VALUES ('synthetic-index-check','workflow',999,'work_completed','system','{}',now())")
+        conn.exec_driver_sql("INSERT INTO audit_events (correlation_id, entity_type, entity_id, event, actor, details, created_at) SELECT 'synthetic-index-check','case',i,'inquiry_queued','system','{}',now() FROM generate_series(1, 30000) AS i")
+        conn.exec_driver_sql("ANALYZE audit_events")
+        conn.exec_driver_sql("DROP INDEX ix_audit_workflow_recent")
+        def sample():
+            conn.exec_driver_sql(query).scalar_one()
+            rows = [conn.exec_driver_sql(query).scalar_one()[0] for _ in range(3)]
+            return {"execution_ms": [row["Execution Time"] for row in rows],
+                    "plan": rows[-1]["Plan"]}
+        before = sample()
+        conn.exec_driver_sql("CREATE INDEX ix_audit_workflow_recent ON audit_events(entity_type, entity_id, event, id)")
+        conn.exec_driver_sql("ANALYZE audit_events")
+        after = sample()
+        print("WORKFLOW INDEX BENCHMARK " + json.dumps({"synthetic_rows": 30000,
+             "without_index_ms": before["execution_ms"], "with_index_ms": after["execution_ms"],
+             "without_index_plan": before["plan"], "with_index_plan": after["plan"]}))
+
+
 def run():
     if engine.dialect.name != "postgresql":
         raise RuntimeError("Run inside the Compose API container")
@@ -46,6 +69,22 @@ def run():
     old_secret = settings.shopify_webhook_secret
     try:
         Base.metadata.create_all(isolated)
+        with sessions() as db:
+            manage_account(db, "concurrency-user", "create", role="reviewer", password="synthetic-test-password")
+        def fail_login(index):
+            with sessions() as db:
+                return managed_login(db, "concurrency-user", "wrong", f"synthetic-{index}")[2]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            waits = list(pool.map(fail_login, range(6)))
+        assert sum(wait > 0 for wait in waits) == 1, waits
+        with sessions() as db:
+            manage_account(db, "revocable-user", "create", role="support", password="synthetic-test-password")
+            _, token, _ = managed_login(db, "revocable-user", "synthetic-test-password", "synthetic-valid")
+            assert session_account(db, token) is not None
+            manage_account(db, "revocable-user", "revoke")
+        with sessions() as db:
+            assert session_account(db, token) is None
+        print("PASS: concurrent managed login budget and cross-session revocation")
 
         def session_override():
             with sessions() as db:
@@ -83,6 +122,15 @@ def run():
         with sessions() as db:
             assert db.scalar(select(func.count(Delivery.id))) == 1
             delivery_id = db.scalar(select(Delivery.id))
+
+        changed = json.dumps({**json.loads(raw), "name": "#CONFLICT"}).encode()
+        changed_headers = {**headers, "X-Shopify-Hmac-SHA256": base64.b64encode(hmac.new(
+            settings.shopify_webhook_secret.encode(), changed, hashlib.sha256).digest()).decode()}
+        with TestClient(main.app) as client:
+            assert client.post("/webhooks/shopify/orders", content=changed, headers=changed_headers).status_code == 409
+        with sessions() as db:
+            assert db.get(Delivery, delivery_id).payload["name"] == "#CONCURRENT"
+        print("PASS: conflicting signed delivery ID rejected without replacing original evidence")
 
         def process(_):
             with sessions() as db:
@@ -693,6 +741,7 @@ def run():
             ))
             assert original.state == "ambiguous" and original.attempts == 1
 
+        measure_workflow_index(isolated)
         print(
             "PASS: concurrent webhook duplicates, duplicate workers, first-insert/out-of-order races, conflicting support request-key reuse, repeated and conflicting approval decisions, source freshness locking, refresh/execution and retry/execution races, concurrent replacement requests, immutable reconciliation follow-ups, later evidence racing replacement execution, duplicate decision callbacks, concurrent blocker resolution/requeue, and repeated execution."
         )

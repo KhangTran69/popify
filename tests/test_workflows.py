@@ -163,6 +163,12 @@ def test_signed_webhook_duplicate_and_bad_signature(monkeypatch):
     assert r.status_code == 202
     r = client.post("/webhooks/shopify/orders", content=raw, headers=headers)
     assert r.status_code == 200 and r.json()["duplicate"] is True
+    changed = json.dumps({**json.loads(raw), "name": "#DIFFERENT"}).encode()
+    conflict = client.post("/webhooks/shopify/orders", content=changed,
+                           headers={**headers, "X-Shopify-Hmac-SHA256": sig(changed)})
+    assert conflict.status_code == 409 and "#DIFFERENT" not in conflict.text
+    assert client.post("/webhooks/shopify/orders", content=raw,
+                       headers={**headers, "X-Shopify-Topic": "orders/updated"}).status_code == 409
     assert (
         client.post(
             "/webhooks/shopify/orders",
@@ -186,7 +192,10 @@ def test_signed_webhook_duplicate_and_bad_signature(monkeypatch):
         delivery = db.scalar(
             select(Delivery).where(Delivery.webhook_id == "delivery-1")
         )
-        assert delivery.status == "received"
+        assert delivery.status == "received" and delivery.payload["name"] == "#1"
+        conflicts = list(db.scalars(select(Audit).where(Audit.entity_id == delivery.id,
+            Audit.entity_type == "delivery", Audit.event == "delivery_id_conflict")))
+        assert len(conflicts) == 2 and all("#DIFFERENT" not in str(event.details) for event in conflicts)
         assert db.scalar(select(Order).where(Order.external_id == "1")) is None
         process_delivery(db, delivery.id)
         process_delivery(db, delivery.id)
