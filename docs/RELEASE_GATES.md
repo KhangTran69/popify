@@ -29,3 +29,5 @@ The local alert outbox preserves unacknowledged events and supports explicit ack
 Use [OPERATIONAL_HANDOVER.md](OPERATIONAL_HANDOVER.md) to record ownership and evidence, run incident procedures and preserve rollback boundaries. A CI-green branch is necessary but not sufficient for a real deployment.
 
 CI exercises a fresh synthetic recovery keyring and rejects truncated encrypted archives before restoration. This does not establish actual offsite custody or authenticity of an archive obtained from an untrusted source; validate provenance separately before an authorized restore.
+
+Expired authentication-artifact cleanup is implemented with a dry-run default and explicit apply flag. Business-data deletion remains blocked on an approved retention policy and evidence-preservation review.

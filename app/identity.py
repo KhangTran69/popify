@@ -63,6 +63,23 @@ def _event(db, account, event, actor):
                  actor=actor, correlation_id=secrets.token_hex(16), details={}))
 
 
+def purge_expired_identity(db, *, apply=False, now=None):
+    """Remove only expired authentication artifacts, never business or audit data."""
+    now = now or utcnow()
+    if apply and db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(607291041)"))
+    results = {}
+    for name, model in (("expired_sessions", OperatorSession), ("expired_login_buckets", LoginBucket)):
+        predicate = model.expires_at <= now
+        if apply:
+            results[name] = db.execute(delete(model).where(predicate)).rowcount
+        else:
+            results[name] = db.scalar(select(func.count()).select_from(model).where(predicate)) or 0
+    if apply:
+        db.commit()
+    return results
+
+
 def managed_login(db, username, password, client_address, *, previous_token=None):
     """Serialize the bounded login budget across PostgreSQL workers.
 
