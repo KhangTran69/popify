@@ -35,6 +35,8 @@ bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/n8n.gpg"
 if bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/n8n.gpg"; then
   echo "Archive overwrite unexpectedly allowed" >&2; exit 1
 fi
+source scripts/verify_recovery_keyring.sh
+prepare_recovery_keyring "$work" "$recipient" "$work/n8n.gpg"
 volume="popify-ci-n8n-$(basename "$work" | tr -cd 'a-zA-Z0-9')"
 docker volume create "$volume" >/dev/null
 gpg --batch --decrypt "$work/n8n.gpg" |

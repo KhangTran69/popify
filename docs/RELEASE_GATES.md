@@ -27,3 +27,5 @@ The repository CI now includes an encrypted n8n state recovery drill on a separa
 The local alert outbox preserves unacknowledged events and supports explicit acknowledgement; actual relay delivery, deduplication and escalation ownership must be exercised on the approved host before deployment.
 
 Use [OPERATIONAL_HANDOVER.md](OPERATIONAL_HANDOVER.md) to record ownership and evidence, run incident procedures and preserve rollback boundaries. A CI-green branch is necessary but not sufficient for a real deployment.
+
+CI exercises a fresh synthetic recovery keyring and rejects truncated encrypted archives before restoration. This does not establish actual offsite custody or authenticity of an archive obtained from an untrusted source; validate provenance separately before an authorized restore.

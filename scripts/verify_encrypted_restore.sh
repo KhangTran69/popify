@@ -18,6 +18,8 @@ if bash scripts/backup_encrypted.sh "$recipient" "$work/backup.gpg"; then
   echo "Backup unexpectedly overwrote existing output" >&2
   exit 1
 fi
+source scripts/verify_recovery_keyring.sh
+prepare_recovery_keyring "$work" "$recipient" "$work/backup.gpg"
 docker compose cp scripts/verify_restore.sh db:/tmp/popify-verify-restore.sh
 gpg --batch --decrypt "$work/backup.gpg" |
   docker compose exec -T -e POPIFY_CONFIRM_DISPOSABLE=1 -e POPIFY_RESTORE_FROM_STDIN=1 db sh /tmp/popify-verify-restore.sh

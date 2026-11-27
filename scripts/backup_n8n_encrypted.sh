@@ -25,5 +25,5 @@ docker run --rm --network none --user 0 --mount "type=volume,source=$volume,targ
   gpg --batch --yes --trust-model always --recipient "$recipient" --encrypt --output "$temp"
 test -s "$temp"
 [[ "$(docker inspect --format '{{.State.Running}}' "$id")" == false ]] || { echo "n8n started during backup; refusing archive" >&2; exit 2; }
-ln -- "$temp" "$output"
+ln -T -- "$temp" "$output"
 echo "Encrypted n8n state archived; preserve the matching encryption key separately."
