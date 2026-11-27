@@ -3,7 +3,15 @@ services:
   api:
     ports: !reset []
     networks: [data_plane, worker_plane, operator_plane]
+    user: "10001:10001"
+    read_only: true
+    init: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     environment:
+      PYTHONDONTWRITEBYTECODE: "1"
       POPIFY_ENV: production
       MANAGED_IDENTITY: "true"
       COOKIE_SECURE: "true"

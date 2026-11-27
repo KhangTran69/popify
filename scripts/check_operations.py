@@ -142,6 +142,13 @@ def update_outbox(path, snapshot=None, repeat_seconds=900, *, acknowledge=None):
         return pending
 
 
+def handoff_summary(pending, now, max_unacknowledged_seconds):
+    age = max(0, now - min(e["observed_at_epoch"] for e in pending)) if pending else None
+    return {"pending_count": len(pending), "oldest_pending_seconds": age,
+            "status": "clear" if age is None else "overdue" if age >= max_unacknowledged_seconds else "awaiting_acknowledgement",
+            "max_unacknowledged_seconds": max_unacknowledged_seconds}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -152,9 +159,13 @@ def main(argv=None):
     relay.add_argument("--list-pending", action="store_true",
                        help="read pending events without polling the database; requires --outbox-file")
     parser.add_argument("--repeat-seconds", type=int, default=900)
+    parser.add_argument("--max-unacknowledged-seconds", type=int, default=900,
+                        help="escalate a stalled alert handoff independently of business health")
     args = parser.parse_args(argv)
     if not 60 <= args.repeat_seconds <= 86400:
         parser.error("repeat-seconds must be between 60 and 86400")
+    if not 60 <= args.max_unacknowledged_seconds <= 86400:
+        parser.error("max-unacknowledged-seconds must be between 60 and 86400")
     if args.list_pending:
         if not args.outbox_file:
             parser.error("--list-pending requires --outbox-file")
@@ -164,7 +175,8 @@ def main(argv=None):
             print(json.dumps({"status": "unavailable", "state_error": "Unable to read alert outbox."}))
             return 2
         print(json.dumps({"status": "pending" if pending else "clear",
-                          "pending_count": len(pending), "pending_events": pending}))
+                          "pending_count": len(pending), "pending_events": pending,
+                          "handoff": handoff_summary(pending, int(time.time()), args.max_unacknowledged_seconds)}))
         return 1 if pending else 0
     if args.ack_event:
         if not args.outbox_file or len(args.ack_event) != 32 or any(c not in "0123456789abcdef" for c in args.ack_event):
@@ -190,9 +202,7 @@ def main(argv=None):
             if args.outbox_file:
                 pending = update_outbox(args.outbox_file, snapshot, args.repeat_seconds)
                 snapshot["pending_events"] = pending
-                snapshot["handoff"] = {"pending_count": len(pending),
-                    "oldest_pending_seconds": max(0, int(time.time()) - min(e["observed_at_epoch"] for e in pending)) if pending else None,
-                    "status": "awaiting_acknowledgement" if pending else "clear"}
+                snapshot["handoff"] = handoff_summary(pending, int(time.time()), args.max_unacknowledged_seconds)
             else:
                 snapshot["transitions"] = update_state(args.state_file, snapshot, args.repeat_seconds)
         except (OSError, ValueError):
@@ -200,7 +210,7 @@ def main(argv=None):
             print(json.dumps(snapshot))
             return 2
     print(json.dumps(snapshot))
-    return 2 if snapshot["status"] == "unavailable" else 1 if snapshot["alerts"] or snapshot.get("pending_events") else 0
+    return 2 if snapshot["status"] == "unavailable" or snapshot.get("handoff", {}).get("status") == "overdue" else 1 if snapshot["alerts"] or snapshot.get("pending_events") else 0
 
 
 if __name__ == "__main__":

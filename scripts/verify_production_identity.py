@@ -122,6 +122,8 @@ def verify_worker_lock_contention(sessions):
                 blocked = db.scalar(select(Delivery).where(Delivery.webhook_id == blocked_key))
                 assert first.status == "processed" and first.attempts == 1
                 assert blocked.status == "received" and blocked.attempts == 0
+                last = db.scalar(select(Audit).where(Audit.entity_type == "workflow", Audit.entity_id == 1).order_by(Audit.id.desc()).limit(1))
+                assert last.event == "work_failed" and last.details == {"status": "unavailable", "reason": "database_lock_timeout"}
             blocker.rollback()
         assert client.post("/api/n8n/process-next?batch_size=5", headers=headers).json()["outcomes"]["processed"] == 1
         with sessions() as db:
@@ -137,6 +139,8 @@ def verify_worker_lock_contention(sessions):
                 case = db.scalar(select(Case).where(Case.request_key == "ci-lock-support"))
                 assert case.status == "queued" and case.attempts == 0
                 assert not list(db.scalars(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id)))
+                last = db.scalar(select(Audit).where(Audit.entity_type == "workflow", Audit.entity_id == 2).order_by(Audit.id.desc()).limit(1))
+                assert last.event == "work_failed" and last.details["reason"] == "database_lock_timeout"
             blocker.rollback()
         assert client.post("/api/n8n/triage-next?batch_size=5", headers=headers).json()["outcomes"]["needs_review"] == 1
         with sessions() as db:

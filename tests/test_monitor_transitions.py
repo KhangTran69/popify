@@ -145,3 +145,26 @@ def test_missing_or_invalid_relay_state(tmp_path, capsys):
     assert monitor.main(["--outbox-file", str(path), "--list-pending"]) == 2
     assert json.loads(capsys.readouterr().out)["status"] == "unavailable"
     assert path.read_bytes() == before
+
+
+def test_overdue_alert_delivery_escalates_even_when_business_is_healthy(tmp_path, monkeypatch, capsys):
+    from contextlib import nullcontext
+    from scripts import check_operations as monitor
+    path = tmp_path / "outbox.json"
+    monkeypatch.setattr(monitor.time, "time", lambda: 1000)
+    original = monitor.update_outbox(path, snapshot("orders_overdue"))
+    monkeypatch.setattr(monitor.time, "time", lambda: 1061)
+    monkeypatch.setattr(monitor, "SessionLocal", lambda: nullcontext(None))
+    monkeypatch.setattr(monitor, "operational_snapshot", lambda db: snapshot(status="healthy"))
+    args = ["--outbox-file", str(path), "--max-unacknowledged-seconds", "60"]
+    assert monitor.main(args) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "healthy" and result["handoff"]["status"] == "overdue"
+    assert result["handoff"]["oldest_pending_seconds"] == 61
+    assert result["pending_events"][0] == original[0]
+    assert monitor.main(args + ["--list-pending"]) == 1
+    assert json.loads(capsys.readouterr().out)["handoff"]["status"] == "overdue"
+    for event in result["pending_events"]:
+        monitor.update_outbox(path, acknowledge=event["event_id"])
+    assert monitor.main(args) == 0
+    assert json.loads(capsys.readouterr().out)["handoff"]["status"] == "clear"

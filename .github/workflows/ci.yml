@@ -224,6 +224,23 @@ jobs:
             bindings=$(docker inspect --format '{{json .HostConfig.PortBindings}}' "$id")
             test "$bindings" = '{}' || test "$bindings" = 'null'
           done
+      - name: Verify API runtime confinement
+        run: |
+          id=$(docker compose -f docker-compose.yml -f deploy/staging.compose.yml ps -q api)
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$id")" = true
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'
+          import os, tempfile
+          from pathlib import Path
+          status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
+          assert os.getuid() == 10001 and os.getgid() == 10001
+          assert int(status["CapEff"].strip(), 16) == 0
+          assert status["NoNewPrivs"].strip() == "1"
+          assert not os.path.exists("/var/run/docker.sock")
+          assert not os.access("/srv", os.W_OK)
+          with tempfile.TemporaryFile(dir="/tmp") as handle:
+              handle.write(b"synthetic")
+          print("PASS: non-root API, no effective capabilities, read-only root, no privilege escalation and bounded temporary storage")
+          PY
       - name: Verify private staging network separation
         run: |
           for service in db n8n operator-gateway; do

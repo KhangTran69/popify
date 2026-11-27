@@ -2,6 +2,7 @@
 import time
 from datetime import timedelta
 from sqlalchemy import exists, or_, select
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from app.config import settings
 from app.db import bound_worker_lock_wait
 from app.models import Delivery, Case, Order, Approval, utcnow
@@ -57,18 +58,34 @@ def heartbeat(db, number, result, completed=False, failed=False):
 
 def run_batch(db, number, process_next, batch_size, success_status):
     """Bound each poll; every item commits separately; never pre-lock a batch."""
+    def next_item():
+        try:
+            return process_next(db)
+        except OperationalError as exc:
+            # A lock timeout has a known SQLSTATE and a responsive server.
+            # Record a sanitized failed poll when possible, without masking the
+            # original 503 or spending a business-record attempt.
+            if getattr(exc.orig, "sqlstate", None) == "55P03":
+                try:
+                    db.rollback()
+                    bound_worker_lock_wait(db)
+                    heartbeat(db, number, {"status": "unavailable", "reason": "database_lock_timeout"}, failed=True)
+                except SQLAlchemyError:
+                    db.rollback()
+            raise
+
     def record(result):
         status = result["status"]
         return heartbeat(db, number, result, completed=status == success_status,
                          failed=status in ("failed", "exhausted"))
     if batch_size == 1:
-        return record(process_next(db))
+        return record(next_item())
     deadline = time.monotonic() + 7
     counts = {status: 0 for status in (success_status, "failed", "exhausted", "duplicate", "deferred")}
     for _ in range(batch_size):
         if time.monotonic() >= deadline:
             break
-        result = process_next(db)
+        result = next_item()
         status = result["status"]
         if status == "idle":
             break
