@@ -249,7 +249,7 @@ jobs:
           from app.db import SessionLocal
           from app.identity import manage_account
           with SessionLocal() as db:
-              for role in ("admin", "auditor"):
+              for role in ("admin", "auditor", "support", "reviewer"):
                   manage_account(db, "ci-staging-" + role, "create", role=role, password="synthetic-staging-test-password")
           PY
       - name: Validate actual HTTPS identity and route isolation
@@ -260,6 +260,26 @@ jobs:
           "$RUNNER_TEMP/popify-browser/node_modules/.bin/playwright" install chromium
       - name: Verify managed role browser journeys
         run: POPIFY_BROWSER_MODULES="$RUNNER_TEMP/popify-browser" node scripts/verify_managed_browser.mjs
+      - name: Verify managed browser business and audit records
+        run: |
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'
+          from sqlalchemy import select
+          from app.db import SessionLocal
+          from app.models import Case, Approval, ActionExecution, Audit
+          with SessionLocal() as db:
+              for suffix, expected in (("approved", "approved"), ("rejected", "rejected")):
+                  case = db.scalar(select(Case).where(Case.message == "Synthetic staging inquiry " + suffix))
+                  assert case and case.attempts == 1
+                  approval = db.scalar(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id, Approval.proposed_action == "send_reply"))
+                  assert approval and approval.status == expected and approval.actor == "ci-staging-reviewer"
+                  rows = list(db.scalars(select(ActionExecution).where(ActionExecution.idempotency_key == f"approval:{approval.id}")))
+                  assert len(rows) == (1 if expected == "approved" else 0)
+                  if rows:
+                      assert rows[0].state == "succeeded" and rows[0].attempts == 1
+                  event = db.scalar(select(Audit).where(Audit.entity_type == "case", Audit.entity_id == case.id, Audit.event == "inquiry_queued"))
+                  assert event and event.actor == "ci-staging-support"
+          print("PASS: real staging browser actions persisted correct roles, one approved execution and no rejected execution")
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
