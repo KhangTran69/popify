@@ -1939,6 +1939,7 @@ async def http_error(request, exc):
                 "csrf": csrf(request),
             },
             status_code=exc.status_code,
+            headers=exc.headers,
         )
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
 
@@ -1948,7 +1949,7 @@ async def http_error(request, exc):
 async def database_error(request, exc):
     # Never expose connection strings, SQL parameters or customer records.
     log.warning(json.dumps({"event": "database_unavailable", "correlation_id": getattr(request.state, "correlation_id", None)}))
-    return await http_error(request, HTTPException(503, "Database temporarily unavailable. Try again later."))
+    return await http_error(request, HTTPException(503, "Database temporarily unavailable. Try again later.", headers={"Retry-After": "5"}))
 
 
 @app.exception_handler(RequestValidationError)

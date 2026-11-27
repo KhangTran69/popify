@@ -115,8 +115,10 @@ jobs:
           docker compose stop n8n db
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/live)" = 200
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 503
+          docker compose exec -T api python -m scripts.verify_db_outage unavailable --confirm-disposable
           docker compose up -d --wait --wait-timeout 120 db
           test "$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/ready)" = 200
+          docker compose exec -T api python -m scripts.verify_db_outage recovered --confirm-disposable
       - name: Seed synthetic managed identity for restore verification
         run: docker compose exec -T api python -m scripts.seed_restore_identity --confirm-disposable
       - name: Verify encrypted disposable PostgreSQL backup restoration
@@ -157,7 +159,7 @@ jobs:
           if-no-files-found: ignore
 
   private-staging:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -198,6 +200,18 @@ jobs:
           PY
       - name: Validate actual HTTPS identity and route isolation
         run: python -m scripts.verify_staging --ca "$POPIFY_STAGING_TLS_DIR/tls.crt" --confirm-disposable
+      - name: Install isolated pinned browser tools
+        run: |
+          npm install --prefix "$RUNNER_TEMP/popify-browser" --no-audit --no-fund --ignore-scripts playwright@1.51.1 axe-core@4.10.3
+          "$RUNNER_TEMP/popify-browser/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Verify managed role browser journeys
+        run: POPIFY_BROWSER_MODULES="$RUNNER_TEMP/popify-browser" node scripts/verify_managed_browser.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: managed-accessibility-report
+          path: managed-accessibility-report.json
+          if-no-files-found: ignore
       - name: Clean disposable staging
         if: always()
         run: docker compose -f docker-compose.yml -f deploy/staging.compose.yml down --volumes --remove-orphans
