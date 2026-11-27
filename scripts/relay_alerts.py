@@ -38,11 +38,14 @@ class LocalReceiptSink:
             except FileExistsError:
                 # Replay is accepted only for the same immutable receipt.
                 fd = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                with os.fdopen(fd, "rb") as existing:
-                    private_regular(existing.fileno())
-                    if existing.read(len(data) + 1) != data:
-                        raise ValueError("Conflicting receipt")
-                    os.fsync(existing.fileno())
+                try:
+                    private_regular(fd)
+                    with os.fdopen(fd, "rb", closefd=False) as existing:
+                        if existing.read(len(data) + 1) != data:
+                            raise ValueError("Conflicting receipt")
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
             fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(fd)

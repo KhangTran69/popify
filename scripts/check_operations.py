@@ -64,20 +64,27 @@ def locked_state(path):
     private_directory(path.parent)
     lock_path = path.with_name(path.name + ".lock")
     # Nonblocking open prevents a planted FIFO from hanging the scheduler.
-    with os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600), "r+") as lock:
-        private_regular(lock.fileno())
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        # Inspect the descriptor before creating a seekable text stream.
+        private_regular(lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             previous = None
         else:
-            with os.fdopen(fd, "r") as source:
-                info = private_regular(source.fileno())
+            try:
+                info = private_regular(fd)
                 if info.st_size > 512_000:
                     raise ValueError("Invalid monitor state file")
-                previous = json.loads(source.read(512_001))
+                with os.fdopen(fd, "r", closefd=False) as source:
+                    previous = json.loads(source.read(512_001))
+            finally:
+                os.close(fd)
         yield path, previous
+    finally:
+        os.close(lock_fd)
 
 
 def atomic_write(path, value):
