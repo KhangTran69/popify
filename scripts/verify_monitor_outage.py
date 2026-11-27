@@ -30,8 +30,12 @@ def run():
         assert event["transition"] == "opened"
         code, repeat = poll()
         assert code == 2 and repeat["pending_events"] == first["pending_events"]
+        code, listed = poll("--list-pending")
+        assert code == 1 and listed["pending_events"] == first["pending_events"]
         assert poll("--ack-event", event["event_id"])[0] == 0
         assert poll("--ack-event", event["event_id"])[0] == 0
+        code, listed = poll("--list-pending")
+        assert code == 0 and listed["pending_events"] == []
         assert poll()[1]["pending_events"] == []
         MARKER.write_text(event["event_id"])
         print("PASS: real database outage alert persisted, deduplicated and acknowledged without database")

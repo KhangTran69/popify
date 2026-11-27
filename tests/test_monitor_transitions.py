@@ -102,3 +102,46 @@ def test_healthy_snapshot_with_pending_delivery_is_not_clear(tmp_path, monkeypat
         monitor.update_outbox(path, acknowledge=event["event_id"])
     assert monitor.main(["--outbox-file", str(path)]) == 0
     assert json.loads(capsys.readouterr().out)["handoff"]["status"] == "clear"
+
+
+
+def test_relay_can_drain_full_outbox_without_database(tmp_path, monkeypatch, capsys):
+    from scripts import check_operations as monitor
+    from contextlib import nullcontext
+    monkeypatch.setattr(monitor, "MAX_PENDING_EVENTS", 1)
+    path = tmp_path / "outbox.json"
+    first = monitor.update_outbox(path, snapshot("orders_overdue"))
+    before = path.read_bytes()
+    monkeypatch.setattr(monitor, "SessionLocal", lambda: nullcontext(None))
+    monkeypatch.setattr(monitor, "operational_snapshot", lambda db: snapshot(status="healthy"))
+    assert monitor.main(["--outbox-file", str(path)]) == 2
+    assert "state_error" in json.loads(capsys.readouterr().out)
+    assert path.read_bytes() == before
+
+    def unavailable():
+        raise AssertionError("listing must not contact database")
+    monkeypatch.setattr(monitor, "SessionLocal", unavailable)
+    assert monitor.main(["--outbox-file", str(path), "--list-pending"]) == 1
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["pending_events"] == first and listed["pending_count"] == 1
+    assert path.read_bytes() == before
+    assert monitor.main(["--outbox-file", str(path), "--ack-event", first[0]["event_id"]]) == 0
+    capsys.readouterr()
+    assert monitor.main(["--outbox-file", str(path), "--list-pending"]) == 0
+    assert json.loads(capsys.readouterr().out)["pending_events"] == []
+    # Once capacity returns, the original resolution is still emitted.
+    resolved = monitor.update_outbox(path, snapshot(status="healthy"))
+    assert len(resolved) == 1 and resolved[0]["transition"] == "resolved"
+
+
+def test_missing_or_invalid_relay_state(tmp_path, capsys):
+    from scripts import check_operations as monitor
+    path = tmp_path / "outbox.json"
+    assert monitor.main(["--outbox-file", str(path), "--list-pending"]) == 0
+    assert not path.exists()
+    capsys.readouterr()
+    path.write_text("{broken")
+    before = path.read_bytes()
+    assert monitor.main(["--outbox-file", str(path), "--list-pending"]) == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "unavailable"
+    assert path.read_bytes() == before

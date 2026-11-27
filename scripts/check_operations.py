@@ -135,7 +135,10 @@ def update_outbox(path, snapshot=None, repeat_seconds=900, *, acknowledge=None):
                 raise ValueError("Alert outbox is full")
             pending = pending + [{**event, "event_id": uuid.uuid4().hex, "observed_at_epoch": now}
                                  for event in events]
-        atomic_write(path, {"version": 1, "state": state, "pending": pending})
+        # A relay can drain a saturated outbox without collecting a snapshot
+        # or rewriting the durable state. Existing IDs and ordering are preserved.
+        if acknowledge is not None or snapshot is not None:
+            atomic_write(path, {"version": 1, "state": state, "pending": pending})
         return pending
 
 
@@ -144,11 +147,25 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--state-file", help="private local JSON state file for transition deduplication")
     mode.add_argument("--outbox-file", help="private durable alert outbox with explicit delivery acknowledgement")
-    parser.add_argument("--ack-event", help="acknowledge a delivered event ID; requires --outbox-file")
+    relay = parser.add_mutually_exclusive_group()
+    relay.add_argument("--ack-event", help="acknowledge a delivered event ID; requires --outbox-file")
+    relay.add_argument("--list-pending", action="store_true",
+                       help="read pending events without polling the database; requires --outbox-file")
     parser.add_argument("--repeat-seconds", type=int, default=900)
     args = parser.parse_args(argv)
     if not 60 <= args.repeat_seconds <= 86400:
         parser.error("repeat-seconds must be between 60 and 86400")
+    if args.list_pending:
+        if not args.outbox_file:
+            parser.error("--list-pending requires --outbox-file")
+        try:
+            pending = update_outbox(args.outbox_file)
+        except (OSError, ValueError):
+            print(json.dumps({"status": "unavailable", "state_error": "Unable to read alert outbox."}))
+            return 2
+        print(json.dumps({"status": "pending" if pending else "clear",
+                          "pending_count": len(pending), "pending_events": pending}))
+        return 1 if pending else 0
     if args.ack_event:
         if not args.outbox_file or len(args.ack_event) != 32 or any(c not in "0123456789abcdef" for c in args.ack_event):
             parser.error("--ack-event requires --outbox-file and a valid event ID")
