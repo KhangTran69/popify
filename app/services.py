@@ -245,14 +245,17 @@ def create_support_case(
 ):
     order = None
     if order_ref and email:
-        order = db.scalar(
+        matches = list(db.scalars(
             select(Order).where(
                 (Order.order_number == order_ref) | (Order.external_id == order_ref),
                 func.lower(Order.email) == email.strip().lower(),
                 Order.shop_domain
                 == (settings.shopify_store_domain or "demo.myshopify.com"),
-            )
-        )
+            ).limit(2)
+        ))
+        # A reference can match one external ID and another display number.
+        # Never disclose facts or bind an approval to an arbitrary match.
+        order = matches[0] if len(matches) == 1 else None
     category, confidence = classify(message)
     facts = (
         f"Order {order.order_number} is {order.fulfillment_status}; total {order.currency} {order.total}."

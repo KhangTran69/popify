@@ -59,3 +59,37 @@ def test_database_safe_text_fields():
     assert valid_text_fields("synthetic café", "", None)
     assert not valid_text_fields("bad\x00text")
     assert not valid_text_fields("\ud800")
+
+
+def test_canonical_shop_hostname():
+    import pytest
+    from app.config import Settings, canonical_shop_domain
+    assert canonical_shop_domain(" DEMO.MyShopify.com ") == "demo.myshopify.com"
+    assert Settings(_env_file=None, shopify_store_domain="DEMO.MyShopify.com").shopify_store_domain == "demo.myshopify.com"
+    for domain in ("https://demo.myshopify.com", "nested.demo.myshopify.com", "-demo.myshopify.com",
+                   "demo.myshopify.com.evil.test", ".myshopify.com"):
+        with pytest.raises(ValueError):
+            canonical_shop_domain(domain)
+
+
+def test_ambiguous_support_reference_does_not_disclose_order(monkeypatch):
+    from app.models import Case, utcnow
+    from app.services import create_support_case
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(settings, "shopify_store_domain", "demo.myshopify.com")
+    monkeypatch.setattr(settings, "llm_mode", "mock")
+    with sessions() as db:
+        for external, display, total in (("one", "collision", "21.00"), ("collision", "two", "72.00")):
+            db.add(Order(shop_domain="demo.myshopify.com", external_id=external, order_number=display,
+                         email="synthetic@example.test", currency="USD", total=total,
+                         fulfillment_status="unfulfilled", financial_status="paid",
+                         created_at=utcnow(), source_updated_at=utcnow(), payload={}))
+        db.commit()
+        case = create_support_case(db, "Where is my order?", "collision", "synthetic@example.test")
+        assert case.order_id is None
+        assert "No matching order" in case.draft
+        assert "21.00" not in case.draft and "72.00" not in case.draft
+        assert "Verified order reference" in case.missing_info
+    engine.dispose()

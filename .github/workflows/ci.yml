@@ -177,7 +177,7 @@ jobs:
       - name: Install isolated pinned browser tools
         run: |
           npm install --prefix "$RUNNER_TEMP/popify-browser" --no-audit --no-fund --ignore-scripts playwright@1.51.1 axe-core@4.10.3
-          "$RUNNER_TEMP/popify-browser/node_modules/.bin/playwright" install --with-deps chromium
+          "$RUNNER_TEMP/popify-browser/node_modules/.bin/playwright" install chromium
       - name: Run browser and accessibility checks
         run: POPIFY_BROWSER_MODULES="$RUNNER_TEMP/popify-browser" node scripts/verify_browser.mjs
       - uses: actions/upload-artifact@v4
@@ -232,7 +232,7 @@ jobs:
       - name: Install isolated pinned browser tools
         run: |
           npm install --prefix "$RUNNER_TEMP/popify-browser" --no-audit --no-fund --ignore-scripts playwright@1.51.1 axe-core@4.10.3
-          "$RUNNER_TEMP/popify-browser/node_modules/.bin/playwright" install --with-deps chromium
+          "$RUNNER_TEMP/popify-browser/node_modules/.bin/playwright" install chromium
       - name: Verify managed role browser journeys
         run: POPIFY_BROWSER_MODULES="$RUNNER_TEMP/popify-browser" node scripts/verify_managed_browser.mjs
       - uses: actions/upload-artifact@v4

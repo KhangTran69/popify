@@ -1,7 +1,8 @@
 import os
 import secrets
+import re
 from typing import Literal
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_STORE_POLICIES = {
@@ -11,6 +12,14 @@ DEFAULT_STORE_POLICIES = {
     "order_status": "Only share the recorded status; do not infer a delivery date.",
     "other": "A support operator will review this request.",
 }
+
+
+def canonical_shop_domain(value: str) -> str:
+    """One DNS label under the Shopify store domain, not a URL or suffix match."""
+    domain = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com", domain):
+        raise ValueError("Expected a single myshopify.com store hostname")
+    return domain
 
 
 class Settings(BaseSettings):
@@ -39,6 +48,11 @@ class Settings(BaseSettings):
     retry_base_seconds: int = Field(default=30, ge=1, le=3600)
     mock_retry_after_seconds: int = Field(default=0, ge=0, le=86400)
     store_policies: dict[str, str] = DEFAULT_STORE_POLICIES.copy()
+    @field_validator("shopify_store_domain")
+    @classmethod
+    def validate_shop_domain(cls, value):
+        return canonical_shop_domain(value) if value else ""
+
     @model_validator(mode="after")
     def validate_store_policies(self):
         expected = {"refund", "cancellation", "damaged_item", "order_status", "other"}

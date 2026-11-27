@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 import httpx
 from sqlalchemy.orm import Session, selectinload
 from app.db import Base, engine, get_db
-from app.config import settings
+from app.config import settings, canonical_shop_domain
 from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integration_secret
 from app.identity import managed_login, session_account, revoke_session, manage_account, ROLES
 from app.models import OperatorAccount, OperatorSession, LoginBucket
@@ -1541,7 +1541,9 @@ def shopify_order(request: Request, raw: bytes = Depends(webhook_body), db: Sess
     shop = request.headers.get("x-shopify-shop-domain")
     if not request.headers.get("x-shopify-webhook-id"):
         raise HTTPException(400, "missing Shopify delivery ID")
-    if not shop or not shop.lower().endswith(".myshopify.com"):
+    try:
+        shop = canonical_shop_domain(shop or "")
+    except ValueError:
         raise HTTPException(400, "missing or invalid Shopify shop domain")
     if (
         settings.shopify_store_domain
