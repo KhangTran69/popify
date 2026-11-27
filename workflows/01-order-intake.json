@@ -24,7 +24,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://api:8000/api/n8n/process-next?batch_size=3",
+        "url": "http://api:8000/api/n8n/process-next?batch_size=5",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -99,9 +99,9 @@
     "saveDataSuccessExecution": "all",
     "timezone": "UTC"
   },
-  "versionId": "87e6d2a1-70a3-4f5b-9d61-52fc35a6e10b",
+  "versionId": "029537c2-afc8-4bd5-9a4c-c76a9415441b",
   "meta": {
-    "description": "Shopify must POST directly to FastAPI /webhooks/shopify/orders so FastAPI can verify the exact raw body HMAC and persist the delivery before acknowledging. n8n polls the durable queue every minute and processes up to three due deliveries per execution, each with an independent transaction. Failed poll executions can be retried from n8n Executions."
+    "description": "Shopify must POST directly to FastAPI /webhooks/shopify/orders so FastAPI can verify the exact raw body HMAC and persist the delivery before acknowledging. n8n polls the durable queue every minute and processes up to five due deliveries per execution, each with an independent transaction. Failed poll executions can be retried from n8n Executions."
   },
   "tags": [],
   "id": "mf9vs7gTVY8xDqi0"

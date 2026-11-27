@@ -147,11 +147,12 @@ def run():
         assert percentile_ms(list(order_wait.values()), .95) <= 120, "Steady order queue p95 exceeded 120 seconds"
         assert percentile_ms(list(support_wait.values()), .95) <= 120, "Steady support queue p95 exceeded 120 seconds"
     else:
-        # Arrival rate exceeds the nominal three-per-minute service rate.
+        # Arrival rate exceeds the nominal five-per-minute service rate.
         # Require visible backlog growth and bounded drainage, not a steady-load SLA.
         assert peak_orders > 3, "Overload profile did not exercise backlog growth"
         assert backlog_trace[-1][1:] == (0, 0)
         assert elapsed <= deadline
+        assert percentile_ms(list(order_wait.values()), .95) <= 180, "Overload order p95 exceeded provisional 180-second regression gate"
     assert percentile_ms(ack, .95) <= 500, "Synthetic HTTP acknowledgement p95 exceeded 500 ms"
 
 

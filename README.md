@@ -47,8 +47,8 @@ There is no custom scheduler. Each workflow runs once per minute in n8n. FastAPI
 
 | Workflow | Work per run | Local POST trigger |
 | --- | --- | --- |
-| 01 — Order intake | Process up to three due deliveries | `/webhook/commerceops/orders/process` |
-| 02 — Support triage | Process up to three due mock inquiries | `/webhook/commerceops/support/triage` |
+| 01 — Order intake | Process up to five due deliveries | `/webhook/commerceops/orders/process` |
+| 02 — Support triage | Process up to five due mock inquiries | `/webhook/commerceops/support/triage` |
 | 03 — Exceptions and actions | Detect delayed orders; process up to 20 due approved actions | `/webhook/commerceops/exceptions/scan` |
 
 The trigger URLs use port 5678 and are local demo conveniences. They return worker summaries and do not accept customer payloads. The n8n editor shows its own execution history. Successful workflow data contains worker summaries; error payload persistence is disabled. Original customer messages remain in the protected operator application.
