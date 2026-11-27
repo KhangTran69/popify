@@ -7,6 +7,7 @@ import json
 import re
 import httpx
 from app.config import settings
+from app.security import secure_equal
 
 
 def verify_shopify(raw: bytes, signature: str | None) -> bool:
@@ -15,7 +16,7 @@ def verify_shopify(raw: bytes, signature: str | None) -> bool:
     digest = base64.b64encode(
         hmac.new(settings.shopify_webhook_secret.encode(), raw, hashlib.sha256).digest()
     ).decode()
-    return hmac.compare_digest(digest, signature)
+    return secure_equal(digest, signature)
 
 
 def _minimize_customer_message(message: str) -> str:

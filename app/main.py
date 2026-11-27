@@ -10,12 +10,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import select, func, or_, cast, String, exists, literal
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from pydantic import BaseModel, Field
 import httpx
 from sqlalchemy.orm import Session, selectinload
 from app.db import Base, engine, get_db
 from app.config import settings
+from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integration_secret
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
     ExecutionReconciliation, utcnow,
@@ -88,9 +89,9 @@ def _check_login_attempt(
                 _LOGIN_ATTEMPTS[key] = recent
             else:
                 del _LOGIN_ATTEMPTS[key]
-        valid = secrets.compare_digest(
+        valid = secure_equal(
             username, settings.operator_username
-        ) and secrets.compare_digest(password, settings.operator_password)
+        ) and secure_equal(password, settings.operator_password)
         if valid:
             for key in keys:
                 _LOGIN_ATTEMPTS.pop(key, None)
@@ -115,10 +116,10 @@ def _check_login_attempt(
 
 @asynccontextmanager
 async def lifespan(app):
-    if (
-        not settings.preview_mode
-        and os.environ.get("POPIFY_ENV", "production").lower() == "production"
-    ):
+    environment = os.environ.get("POPIFY_ENV", "production").lower()
+    if not settings.preview_mode and environment not in {"development", "production"}:
+        raise RuntimeError("POPIFY_ENV must be development or production.")
+    if not settings.preview_mode and environment == "production":
         required = {
             "APP_SECRET": settings.app_secret,
             "OPERATOR_PASSWORD": settings.operator_password,
@@ -127,6 +128,8 @@ async def lifespan(app):
         }
         placeholders = {
             "local-development-secret-change-me",
+            "change-me-in-real-use",
+            "replace-with-a-random-url-safe-password",
             "demo-change-me",
             "local-demo-secret",
             "replace-with-random-key-before-sharing",
@@ -165,6 +168,9 @@ app.add_middleware(
 )
 
 
+app.add_middleware(RequestBodyLimitMiddleware)
+
+
 @app.middleware("http")
 async def block_live_integrations_in_preview(request: Request, call_next):
     if settings.preview_mode and (
@@ -179,9 +185,11 @@ async def block_live_integrations_in_preview(request: Request, call_next):
 
 
 def operator(request: Request):
-    if not request.session.get("operator"):
+    actor = request.session.get("operator")
+    if not isinstance(actor, str) or not actor or not secure_equal(actor, settings.operator_username):
+        request.session.clear()
         raise HTTPException(401, "Sign in to access the operator console")
-    return request.session["operator"]
+    return actor
 
 
 def csrf(request):
@@ -194,7 +202,7 @@ def csrf(request):
 
 def verify_csrf(request, token):
     expected = request.session.get("csrf", "")
-    if not expected or not secrets.compare_digest(expected, token):
+    if not expected or not secure_equal(expected, token):
         raise HTTPException(403, "invalid CSRF token")
 
 
@@ -235,9 +243,9 @@ def login(
     verify_csrf(request, csrf_token)
     now = time.monotonic()
     if settings.preview_mode:
-        valid = secrets.compare_digest(
+        valid = secure_equal(
             username, settings.operator_username
-        ) and secrets.compare_digest(password, settings.operator_password)
+        ) and secure_equal(password, settings.operator_password)
         retry_after = 0
     else:
         valid, retry_after = _check_login_attempt(request, username, password, now)
@@ -1439,26 +1447,12 @@ def preview_run(
 
 @app.post("/webhooks/shopify/orders")
 async def shopify_order(request: Request, db: Session = Depends(get_db)):
-    max_body_bytes = 1_000_000
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            if int(content_length) > max_body_bytes:
-                raise HTTPException(413, "Webhook exceeds 1 MB")
-        except ValueError:
-            raise HTTPException(400, "invalid Content-Length")
-
-    raw = bytearray()
-    async for chunk in request.stream():
-        if len(raw) + len(chunk) > max_body_bytes:
-            raise HTTPException(413, "Webhook exceeds 1 MB")
-        raw.extend(chunk)
-    raw = bytes(raw)
+    raw = await request.body()
     if not verify_shopify(raw, request.headers.get("x-shopify-hmac-sha256")):
         raise HTTPException(401, "invalid webhook signature")
     try:
         payload = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise HTTPException(400, "invalid JSON")
     if not isinstance(payload, dict):
         raise HTTPException(422, "Order payload must be an object")
@@ -1476,7 +1470,8 @@ async def shopify_order(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(403, "unexpected Shopify shop")
     if topic not in ("orders/create", "orders/updated"):
         raise HTTPException(422, "unsupported Shopify topic")
-    if len(webhook_id) > 150 or len(shop) > 255:
+    event_id = request.headers.get("x-shopify-event-id")
+    if len(webhook_id) > 150 or len(shop) > 255 or (event_id and len(event_id) > 150):
         raise HTTPException(422, "Invalid header length")
     shop = shop.lower()
     existing = db.scalar(select(Delivery).where(Delivery.webhook_id == webhook_id))
@@ -1494,7 +1489,7 @@ async def shopify_order(request: Request, db: Session = Depends(get_db)):
         return JSONResponse({"received": True, "duplicate": True}, status_code=200)
     delivery = Delivery(
         webhook_id=webhook_id,
-        event_id=request.headers.get("x-shopify-event-id"),
+        event_id=event_id,
         topic=topic,
         shop_domain=shop,
         payload=payload,
@@ -1536,7 +1531,7 @@ def n8n_process(
     x_n8n_secret: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
     return process_delivery(db, delivery_id)
 
@@ -1545,7 +1540,7 @@ def n8n_process(
 def n8n_next(
     x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db)
 ):
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
     pending = db.scalar(
         select(Delivery)
@@ -1584,7 +1579,7 @@ def support_api(
     x_n8n_secret: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
     if not data.message.strip():
         raise HTTPException(422, "Message is required")
@@ -1599,7 +1594,7 @@ def support_api(
 def triage_next(
     x_n8n_secret: str | None = Header(default=None), db: Session = Depends(get_db)
 ):
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
     case = db.scalar(
         select(Case)
@@ -1738,7 +1733,7 @@ def scan_delayed(
 ):
     from app.services import create_approval
 
-    if not secrets.compare_digest(x_n8n_secret or "", settings.n8n_webhook_secret):
+    if not valid_integration_secret(x_n8n_secret, settings.n8n_webhook_secret):
         raise HTTPException(401)
     cutoff = utcnow() - timedelta(hours=settings.order_delay_hours)
     already_approved = exists(
@@ -1853,7 +1848,14 @@ async def http_error(request, exc):
             },
             status_code=exc.status_code,
         )
-    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(OperationalError)
+async def database_error(request, exc):
+    # Never expose connection strings, SQL parameters or customer records.
+    log.warning(json.dumps({"event": "database_unavailable", "correlation_id": getattr(request.state, "correlation_id", None)}))
+    return await http_error(request, HTTPException(503, "Database temporarily unavailable. Try again later."))
 
 
 @app.exception_handler(RequestValidationError)
@@ -1881,9 +1883,11 @@ async def validation_error(request, exc):
 async def request_log(request, call_next):
     correlation = str(uuid.uuid4())
     started = time.monotonic()
+    request.state.correlation_id = correlation
     response = await call_next(request)
     response.headers["X-Correlation-ID"] = correlation
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Cache-Control"] = "no-store"
     log.info(
