@@ -39,6 +39,16 @@ sequence_query="SELECT schemaname,sequencename,last_value FROM pg_sequences WHER
 source_sequences=$(psql -X -U "$user" -d "$source_db" -v ON_ERROR_STOP=1 -Atc "$sequence_query")
 restored_sequences=$(psql -X -U "$user" -d "$target" -v ON_ERROR_STOP=1 -Atc "$sequence_query")
 [ "$source_sequences" = "$restored_sequences" ] || { echo "Restore sequence mismatch" >&2; exit 1; }
+# pg_sequences.last_value alone cannot distinguish an initialized sequence
+# from an identical value whose next call has not yet been made.
+sequence_state() {
+  psql -X -U "$user" -d "$1" -v ON_ERROR_STOP=1 -At <<'SQL'
+SELECT format('SELECT %L, last_value, is_called FROM %I.%I;', sequencename, schemaname, sequencename)
+FROM pg_sequences WHERE schemaname = 'public' ORDER BY sequencename
+\gexec
+SQL
+}
+[ "$(sequence_state "$source_db")" = "$(sequence_state "$target")" ] || { echo "Restore sequence initialization mismatch" >&2; exit 1; }
 source_sessions=$(psql -X -U "$user" -d "$source_db" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM operator_sessions")
 restored_sessions=$(psql -X -U "$user" -d "$target" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM operator_sessions")
 [ "$source_sessions" -gt 0 ] && [ "$source_sessions" = "$restored_sessions" ]
