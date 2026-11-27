@@ -168,3 +168,47 @@ def test_overdue_alert_delivery_escalates_even_when_business_is_healthy(tmp_path
         monitor.update_outbox(path, acknowledge=event["event_id"])
     assert monitor.main(args) == 0
     assert json.loads(capsys.readouterr().out)["handoff"]["status"] == "clear"
+
+
+def test_monitor_rejects_insecure_state_directory_and_files(tmp_path):
+    import os
+    import pytest
+    from scripts.check_operations import update_outbox
+    directory = tmp_path / "state"
+    directory.mkdir(mode=0o755)
+    path = directory / "outbox.json"
+    with pytest.raises(ValueError, match="owner-only state directory"):
+        update_outbox(path, snapshot("orders_overdue"))
+    assert not path.exists()
+    directory.chmod(0o700)
+    first = update_outbox(path, snapshot("orders_overdue"))
+    before = path.read_bytes()
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="owner-only regular state file"):
+        update_outbox(path)
+    assert path.read_bytes() == before
+    path.chmod(0o600)
+    lock = path.with_name(path.name + ".lock")
+    lock.chmod(0o644)
+    with pytest.raises(ValueError, match="owner-only regular state file"):
+        update_outbox(path)
+    lock.unlink()
+    os.mkfifo(lock, 0o600)
+    with pytest.raises(ValueError, match="owner-only regular state file"):
+        update_outbox(path)
+    lock.unlink()
+    assert update_outbox(path) == first
+
+
+def test_oversized_state_write_preserves_readable_outbox(tmp_path):
+    import pytest
+    from scripts.check_operations import update_outbox
+    path = tmp_path / "outbox.json"
+    first = update_outbox(path, snapshot("orders_overdue"))
+    before = path.read_bytes()
+    large = snapshot("support_overdue")
+    large["alerts"][0]["message"] = "x" * 512_000
+    with pytest.raises(ValueError, match="durable storage bound"):
+        update_outbox(path, large)
+    assert path.read_bytes() == before
+    assert update_outbox(path) == first

@@ -7,9 +7,10 @@ import sys
 from pathlib import Path
 from scripts.relay_alerts import relay_pending, LocalReceiptSink
 
-STATE = Path("/tmp/popify-ci-monitor-outbox.json")
-MARKER = Path("/tmp/popify-ci-monitor-event")
-RECEIPTS = Path("/tmp/popify-ci-monitor-receipts")
+ROOT = Path("/tmp/popify-ci-monitor-private")
+STATE = ROOT / "outbox.json"
+MARKER = ROOT / "event"
+RECEIPTS = ROOT / "receipts"
 
 
 def poll(*args):
@@ -25,7 +26,8 @@ def run():
     args = parser.parse_args()
     assert os.environ.get("POPIFY_ENV") == "development"
     if args.stage == "unavailable":
-        assert not STATE.exists() and not MARKER.exists() and not RECEIPTS.exists()
+        assert not ROOT.exists()
+        ROOT.mkdir(mode=0o700)
         RECEIPTS.mkdir(mode=0o700)
         code, first = poll()
         assert code == 2 and first["status"] == "unavailable"
@@ -65,6 +67,7 @@ def run():
         STATE.unlink()
         STATE.with_name(STATE.name + ".lock").unlink()
         MARKER.unlink()
+        ROOT.rmdir()
 
 
 if __name__ == "__main__":

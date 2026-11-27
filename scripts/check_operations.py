@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import tempfile
+import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -44,31 +45,51 @@ def alert_transitions(previous, snapshot, now, repeat_seconds):
 MAX_PENDING_EVENTS = 500
 
 
+def private_directory(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ValueError("Use an existing owner-only state directory")
+
+
+def private_regular(fd):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ValueError("Use an owner-only regular state file")
+    return info
+
+
 @contextmanager
 def locked_state(path):
     path = Path(path)
-    if not path.parent.is_dir() or path.is_symlink():
-        raise ValueError("Use a trusted existing directory and regular state file.")
+    private_directory(path.parent)
     lock_path = path.with_name(path.name + ".lock")
-    with os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), "r+") as lock:
+    # Nonblocking open prevents a planted FIFO from hanging the scheduler.
+    with os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600), "r+") as lock:
+        private_regular(lock.fileno())
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if path.exists():
-            # Limit reads and reject symlinks and non-regular files before parsing.
-            if not path.is_file() or path.is_symlink() or path.stat().st_size > 512_000:
-                raise ValueError("Invalid monitor state file")
-            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "r") as source:
-                previous = json.loads(source.read(512_001))
-        else:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
             previous = None
+        else:
+            with os.fdopen(fd, "r") as source:
+                info = private_regular(source.fileno())
+                if info.st_size > 512_000:
+                    raise ValueError("Invalid monitor state file")
+                previous = json.loads(source.read(512_001))
         yield path, previous
 
 
 def atomic_write(path, value):
+    # Never publish a file that the next bounded reader would reject.
+    encoded = json.dumps(value, sort_keys=True)
+    if len(encoded.encode("utf-8")) > 512_000:
+        raise ValueError("Alert state exceeds durable storage bound")
     temp = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".monitor-", delete=False) as output:
             temp = output.name
-            json.dump(value, output, sort_keys=True)
+            output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temp, path)

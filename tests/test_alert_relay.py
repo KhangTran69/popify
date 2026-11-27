@@ -49,3 +49,12 @@ def test_conflicting_receipt_preserves_event(tmp_path):
         relay_pending(path, sink)
     assert update_outbox(path) == events
     assert conflicting.read_text() == "{}"
+
+
+def test_receipt_sink_rejects_shared_directory(tmp_path):
+    import pytest
+    from scripts.relay_alerts import LocalReceiptSink
+    directory = tmp_path / "receipts"
+    directory.mkdir(mode=0o755)
+    with pytest.raises(ValueError, match="owner-only state directory"):
+        LocalReceiptSink(directory)

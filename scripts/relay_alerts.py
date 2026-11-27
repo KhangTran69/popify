@@ -7,18 +7,16 @@ import argparse
 import json
 import os
 import re
-import stat
 import tempfile
 from pathlib import Path
 
-from scripts.check_operations import update_outbox
+from scripts.check_operations import update_outbox, private_directory, private_regular
 
 
 class LocalReceiptSink:
     def __init__(self, directory):
         self.directory = Path(directory)
-        if self.directory.is_symlink() or not self.directory.is_dir() or self.directory.stat().st_mode & 0o077:
-            raise ValueError("Use an existing private receipt directory")
+        private_directory(self.directory)
 
     def __call__(self, event):
         event_id = event.get("event_id", "")
@@ -41,8 +39,8 @@ class LocalReceiptSink:
                 # Replay is accepted only for the same immutable receipt.
                 fd = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                 with os.fdopen(fd, "rb") as existing:
-                    info = os.fstat(existing.fileno())
-                    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or existing.read(len(data) + 1) != data:
+                    private_regular(existing.fileno())
+                    if existing.read(len(data) + 1) != data:
                         raise ValueError("Conflicting receipt")
                     os.fsync(existing.fileno())
             fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
