@@ -1,12 +1,14 @@
 """Verify migration 0008 on fresh and populated PostgreSQL schemas."""
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 
 from sqlalchemy import create_engine, text
 
 from app.config import settings
 from app.db import engine
+from scripts.migrate import migrate
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations" / "versions"
 
@@ -21,7 +23,8 @@ def run():
     if engine.dialect.name != "postgresql":
         raise RuntimeError("Migration verification requires PostgreSQL")
     schemas = ["migration_fresh_" + uuid.uuid4().hex,
-               "migration_upgrade_" + uuid.uuid4().hex]
+               "migration_upgrade_" + uuid.uuid4().hex,
+               "migration_concurrent_" + uuid.uuid4().hex]
     isolated_engines = []
     migrations = sorted(MIGRATIONS.glob("*.sql"))
     migration_0007 = MIGRATIONS / "0007_execution_reconciliation.sql"
@@ -30,7 +33,7 @@ def run():
         with engine.begin() as connection:
             for schema in schemas:
                 connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-        for index, schema in enumerate(schemas):
+        for index, schema in enumerate(schemas[:2]):
             isolated = create_engine(
                 settings.database_url,
                 connect_args={"options": f"-csearch_path={schema}"},
@@ -114,6 +117,15 @@ def run():
                     assert result == (2, 2, "legacy-operator", "still_unknown"), result
                 assert connection.exec_driver_sql("SELECT count(*) FROM operator_accounts").scalar_one() == 0
                 assert connection.exec_driver_sql("SELECT count(*) FROM operator_sessions").scalar_one() == 0
+        concurrent = create_engine(settings.database_url, connect_args={"options": f"-csearch_path={schemas[2]}"})
+        isolated_engines.append(concurrent)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda _: migrate(concurrent), range(2)))
+        with concurrent.connect() as connection:
+            versions = connection.exec_driver_sql("SELECT version FROM schema_migrations ORDER BY version").scalars().all()
+            assert versions == [migration.name for migration in migrations]
+            assert connection.exec_driver_sql("SELECT count(*) FROM operator_accounts").scalar_one() == 0
+        print("PASS: competing migrators serialized; each ordered migration recorded exactly once")
         print("PASS: identity schema and migration 0008 apply to a fresh schema and upgrades populated 0007 data, preserving historical ambiguous decisions and allowing an append-only follow-up.")
     finally:
         for isolated in isolated_engines:

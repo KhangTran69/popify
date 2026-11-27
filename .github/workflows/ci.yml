@@ -108,8 +108,6 @@ jobs:
           docker compose exec -T api python -m scripts.verify_outage pending --confirm-disposable
           docker compose start n8n
           docker compose exec -T api python -m scripts.verify_outage recovered --confirm-disposable
-      - name: Measure real scheduled order and support queue latency
-        run: docker compose exec -T api python -m scripts.verify_scheduled_workload --confirm-disposable
       - name: Verify database outage and readiness recovery
         run: |
           docker compose stop n8n db
@@ -130,6 +128,33 @@ jobs:
         run: |
           docker compose logs --no-color --tail=120 || true
           docker compose down --remove-orphans
+
+  scheduled-workload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure disposable mock stack
+        run: |
+          cp .env.example .env
+          sed -i 's/^SHOPIFY_WEBHOOK_SECRET=$/SHOPIFY_WEBHOOK_SECRET=synthetic-ci-scheduled-intake-only/' .env
+      - name: Start actual scheduled n8n workers
+        run: docker compose up --build --detach --wait --wait-timeout 240
+      - name: Measure real scheduled order and support queue latency
+        run: |
+          set -o pipefail
+          docker compose exec -T api python -m scripts.verify_scheduled_workload --confirm-disposable | tee scheduled-workload.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scheduled-workload
+          path: scheduled-workload.log
+          if-no-files-found: ignore
+      - name: Clean disposable scheduled stack
+        if: always()
+        run: |
+          docker compose logs --no-color --tail=80 || true
+          docker compose down --volumes --remove-orphans
 
   browser-accessibility:
     # Playwright 1.51 is supported on Ubuntu 24.04, not the latest 26.04 runner.
