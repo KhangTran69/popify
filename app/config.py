@@ -2,6 +2,7 @@ import os
 import secrets
 import re
 from typing import Literal
+from urllib.parse import urlsplit
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -32,6 +33,7 @@ class Settings(BaseSettings):
     shopify_admin_token: str = ""
     shopify_api_version: str = "2026-10"
     managed_identity: bool = False
+    operator_origin: str = ""
     allow_external_ai: bool = False
     operator_username: str = "operator"
     operator_password: str = "demo-change-me"
@@ -49,6 +51,23 @@ class Settings(BaseSettings):
     retry_base_seconds: int = Field(default=30, ge=1, le=3600)
     mock_retry_after_seconds: int = Field(default=0, ge=0, le=86400)
     store_policies: dict[str, str] = DEFAULT_STORE_POLICIES.copy()
+    @field_validator("operator_origin")
+    @classmethod
+    def validate_operator_origin(cls, value):
+        if not value:
+            return ""
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or parsed.path or parsed.query or parsed.fragment
+                or any(ch.isspace() for ch in value) or value != "https://" + parsed.netloc):
+            raise ValueError("OPERATOR_ORIGIN must be an HTTPS origin without a path")
+        # Accessing port also rejects malformed or out-of-range port numbers.
+        port = parsed.port
+        host = parsed.hostname
+        if ":" in host:
+            host = "[" + host + "]"
+        return "https://" + host + (f":{port}" if port and port != 443 else "")
+
     @field_validator("shopify_store_domain")
     @classmethod
     def validate_shop_domain(cls, value):

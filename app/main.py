@@ -250,8 +250,13 @@ def csrf(request):
 
 
 def verify_csrf(request, token):
-    if settings.managed_identity and request.headers.get("sec-fetch-site", "").lower() == "cross-site":
-        raise HTTPException(403, "Cross-site form submission denied")
+    if settings.managed_identity:
+        fetch_site = request.headers.get("sec-fetch-site", "").lower()
+        if fetch_site in {"cross-site", "same-site"}:
+            raise HTTPException(403, "Cross-origin form submission denied")
+        origins = request.headers.getlist("origin")
+        if origins and settings.operator_origin and origins != [settings.operator_origin]:
+            raise HTTPException(403, "Cross-origin form submission denied")
     expected = request.session.get("csrf", "")
     if not expected or not secure_equal(expected, token):
         raise HTTPException(403, "invalid CSRF token")

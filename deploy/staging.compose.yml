@@ -7,6 +7,7 @@ services:
       POPIFY_ENV: production
       MANAGED_IDENTITY: "true"
       COOKIE_SECURE: "true"
+      OPERATOR_ORIGIN: "${POPIFY_STAGING_OPERATOR_ORIGIN:-https://localhost:8444}"
       LLM_MODE: mock
       ALLOW_EXTERNAL_AI: "false"
       OPENAI_API_KEY: ""
