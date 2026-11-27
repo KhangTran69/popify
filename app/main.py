@@ -278,10 +278,11 @@ def liveness():
 def readiness(db: Session = Depends(get_db)):
     try:
         for model in (Order, Delivery, Case, Approval, ActionExecution, Audit, ExecutionReconciliation):
-            db.execute(select(model.id).limit(1))
+            # Validate mapped columns as well as table existence without reading customer records.
+            db.execute(select(model).limit(0))
         if settings.managed_identity and not settings.preview_mode:
-            db.execute(select(OperatorSession.token_hash).limit(1))
-            db.execute(select(LoginBucket.key).limit(1))
+            for model in (OperatorAccount, OperatorSession, LoginBucket):
+                db.execute(select(model).limit(0))
             if not db.scalar(select(OperatorAccount.id).where(OperatorAccount.active.is_(True), OperatorAccount.role == "admin").limit(1)):
                 return JSONResponse({"status": "not_ready"}, status_code=503)
     except Exception:

@@ -93,3 +93,22 @@ def test_ambiguous_support_reference_does_not_disclose_order(monkeypatch):
         assert "21.00" not in case.draft and "72.00" not in case.draft
         assert "Verified order reference" in case.missing_info
     engine.dispose()
+
+
+def test_readiness_detects_incomplete_schema(monkeypatch):
+    from sqlalchemy import text
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE orders (id INTEGER PRIMARY KEY)"))
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(engine)
+    def override():
+        with sessions() as db:
+            yield db
+    monkeypatch.setitem(main.app.dependency_overrides, get_db, override)
+    monkeypatch.setattr(settings, "managed_identity", False)
+    client = TestClient(main.app)
+    assert client.get("/live").status_code == 200
+    assert client.get("/ready").status_code == 503
+    assert client.get("/ready").json() == {"status": "not_ready"}
+    engine.dispose()

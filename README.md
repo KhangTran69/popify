@@ -318,3 +318,5 @@ Official documentation consulted for this implementation:
 | Migration error | Read API startup logs and `schema_migrations`; preserve the database and fix the failing migration |
 
 This is a single-operator local portfolio system. Production identity verification, secret rotation, retention, high-volume worker throughput, multi-store isolation, and real outbound adapters require additional work.
+
+Operational ownership and handover: [single-store mock staging handover](docs/OPERATIONAL_HANDOVER.md) and [release gates](docs/RELEASE_GATES.md).

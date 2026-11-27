@@ -25,3 +25,5 @@ Review CI failures and dependency updates before merging. Monthly: review queue 
 The repository CI now includes an encrypted n8n state recovery drill on a separate volume. Record its result and measured duration alongside PostgreSQL restoration evidence; host-loss recovery, independent key recovery, actual RPO/RTO and offsite storage remain distinct gates.
 
 The local alert outbox preserves unacknowledged events and supports explicit acknowledgement; actual relay delivery, deduplication and escalation ownership must be exercised on the approved host before deployment.
+
+Use [OPERATIONAL_HANDOVER.md](OPERATIONAL_HANDOVER.md) to record ownership and evidence, run incident procedures and preserve rollback boundaries. A CI-green branch is necessary but not sufficient for a real deployment.
