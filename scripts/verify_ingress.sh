@@ -41,7 +41,7 @@ expect_code 401 -X POST -d '{}' "$base"
 head -c 1000001 /dev/zero > "$tmp/large"
 expect_code 413 -H "Expect: 100-continue" --expect100-timeout 5 --data-binary @"$tmp/large" "$base"
 # Bounded synthetic burst against the isolated ingress, no valid signatures.
-seq 1 40 | xargs -P 8 -I '%' sh -c 'curl -ks --max-time 10 -o /dev/null -w "%{http_code}\n" -X POST -d "{}" "$1"' _ "$base" '%' > "$tmp/status"
+seq 1 40 | xargs -P 8 -I '__INDEX__' sh -c 'curl -ks --max-time 10 -o /dev/null -w "%{http_code}\n" -X POST -d "{}" "$1"' _ "$base" '__INDEX__' > "$tmp/status"
 sort "$tmp/status" | uniq -c
 [ "$(wc -l < "$tmp/status")" -eq 40 ]
 if grep -Ev '^(401|429)
