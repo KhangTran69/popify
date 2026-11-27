@@ -146,3 +146,26 @@ def test_admin_account_controls_and_audit(identity_db):
         event = db.scalar(select(Audit).where(Audit.entity_type == "operator",
                     Audit.entity_id == account.id, Audit.event == "operator_account_role"))
         assert event.actor == "test-admin"
+
+
+def test_reauthentication_revokes_presented_cookie(identity_db):
+    client = TestClient(main.app, follow_redirects=False)
+    login(client, "support")
+    old = client.cookies.get("session")
+    login(client, "reviewer")
+    replay = TestClient(main.app, follow_redirects=False)
+    replay.cookies.set("session", old)
+    assert replay.get("/").status_code == 401
+    assert client.get("/operations").status_code == 200
+
+
+def test_admin_mutation_rechecks_revoked_session(identity_db):
+    with identity_db() as db:
+        _, token, _ = managed_login(db, "test-admin", PASSWORD, "synthetic-admin")
+        manage_account(db, "test-admin", "revoke")
+        with pytest.raises(PermissionError):
+            manage_account(db, "test-support", "disable", actor="test-admin",
+                           protect_last_admin=True, administrator_token=token)
+        db.rollback()
+        account = db.scalar(select(OperatorAccount).where(OperatorAccount.username == "test-support"))
+        assert account.active

@@ -20,7 +20,7 @@ from app.security import RequestBodyLimitMiddleware, secure_equal, valid_integra
 from app.identity import managed_login, session_account, revoke_session, manage_account, ROLES
 from app.models import OperatorAccount, OperatorSession, LoginBucket
 from app.privacy import minimized_order_payload
-from app.operations import queue_summary
+from app.operations import operational_snapshot, workflow_activity
 from app.models import (
     Order, Delivery, Case, Approval, Audit, ActionExecution,
     ExecutionReconciliation, utcnow,
@@ -274,7 +274,8 @@ def liveness():
 @app.get("/ready")
 def readiness(db: Session = Depends(get_db)):
     try:
-        db.execute(select(Order.id).limit(1))
+        for model in (Order, Delivery, Case, Approval, ActionExecution, Audit, ExecutionReconciliation):
+            db.execute(select(model.id).limit(1))
         if settings.managed_identity and not settings.preview_mode:
             db.execute(select(OperatorSession.token_hash).limit(1))
             db.execute(select(LoginBucket.key).limit(1))
@@ -287,12 +288,15 @@ def readiness(db: Session = Depends(get_db)):
 
 @app.get("/api/ops/status")
 def operational_status(actor=Depends(operator), db: Session = Depends(get_db)):
-    activity = workflow_activity(db)
-    return {"mode": "isolated_preview" if settings.preview_mode else "mock_actions",
-            "queues": queue_summary(db),
-            "workers": [{"number": item["number"], "recent_poll": item["recent"],
-                         "last_poll": as_utc(item["last"].created_at).isoformat() if item["last"] else None}
-                        for item in activity]}
+    return operational_snapshot(db, preview=settings.preview_mode)
+
+
+@app.get("/operations", response_class=HTMLResponse)
+def operations_page(request: Request, actor=Depends(operator), db: Session = Depends(get_db)):
+    return templates.TemplateResponse(request, "operations.html", {
+        "request": request, "actor": actor, "csrf": csrf(request),
+        "title": "Operational status", "snapshot": operational_snapshot(db, preview=settings.preview_mode),
+    })
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -320,7 +324,8 @@ def login(
         retry_after = 0
     elif settings.managed_identity:
         account, identity_token, retry_after = managed_login(
-            db, username, password, request.client.host if request.client else "unknown"
+            db, username, password, request.client.host if request.client else "unknown",
+            previous_token=request.session.get("identity_token"),
         )
         valid = account is not None
     else:
@@ -397,64 +402,17 @@ def operator_update(username: str, request: Request, action: str = Form(...),
     if username == actor:
         raise HTTPException(409, "Use sign out for your own session; another administrator must change your account.")
     try:
-        manage_account(db, username, action, role=role, actor=actor, protect_last_admin=True)
+        manage_account(db, username, action, role=role, actor=actor, protect_last_admin=True,
+                       administrator_token=request.session.get("identity_token"))
+    except PermissionError:
+        db.rollback()
+        request.session.clear()
+        raise HTTPException(403, "Administrator authorization changed. Sign in again.")
     except ValueError as exc:
         db.rollback()
         raise HTTPException(409, str(exc))
     return RedirectResponse("/operators", status_code=303)
 
-
-def workflow_activity(db):
-    result = []
-    for number, label in [
-        (1, "Order intake"),
-        (2, "Support triage"),
-        (3, "Exceptions & actions"),
-    ]:
-        last = db.scalar(
-            select(Audit)
-            .where(
-                Audit.entity_type == "workflow",
-                Audit.entity_id == number,
-                Audit.event.in_(["work_completed", "work_failed", "poll_completed"]),
-            )
-            .order_by(Audit.id.desc())
-            .limit(1)
-        )
-        success = db.scalar(
-            select(Audit)
-            .where(
-                Audit.entity_type == "workflow",
-                Audit.entity_id == number,
-                Audit.event == "work_completed",
-            )
-            .order_by(Audit.id.desc())
-            .limit(1)
-        )
-        failure = db.scalar(
-            select(Audit)
-            .where(
-                Audit.entity_type == "workflow",
-                Audit.entity_id == number,
-                Audit.event == "work_failed",
-            )
-            .order_by(Audit.id.desc())
-            .limit(1)
-        )
-        recent = bool(
-            last and (utcnow() - as_utc(last.created_at)).total_seconds() < 180
-        )
-        result.append(
-            {
-                "number": number,
-                "label": label,
-                "last": last,
-                "success": success,
-                "failure": failure,
-                "recent": recent,
-            }
-        )
-    return result
 
 
 def heartbeat(db, number, result, completed=False, failed=False):

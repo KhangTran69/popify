@@ -52,7 +52,7 @@ try {
   await page.getByLabel("Password").fill("preview-only");
   await Promise.all([page.waitForURL(base + "/"), page.getByRole("button", { name: "Sign in to workspace" }).click()]);
   await scan(page, "dashboard");
-  for (const route of ["/recovery", "/queues/orders", "/queues/cases", "/queues/approvals", "/support", "/demo"]) {
+  for (const route of ["/recovery", "/operations", "/queues/orders", "/queues/cases", "/queues/approvals", "/support", "/demo"]) {
     await page.goto(base + route);
     await scan(page, route);
   }

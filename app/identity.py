@@ -63,7 +63,7 @@ def _event(db, account, event, actor):
                  actor=actor, correlation_id=secrets.token_hex(16), details={}))
 
 
-def managed_login(db, username, password, client_address):
+def managed_login(db, username, password, client_address, *, previous_token=None):
     """Serialize the bounded login budget across PostgreSQL workers.
 
     The lock covers only login requests, not normal operator or worker activity.
@@ -103,6 +103,9 @@ def managed_login(db, username, password, client_address):
     if buckets[1] is not None:
         db.delete(buckets[1])
     db.execute(delete(OperatorSession).where(OperatorSession.expires_at <= now))
+    # Successful reauthentication replaces the presented session, even on account switch.
+    if isinstance(previous_token, str) and previous_token.isascii() and 32 <= len(previous_token) <= 128:
+        db.execute(delete(OperatorSession).where(OperatorSession.token_hash == _digest(previous_token)))
     # Limit active sessions per account without weakening revocation.
     older = list(db.scalars(select(OperatorSession.token_hash).where(
         OperatorSession.account_id == account.id).order_by(OperatorSession.expires_at.desc()).offset(4)))
@@ -116,13 +119,13 @@ def managed_login(db, username, password, client_address):
     return account, token, 0
 
 
-def session_account(db, token):
+def session_account(db, token, *, refresh=False):
     if not isinstance(token, str) or not 32 <= len(token) <= 128 or not token.isascii():
         return None
-    session = db.get(OperatorSession, _digest(token))
+    session = db.get(OperatorSession, _digest(token), populate_existing=refresh)
     if not session or _aware(session.expires_at) <= utcnow():
         return None
-    account = db.get(OperatorAccount, session.account_id)
+    account = db.get(OperatorAccount, session.account_id, populate_existing=refresh)
     return account if account and account.active else None
 
 
@@ -134,12 +137,16 @@ def revoke_session(db, token, account):
     db.commit()
 
 
-def manage_account(db, username, action, role=None, password=None, *, actor="deployment_admin", protect_last_admin=False):
+def manage_account(db, username, action, role=None, password=None, *, actor="deployment_admin", protect_last_admin=False, administrator_token=None):
     """Manage a stable operator identity under a trusted administrator boundary."""
     validate_username(username)
     # Serialize with login to prevent account changes racing new sessions.
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(607291041)"))
+    if protect_last_admin:
+        administrator = session_account(db, administrator_token, refresh=True)
+        if not administrator or administrator.role != "admin" or administrator.username != actor:
+            raise PermissionError("Administrator session no longer authorized.")
     account = db.scalar(select(OperatorAccount).where(OperatorAccount.username == username).with_for_update())
     if protect_last_admin and account and account.active and account.role == "admin" and (
         action == "disable" or (action == "role" and role != "admin")
