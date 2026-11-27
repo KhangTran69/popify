@@ -43,3 +43,44 @@ def test_unavailable_exit_does_not_leak_exception(monkeypatch, capsys):
     result = capsys.readouterr().out
     assert "private connection details" not in result
     assert json.loads(result)["alerts"][0]["code"] == "database_unavailable"
+
+
+def test_durable_outbox_replays_until_acknowledged(tmp_path):
+    from scripts.check_operations import update_outbox
+    path = tmp_path / "outbox.json"
+    first = update_outbox(path, snapshot("orders_overdue"))
+    assert first[0]["transition"] == "opened"
+    assert update_outbox(path, snapshot("orders_overdue")) == first
+    resolved = update_outbox(path, snapshot(status="healthy"))
+    assert [e["transition"] for e in resolved] == ["opened", "resolved"]
+    assert resolved[0]["event_id"] != resolved[1]["event_id"]
+    assert update_outbox(path, acknowledge=first[0]["event_id"]) == resolved[1:]
+    assert update_outbox(path, acknowledge=first[0]["event_id"]) == resolved[1:]
+    assert update_outbox(path, acknowledge=resolved[1]["event_id"]) == []
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_outbox_full_does_not_discard_unacknowledged_events(tmp_path, monkeypatch):
+    import pytest
+    from scripts import check_operations as monitor
+    monkeypatch.setattr(monitor, "MAX_PENDING_EVENTS", 1)
+    path = tmp_path / "outbox.json"
+    first = monitor.update_outbox(path, snapshot("orders_overdue"))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="full"):
+        monitor.update_outbox(path, snapshot(status="healthy"))
+    assert path.read_bytes() == before
+    monitor.update_outbox(path, acknowledge=first[0]["event_id"])
+    resolved = monitor.update_outbox(path, snapshot(status="healthy"))
+    assert resolved[0]["transition"] == "resolved"
+
+
+def test_ack_command_is_independent_of_database(tmp_path, monkeypatch, capsys):
+    from scripts import check_operations as monitor
+    path = tmp_path / "outbox.json"
+    event = monitor.update_outbox(path, snapshot("orders_overdue"))[0]
+    def unavailable():
+        raise AssertionError("ack must not contact database")
+    monkeypatch.setattr(monitor, "SessionLocal", unavailable)
+    assert monitor.main(["--outbox-file", str(path), "--ack-event", event["event_id"]]) == 0
+    assert json.loads(capsys.readouterr().out)["pending_count"] == 0

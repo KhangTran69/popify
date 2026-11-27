@@ -111,7 +111,9 @@ def operational_snapshot(db, *, preview=False):
         last = item["last"]
         state = "disabled" if preview else "stale" if not item["recent"] else "failed" if last.event == "work_failed" else "healthy"
         workers.append({"number": item["number"], "label": item["label"], "state": state,
-                        "recent_poll": item["recent"], "last_poll": as_utc(last.created_at).isoformat() if last else None})
+                        "recent_poll": item["recent"], "last_poll": as_utc(last.created_at).isoformat() if last else None,
+                        "last_success": as_utc(item["success"].created_at).isoformat() if item["success"] else None,
+                        "last_failure": as_utc(item["failure"].created_at).isoformat() if item["failure"] else None})
         if state in ("stale", "failed"):
             alert(f"worker_{item['number']}_{state}", "warning", f"{item['label']} worker: {state}.",
                   "Inspect private n8n execution logs and database connectivity before retrying.")

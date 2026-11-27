@@ -23,3 +23,5 @@ PoPify is mock-only. These gates distinguish repository verification from a real
 Review CI failures and dependency updates before merging. Monthly: review queue trends, alert noise, access, secrets, retention and dependencies; record owners for open risks. Quarterly: rehearse restoration, manual accessibility and representative queue capacity in an isolated environment. Before each deployment: back up, verify migrations and rollback/restore instructions, test with mock-only settings, and preserve human approval history. Deployment, merchant pilot, live provider actions and commercial commitments are not authorized by repository tests.
 
 The repository CI now includes an encrypted n8n state recovery drill on a separate volume. Record its result and measured duration alongside PostgreSQL restoration evidence; host-loss recovery, independent key recovery, actual RPO/RTO and offsite storage remain distinct gates.
+
+The local alert outbox preserves unacknowledged events and supports explicit acknowledgement; actual relay delivery, deduplication and escalation ownership must be exercised on the approved host before deployment.
