@@ -58,6 +58,16 @@ jobs:
       - run: python -m scripts.migrate
       - run: python -m scripts.verify_migrations
       - run: python -m scripts.verify_postgres
+      - name: Verify production managed identity using isolated PostgreSQL
+        env:
+          POPIFY_CONFIRM_DISPOSABLE: "1"
+          POPIFY_ENV: production
+          MANAGED_IDENTITY: "true"
+          COOKIE_SECURE: "true"
+          APP_SECRET: synthetic-ci-only-app-secret-32-characters
+          N8N_WEBHOOK_SECRET: synthetic-ci-only-worker-secret-32-characters
+          N8N_ENCRYPTION_KEY: synthetic-ci-only-encryption-key-32-characters
+        run: python -m scripts.verify_production_identity
 
   live-compose-demo:
     runs-on: ubuntu-latest

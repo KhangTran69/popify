@@ -16,7 +16,7 @@ const child = spawn(process.env.PYTHON || "python", ["-m", "scripts.preview", "-
 });
 const report = [];
 const fatal = new Set(["button-name", "label", "link-name", "aria-valid-attr", "aria-valid-attr-value",
-  "duplicate-id-aria", "html-has-lang", "document-title", "landmark-one-main"]);
+  "duplicate-id-aria", "html-has-lang", "document-title", "landmark-one-main", "color-contrast", "link-in-text-block"]);
 let browser;
 async function scan(page, name) {
   await page.addScriptTag({ path: axePath });
@@ -27,6 +27,7 @@ async function scan(page, name) {
     id: v.id, impact: v.impact, description: v.description, targets: v.nodes.map(n => n.target)
   }));
   report.push({ name, viewport: page.viewportSize(), violations });
+  console.log("AXE " + JSON.stringify({page:name,violations:violations.map(v=>({rule:v.id,impact:v.impact,count:v.targets.length}))}));
   assert.deepEqual(violations.filter(v => fatal.has(v.id)), [], name + ": critical structural accessibility rules");
   assert.equal(await page.locator("main").count(), 1, name + ": one main landmark");
 }

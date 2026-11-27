@@ -16,7 +16,7 @@
     {% if actor %}
       <aside class="sidebar">
         <a class="brand" href="/"><span class="brand-icon">p.</span>po<span>pify</span></a>
-        <div class="workspace"><span class="store-icon">N</span><div>Northline Supply<small>Local demonstration store</small></div></div>
+        <div class="workspace"><span class="store-icon">N</span><div>{{ "Northline Supply" if demo_enabled else "Operations workspace" }}<small>{{ "Local demonstration store" if demo_enabled else "Single store · Mock actions" }}</small></div></div>
         <div class="nav-label">WORKSPACE</div>
         <nav aria-label="Main navigation">
           {% for href,label,icon in [('/','Overview','◫'),('/demo','Guided demo','▶'),('/recovery','Recovery','!'),('/queues/orders','Orders','▣'),('/queues/cases','Support cases','◷'),('/queues/approvals','Approvals','✓'),('/queues/deliveries','Deliveries','↳')] %}

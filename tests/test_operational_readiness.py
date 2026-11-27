@@ -44,6 +44,11 @@ def test_minimized_signed_order_and_private_status(monkeypatch):
         assert process_delivery(db, delivery.id)["status"] == "processed"
         order = db.scalar(select(Order))
         assert order.email == "synthetic@example.test" and "note" not in order.payload
+        from scripts.privacy_inventory import inventory
+        result = inventory(db, 90)
+        assert result["records"]["orders"]["total"] == 1
+        assert result["orders_with_email"] == 1
+        assert "synthetic@example.test" not in json.dumps(result)
     assert client.post("/webhooks/shopify/orders", content=raw, headers={**headers,
         "X-Shopify-Hmac-SHA256": "invalid", "Accept": "text/html"}).status_code == 401
     engine.dispose()
