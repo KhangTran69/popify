@@ -17,7 +17,8 @@ from app.config import settings
 from app.db import engine, get_db
 from app.schema import migration_paths
 from scripts.migrate import migrate
-from app.identity import manage_account, managed_login, session_account
+from app.identity import manage_account, managed_login, session_account, revoke_session
+from app import identity
 from app.models import Approval, Audit, Case, ActionExecution, ExecutionReconciliation, Delivery, Order, utcnow
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -208,6 +209,75 @@ def verify_mutation_revocation_order(sessions):
     print("PASS: revocation serialized with authorized mutation; stale session denied after commit")
 
 
+def verify_admin_logout_order(sessions):
+    """An administrator's logout must serialize with account administration."""
+    with sessions() as db:
+        manage_account(db, "ci-race-admin", "create", role="admin", password=PASSWORD)
+        manage_account(db, "ci-race-target", "create", role="support", password=PASSWORD)
+        _, admin_token, wait = managed_login(db, "ci-race-admin", PASSWORD, "synthetic-admin-race")
+        assert admin_token and not wait
+
+    checked, release, logout_attempted = Event(), Event(), Event()
+    original_lookup = identity.session_account
+
+    def pause_after_revalidation(db, token, **kwargs):
+        account = original_lookup(db, token, **kwargs)
+        checked.set()
+        if not release.wait(10):
+            raise RuntimeError("Administrator race synchronization timed out")
+        return account
+
+    def change_role():
+        with sessions() as db:
+            manage_account(db, "ci-race-target", "role", role="reviewer",
+                           actor="ci-race-admin", protect_last_admin=True,
+                           administrator_token=admin_token)
+
+    def sign_out():
+        with sessions() as db:
+            account = original_lookup(db, admin_token)
+            assert account is not None
+            logout_attempted.set()
+            revoke_session(db, admin_token, account)
+
+    identity.session_account = pause_after_revalidation
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            change = pool.submit(change_role)
+            try:
+                assert checked.wait(5)
+                logout = pool.submit(sign_out)
+                assert logout_attempted.wait(5)
+                # The administrator session remains locked through the mutation.
+                try:
+                    logout.result(timeout=.5)
+                except TimeoutError:
+                    pass
+                else:
+                    raise AssertionError("Logout committed before the authorized account mutation")
+            finally:
+                release.set()
+            change.result(timeout=10)
+            logout.result(timeout=10)
+    finally:
+        identity.session_account = original_lookup
+
+    with sessions() as db:
+        assert original_lookup(db, admin_token) is None
+        from app.models import OperatorAccount
+        target = db.scalar(select(OperatorAccount).where(OperatorAccount.username == "ci-race-target"))
+        assert target.role == "reviewer"
+        try:
+            manage_account(db, "ci-race-target", "disable", actor="ci-race-admin",
+                           protect_last_admin=True, administrator_token=admin_token)
+        except PermissionError:
+            db.rollback()
+        else:
+            raise AssertionError("Logged-out administrator was allowed to mutate an account")
+        assert db.scalar(select(OperatorAccount.active).where(OperatorAccount.username == "ci-race-target"))
+    print("PASS: administrator logout serialized with account mutation; logged-out administrator denied")
+
+
 def run():
     if os.environ.get("POPIFY_CONFIRM_DISPOSABLE") != "1" or not settings.managed_identity or engine.dialect.name != "postgresql" or os.environ.get("POPIFY_ENV") != "production":
         raise RuntimeError("Requires explicit disposable PostgreSQL and production managed-identity configuration.")
@@ -272,6 +342,7 @@ def run():
                 assert approval.actor == "ci-reviewer" and approval.status == "approved"
                 assert execution and execution.state == "succeeded"
             verify_mutation_revocation_order(sessions)
+            verify_admin_logout_order(sessions)
             verify_delivery_batches(sessions)
             verify_support_batches(sessions)
             verify_recovery(sessions, admin, support, support_token, reviewer, reviewer_token)

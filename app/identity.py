@@ -178,7 +178,10 @@ def manage_account(db, username, action, role=None, password=None, *, actor="dep
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(607291041)"))
     if protect_last_admin:
-        administrator = session_account(db, administrator_token, refresh=True)
+        # Acquire the acting account/session locks only after the global
+        # account-management lock. Explicit sign-out does not take that
+        # global lock, so revalidation alone cannot serialize with logout.
+        administrator = session_account(db, administrator_token, lock_mutation=True)
         if not administrator or administrator.role != "admin" or administrator.username != actor:
             raise PermissionError("Administrator session no longer authorized.")
     account = db.scalar(select(OperatorAccount).where(OperatorAccount.username == username).with_for_update())
