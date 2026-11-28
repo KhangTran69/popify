@@ -1,4 +1,5 @@
 """Bounded operational summaries and actionable alerts without customer content."""
+from math import ceil
 from sqlalchemy import case, func, or_, select
 from app.config import settings
 from app.models import ActionExecution, Approval, Audit, Case, Delivery, utcnow
@@ -78,12 +79,13 @@ def queue_summary(db):
         eligible_since = case((model.next_attempt_at > timestamp, model.next_attempt_at), else_=timestamp)
         # One statement per queue gives a consistent count/age snapshot under
         # PostgreSQL READ COMMITTED, including concurrent enqueue and drain.
-        total, oldest, due_count, oldest_due, exhausted_count = db.execute(select(
+        total, oldest, due_count, oldest_due, exhausted_count, next_due = db.execute(select(
             func.count().filter(pending),
             func.min(timestamp).filter(pending),
             func.count().filter(pending, due),
             func.min(eligible_since).filter(pending, due),
             func.count().filter(exhausted),
+            func.min(model.next_attempt_at).filter(pending, ~due),
         ).select_from(model)).one()
         result[label] = {
             "queued": total,
@@ -92,6 +94,7 @@ def queue_summary(db):
             "scheduled": total - due_count,
             "oldest_due_seconds": max(0, int((now - as_utc(oldest_due)).total_seconds())) if oldest_due else None,
             "exhausted": exhausted_count,
+            "next_scheduled_seconds": max(0, ceil((as_utc(next_due) - now).total_seconds())) if next_due else None,
         }
     result["uncertain_actions"] = db.scalar(select(func.count()).select_from(Approval).where(
         Approval.execution_status.in_(["ambiguous", "disputed", "blocked_prior_outcome"]))) or 0
@@ -112,10 +115,13 @@ def operational_snapshot(db, *, preview=False):
     for item in workflow_activity(db):
         last = item["last"]
         state = "disabled" if preview else "stale" if not item["recent"] else "failed" if last.event == "work_failed" else "healthy"
+        failure_details = item["failure"].details if item["failure"] else {}
+        last_failure_reason = "Database lock wait exceeded" if isinstance(failure_details, dict) and failure_details.get("reason") == "database_lock_timeout" else None
         workers.append({"number": item["number"], "label": item["label"], "state": state,
                         "recent_poll": item["recent"], "last_poll": as_utc(last.created_at).isoformat() if last else None,
                         "last_success": as_utc(item["success"].created_at).isoformat() if item["success"] else None,
-                        "last_failure": as_utc(item["failure"].created_at).isoformat() if item["failure"] else None})
+                        "last_failure": as_utc(item["failure"].created_at).isoformat() if item["failure"] else None,
+                        "last_failure_reason": last_failure_reason})
         if state in ("stale", "failed"):
             alert(f"worker_{item['number']}_{state}", "warning", f"{item['label']} worker: {state}.",
                   "Inspect private n8n execution logs and database connectivity before retrying.")

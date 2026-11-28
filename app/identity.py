@@ -10,7 +10,6 @@ from app.models import OperatorAccount, OperatorSession, LoginBucket, Audit, utc
 from app.config import settings
 
 ROLES = ("admin", "support", "reviewer", "auditor")
-SESSION_HOURS = 8
 ITERATIONS = 600_000
 WINDOW_SECONDS = 900
 MAX_FAILURES = 5
@@ -123,14 +122,16 @@ def managed_login(db, username, password, client_address, *, previous_token=None
     # Successful reauthentication replaces the presented session, even on account switch.
     if isinstance(previous_token, str) and previous_token.isascii() and 32 <= len(previous_token) <= 128:
         db.execute(delete(OperatorSession).where(OperatorSession.token_hash == _digest(previous_token)))
-    # Limit active sessions per account without weakening revocation.
+    # Keep the most recently expiring sessions, with deterministic ties.
+    # Configuration only tightens the existing five-session maximum.
     older = list(db.scalars(select(OperatorSession.token_hash).where(
-        OperatorSession.account_id == account.id).order_by(OperatorSession.expires_at.desc()).offset(4)))
+        OperatorSession.account_id == account.id).order_by(
+        OperatorSession.expires_at.desc(), OperatorSession.token_hash).offset(settings.operator_max_sessions - 1)))
     if older:
         db.execute(delete(OperatorSession).where(OperatorSession.token_hash.in_(older)))
     token = secrets.token_urlsafe(32)
     db.add(OperatorSession(token_hash=_digest(token), account_id=account.id,
-                           expires_at=now + timedelta(hours=SESSION_HOURS)))
+                           expires_at=utcnow() + timedelta(minutes=settings.operator_session_minutes)))
     _event(db, account, "operator_signed_in", account.username)
     db.commit()
     return account, token, 0
@@ -160,7 +161,9 @@ def session_account(db, token, *, refresh=False, lock_mutation=False):
         OperatorSession.token_hash == digest, OperatorSession.account_id == account.id,
         OperatorSession.expires_at > utcnow()
     ).with_for_update(read=True).execution_options(populate_existing=True))
-    return account if session else None
+    # PostgreSQL can wait on the row lock after the query's expiry predicate
+    # was bound. Recheck the wall clock after the lock is actually acquired.
+    return account if session and _aware(session.expires_at) > utcnow() else None
 
 
 def revoke_session(db, token, account):
@@ -178,7 +181,10 @@ def manage_account(db, username, action, role=None, password=None, *, actor="dep
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(607291041)"))
     if protect_last_admin:
-        administrator = session_account(db, administrator_token, refresh=True)
+        # Acquire the acting account/session locks only after the global
+        # account-management lock. Explicit sign-out does not take that
+        # global lock, so revalidation alone cannot serialize with logout.
+        administrator = session_account(db, administrator_token, lock_mutation=True)
         if not administrator or administrator.role != "admin" or administrator.username != actor:
             raise PermissionError("Administrator session no longer authorized.")
     account = db.scalar(select(OperatorAccount).where(OperatorAccount.username == username).with_for_update())

@@ -207,3 +207,29 @@ def test_production_unexpected_failure_is_sanitized(boundary_client, monkeypatch
     assert "private synthetic payload" not in response.text
     assert "private synthetic payload" not in caplog.text
     assert "unexpected_request_failure" in caplog.text
+
+
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "https://sibling.example.test"},
+    {"Origin": "null"},
+    {"Sec-Fetch-Site": "same-site"},
+    {"Sec-Fetch-Site": "cross-site"},
+])
+def test_managed_cross_origin_forms_fail_even_with_valid_token(boundary_client, monkeypatch, headers):
+    monkeypatch.setattr(settings, "managed_identity", True)
+    monkeypatch.setattr(settings, "operator_origin", "https://console.example.test")
+    response = boundary_client.post("/login", headers=headers, data={
+        "username": "synthetic-admin", "password": "synthetic-password", "csrf_token": token(boundary_client)})
+    assert response.status_code == 403
+
+
+def test_operator_origin_configuration():
+    from app.config import Settings
+    from pydantic import ValidationError
+    assert Settings(_env_file=None, operator_origin="https://localhost:8444").operator_origin == "https://localhost:8444"
+    assert Settings(_env_file=None, operator_origin="https://EXAMPLE.test:443").operator_origin == "https://example.test"
+    for value in ("http://example.test", "https://example.test/path", "https://user@example.test",
+                  "https://example.test:99999", "https://example.test?query=1"):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, operator_origin=value)

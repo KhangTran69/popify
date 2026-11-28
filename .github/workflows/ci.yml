@@ -24,6 +24,7 @@ jobs:
       - run: python -m pip install -r requirements-test.lock -e '.[test]'
       - run: python -m pytest -q
       - run: python -m scripts.validate_workflows
+      - run: node --test scripts/test_n8n_retention.cjs
 
   postgres-concurrency:
     runs-on: ubuntu-latest
@@ -137,11 +138,11 @@ jobs:
 
   scheduled-workload:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        profile: [steady, overload]
+        profile: [steady, overload, mixed, sustained]
     steps:
       - uses: actions/checkout@v7
       - name: Configure disposable mock stack
@@ -224,6 +225,23 @@ jobs:
             bindings=$(docker inspect --format '{{json .HostConfig.PortBindings}}' "$id")
             test "$bindings" = '{}' || test "$bindings" = 'null'
           done
+      - name: Verify API runtime confinement
+        run: |
+          id=$(docker compose -f docker-compose.yml -f deploy/staging.compose.yml ps -q api)
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$id")" = true
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'
+          import os, tempfile
+          from pathlib import Path
+          status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
+          assert os.getuid() == 10001 and os.getgid() == 10001
+          assert int(status["CapEff"].strip(), 16) == 0
+          assert status["NoNewPrivs"].strip() == "1"
+          assert not os.path.exists("/var/run/docker.sock")
+          assert not os.access("/srv", os.W_OK)
+          with tempfile.TemporaryFile(dir="/tmp") as handle:
+              handle.write(b"synthetic")
+          print("PASS: non-root API, no effective capabilities, read-only root, no privilege escalation and bounded temporary storage")
+          PY
       - name: Verify private staging network separation
         run: |
           for service in db n8n operator-gateway; do
@@ -237,12 +255,24 @@ jobs:
           from pathlib import Path
           root = Path(os.environ["RUNNER_TEMP"])
           networks = {name: set(json.loads((root / (name + ".network.json")).read_text())) for name in ("api","db","n8n","operator-gateway")}
-          peers = [networks[name] for name in ("db","n8n","operator-gateway")]
-          assert all(len(peer) == 1 for peer in peers)
-          assert len(set.union(*peers)) == 3 and networks["api"] == set.union(*peers)
-          print("PASS: database, worker and operator network membership isolated; API is sole shared service")
+          db, worker, gateway, api = (networks[name] for name in ("db","n8n","operator-gateway","api"))
+          assert len(db) == len(worker) == 1 and not db & worker
+          assert len(gateway) == 2 and len(api) == 3
+          assert len(gateway & api) == 1 and not gateway & (db | worker)
+          assert api == db | worker | (gateway & api)
+          import subprocess
+          for network in api | gateway:
+              internal = subprocess.check_output(["docker", "network", "inspect", "--format", "{{.Internal}}", network], text=True).strip()
+              assert internal == ("true" if network in api else "false")
+          print("PASS: isolated internal data, worker and operator planes; gateway alone has a host-facing network")
           PY
           docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T n8n node -e 'const dns=require("node:dns").promises; (async()=>{await dns.lookup("api");try{await dns.lookup("db")}catch(e){if(e.code==="ENOTFOUND"||e.code==="EAI_AGAIN")return;throw e}throw Error("database resolved from worker network")})().catch(()=>process.exit(1))'
+          docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'
+          from pathlib import Path
+          routes = [line.split() for line in Path("/proc/net/route").read_text().splitlines()[1:]]
+          assert not any(row[1] == "00000000" and int(row[3], 16) & 1 for row in routes), "Mock API unexpectedly has an IPv4 default route"
+          print("PASS: private mock API has no ordinary IPv4 default route")
+          PY
       - name: Provision synthetic accounts
         run: |
           docker compose -f docker-compose.yml -f deploy/staging.compose.yml exec -T api python - <<'PY'
@@ -254,6 +284,24 @@ jobs:
           PY
       - name: Validate actual HTTPS identity and route isolation
         run: python -m scripts.verify_staging --ca "$POPIFY_STAGING_TLS_DIR/tls.crt" --confirm-disposable
+      - name: Verify gateway recovers after API replacement without gateway restart
+        run: |
+          dc() { docker compose -f docker-compose.yml -f deploy/staging.compose.yml "$@"; }
+          gateway=$(dc ps -q operator-gateway)
+          old=$(dc ps -q api)
+          dc stop api
+          status=$(curl --silent --max-time 10 --cacert "$POPIFY_STAGING_TLS_DIR/tls.crt" -o /dev/null -w '%{http_code}' https://localhost:8444/live)
+          test "$status" = 502 || test "$status" = 504
+          dc up -d --no-deps --force-recreate --wait --wait-timeout 120 api
+          test "$(dc ps -q api)" != "$old"
+          for i in $(seq 1 30); do
+            if curl --silent --fail --max-time 5 --cacert "$POPIFY_STAGING_TLS_DIR/tls.crt" https://localhost:8444/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --silent --fail --max-time 5 --cacert "$POPIFY_STAGING_TLS_DIR/tls.crt" https://localhost:8444/ready >/dev/null
+          test "$(dc ps -q operator-gateway)" = "$gateway"
+          test "$(curl --silent --max-time 5 --cacert "$POPIFY_STAGING_TLS_DIR/tls.crt" -o /dev/null -w '%{http_code}' https://localhost:8444/api/n8n/triage-next)" = 404
+          echo "PASS: private gateway fails closed during API outage and recovers after replacement without restart"
       - name: Install isolated pinned browser tools
         run: |
           npm install --prefix "$RUNNER_TEMP/popify-browser" --no-audit --no-fund --ignore-scripts playwright@1.51.1 axe-core@4.10.3

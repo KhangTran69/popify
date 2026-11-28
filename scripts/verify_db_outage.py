@@ -10,9 +10,10 @@ import httpx
 from sqlalchemy import select
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Delivery, Order
+from app.models import Delivery, Order, Case, Approval
 
 KEY = "ci-db-interruption-retry"
+SUPPORT_KEY = "ci-db-interruption-support-retry"
 
 
 def main():
@@ -31,28 +32,39 @@ def main():
     with httpx.Client(base_url="http://127.0.0.1:8000", timeout=15) as client:
         def post():
             return client.post("/webhooks/shopify/orders", content=raw, headers=headers)
+        def support():
+            return client.post("/api/support", json={"message": "Synthetic damaged item", "request_key": SUPPORT_KEY},
+                               headers={"X-N8N-Secret": settings.n8n_webhook_secret})
         if args.stage == "unavailable":
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                pending = pool.submit(post)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                pending = [pool.submit(post), pool.submit(support)]
                 assert client.get("/live", timeout=3).status_code == 200
-                response = pending.result(timeout=15)
-            assert response.status_code == 503, response.status_code
-            assert response.headers.get("X-Correlation-ID")
-            assert response.headers.get("Retry-After") == "5"
-            assert response.json() == {"detail": "Database temporarily unavailable. Try again later."}
-            print("PASS: signed delivery was not acknowledged during database outage; liveness remained responsive")
+                responses = [future.result(timeout=15) for future in pending]
+            for response in responses:
+                assert response.status_code == 503, response.status_code
+                assert response.headers.get("X-Correlation-ID")
+                assert response.headers.get("Retry-After") == "5"
+                assert response.json() == {"detail": "Database temporarily unavailable. Try again later."}
+            print("PASS: signed delivery and support inquiry were not acknowledged during database outage; liveness remained responsive")
             return
         response = post()
         assert response.status_code == 202, response.status_code
         delivery_id = response.json()["delivery_id"]
         assert post().status_code == 200
+        first_case = support()
+        assert first_case.status_code == 202
+        repeated_case = support()
+        assert repeated_case.status_code == 202 and repeated_case.json()["case_id"] == first_case.json()["case_id"]
         response = client.post(f"/api/n8n/process-delivery/{delivery_id}", headers={"X-N8N-Secret": settings.n8n_webhook_secret})
         assert response.status_code == 200 and response.json()["status"] == "processed"
         assert client.post(f"/api/n8n/process-delivery/{delivery_id}", headers={"X-N8N-Secret": settings.n8n_webhook_secret}).json()["status"] == "duplicate"
     with SessionLocal() as db:
         assert len(list(db.scalars(select(Delivery).where(Delivery.webhook_id == KEY)))) == 1
         assert len(list(db.scalars(select(Order).where(Order.external_id == KEY)))) == 1
-    print("PASS: same signed delivery retried after database recovery; one delivery and one order persisted")
+        cases = list(db.scalars(select(Case).where(Case.request_key == SUPPORT_KEY)))
+        assert len(cases) == 1 and cases[0].status == "queued" and cases[0].attempts == 0
+        assert not list(db.scalars(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == cases[0].id)))
+    print("PASS: signed delivery and support retried after database recovery; exactly one delivery, order and queued inquiry persisted")
 
 
 if __name__ == "__main__":

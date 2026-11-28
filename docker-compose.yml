@@ -38,8 +38,8 @@ services:
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
       GENERIC_TIMEZONE: UTC
       EXECUTIONS_DATA_PRUNE: "true"
-      EXECUTIONS_DATA_MAX_AGE: "168"
-      EXECUTIONS_DATA_PRUNE_MAX_COUNT: "10000"
+      EXECUTIONS_DATA_MAX_AGE: "${N8N_EXECUTION_RETENTION_HOURS:-168}"
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: "${N8N_EXECUTION_RETENTION_COUNT:-10000}"
     entrypoint: ["/bin/sh", "/commerceops-scripts/n8n-entrypoint.sh"]
     volumes: ["n8n_data:/home/node/.n8n", "./workflows:/workflows:ro", "./scripts:/commerceops-scripts:ro"]
     depends_on: [api]

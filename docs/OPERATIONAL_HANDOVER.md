@@ -29,3 +29,7 @@ Take verified encrypted backups before changes. For a compatible code-only rollb
 
 ## Conditional work still requiring approval
 Approved notification destination, real host and certificate, independent security review, backup custody/offsite/PITR, approved privacy/retention policy, representative merchant traffic and usability evidence, manual accessibility review, Shopify development-store and provider sandbox access. Commercialization, shared multi-store operation and live financial actions remain outside this mock staging scope.
+
+For the local alert scheduler, treat monitor exit 2 as an unavailable snapshot, state failure or overdue delivery handoff; inspect the structured status and handoff fields. Route that escalation independently of the ordinary alert relay so a stalled receiver cannot suppress its own outage. The proposed unacknowledged age threshold is 900 seconds until the designated owner approves a different value. Use database-independent --list-pending to drain and acknowledge existing event IDs after durable delivery; do not delete the outbox to clear the alarm.
+
+Verify the ingress plane contains only the gateway and that all three API-attached networks are internal. The mock-only API must have no ordinary IPv4 default route. Use the actual host firewall and container network evidence during handover; do not expose the API or attach a general outbound network to enable live integrations.

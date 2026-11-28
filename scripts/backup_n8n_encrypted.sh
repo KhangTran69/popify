@@ -18,12 +18,21 @@ id=$(docker compose ps -aq n8n)
 volume=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.n8n"}}{{.Name}}{{end}}{{end}}' "$id")
 image=$(docker inspect --format '{{.Image}}' "$id")
 [[ -n "$volume" && -n "$image" ]] || exit 2
+# Detect start/stop cycles and container replacement, not only the running flag.
+state=$(docker inspect --format '{{.State.Status}} {{.State.StartedAt}} {{.State.FinishedAt}} {{.RestartCount}}' "$id")
+[[ "$state" == exited\ * && -z "$(docker ps -q --filter "volume=$volume")" ]] || {
+  echo "Require stopped n8n and no running container using its volume" >&2; exit 2;
+}
 temp=$(mktemp -- "$output.tmp.XXXXXX")
 trap 'rm -f -- "$temp"' EXIT
 docker run --rm --network none --user 0 --mount "type=volume,source=$volume,target=/state,readonly" \
   --entrypoint sh "$image" -ec 'test -s /state/database.sqlite; tar -C /state -cf - .' |
   gpg --batch --yes --trust-model always --recipient "$recipient" --encrypt --output "$temp"
 test -s "$temp"
-[[ "$(docker inspect --format '{{.State.Running}}' "$id")" == false ]] || { echo "n8n started during backup; refusing archive" >&2; exit 2; }
-ln -T -- "$temp" "$output"
+[[ "$(docker compose ps -aq n8n)" == "$id" &&
+   "$(docker inspect --format '{{.State.Status}} {{.State.StartedAt}} {{.State.FinishedAt}} {{.RestartCount}}' "$id")" == "$state" &&
+   -z "$(docker ps -q --filter "volume=$volume")" ]] || {
+  echo "n8n lifecycle or volume use changed during backup; refusing archive" >&2; exit 2;
+}
+python3 "$(dirname "${BASH_SOURCE[0]}")/publish_encrypted_archive.py" "$temp" "$output"
 echo "Encrypted n8n state archived; preserve the matching encryption key separately."

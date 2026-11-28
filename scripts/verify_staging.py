@@ -24,8 +24,9 @@ def client(cafile):
         urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)))
 
 
-def call(opener, path, data=None):
-    request = urllib.request.Request(BASE + path, data=urllib.parse.urlencode(data).encode() if data is not None else None)
+def call(opener, path, data=None, headers=None):
+    request = urllib.request.Request(BASE + path, data=urllib.parse.urlencode(data).encode() if data is not None else None,
+                                     headers=headers or {})
     try:
         with opener.open(request, timeout=10) as response:
             return response.status, response.headers, response.read().decode()
@@ -62,10 +63,14 @@ def run():
         time.sleep(1)
     else:
         raise RuntimeError("Private TLS gateway did not become available")
-    for path in ("/api/n8n/process-next", "/api/support", "/webhooks/shopify/orders", "/demo", "/docs", "/openapi.json"):
+    for path in ("/api/n8n/process-next", "/api/support", "/webhooks/shopify/orders", "/demo", "/docs", "/openapi.json", "/health", "/unknown-future-route",
+                 "/approvals/1/preview-run", "/api/unknown", "/webhooks%2Fshopify%2Forders"):
         assert call(admin, path)[0] == 404, path
     assert call(admin, "/api/ops/status")[0] == 401
     assert call(admin, "/ready")[0] == 200
+    forged = {"username": "ci-staging-admin", "password": PASSWORD, "csrf_token": csrf(admin)}
+    assert call(admin, "/login", forged, {"Origin": "https://other.example.test"})[0] == 403
+    assert call(admin, "/login", forged, {"Sec-Fetch-Site": "same-site"})[0] == 403
     admin_token = login(admin, "ci-staging-admin")
     status, headers, body = call(admin, "/operators")
     assert status == 200 and "ci-staging-auditor" in body and "pbkdf2_sha256" not in body

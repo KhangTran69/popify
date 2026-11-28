@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import tempfile
+import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -44,31 +45,58 @@ def alert_transitions(previous, snapshot, now, repeat_seconds):
 MAX_PENDING_EVENTS = 500
 
 
+def private_directory(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ValueError("Use an existing owner-only state directory")
+
+
+def private_regular(fd):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ValueError("Use an owner-only regular state file")
+    return info
+
+
 @contextmanager
 def locked_state(path):
     path = Path(path)
-    if not path.parent.is_dir() or path.is_symlink():
-        raise ValueError("Use a trusted existing directory and regular state file.")
+    private_directory(path.parent)
     lock_path = path.with_name(path.name + ".lock")
-    with os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), "r+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if path.exists():
-            # Limit reads and reject symlinks and non-regular files before parsing.
-            if not path.is_file() or path.is_symlink() or path.stat().st_size > 512_000:
-                raise ValueError("Invalid monitor state file")
-            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "r") as source:
-                previous = json.loads(source.read(512_001))
-        else:
+    # Nonblocking open prevents a planted FIFO from hanging the scheduler.
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        # Inspect the descriptor before creating a seekable text stream.
+        private_regular(lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
             previous = None
+        else:
+            try:
+                info = private_regular(fd)
+                if info.st_size > 512_000:
+                    raise ValueError("Invalid monitor state file")
+                with os.fdopen(fd, "r", closefd=False) as source:
+                    previous = json.loads(source.read(512_001))
+            finally:
+                os.close(fd)
         yield path, previous
+    finally:
+        os.close(lock_fd)
 
 
 def atomic_write(path, value):
+    # Never publish a file that the next bounded reader would reject.
+    encoded = json.dumps(value, sort_keys=True)
+    if len(encoded.encode("utf-8")) > 512_000:
+        raise ValueError("Alert state exceeds durable storage bound")
     temp = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".monitor-", delete=False) as output:
             temp = output.name
-            json.dump(value, output, sort_keys=True)
+            output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temp, path)
@@ -135,8 +163,18 @@ def update_outbox(path, snapshot=None, repeat_seconds=900, *, acknowledge=None):
                 raise ValueError("Alert outbox is full")
             pending = pending + [{**event, "event_id": uuid.uuid4().hex, "observed_at_epoch": now}
                                  for event in events]
-        atomic_write(path, {"version": 1, "state": state, "pending": pending})
+        # A relay can drain a saturated outbox without collecting a snapshot
+        # or rewriting the durable state. Existing IDs and ordering are preserved.
+        if acknowledge is not None or snapshot is not None:
+            atomic_write(path, {"version": 1, "state": state, "pending": pending})
         return pending
+
+
+def handoff_summary(pending, now, max_unacknowledged_seconds):
+    age = max(0, now - min(e["observed_at_epoch"] for e in pending)) if pending else None
+    return {"pending_count": len(pending), "oldest_pending_seconds": age,
+            "status": "clear" if age is None else "overdue" if age >= max_unacknowledged_seconds else "awaiting_acknowledgement",
+            "max_unacknowledged_seconds": max_unacknowledged_seconds}
 
 
 def main(argv=None):
@@ -144,11 +182,30 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--state-file", help="private local JSON state file for transition deduplication")
     mode.add_argument("--outbox-file", help="private durable alert outbox with explicit delivery acknowledgement")
-    parser.add_argument("--ack-event", help="acknowledge a delivered event ID; requires --outbox-file")
+    relay = parser.add_mutually_exclusive_group()
+    relay.add_argument("--ack-event", help="acknowledge a delivered event ID; requires --outbox-file")
+    relay.add_argument("--list-pending", action="store_true",
+                       help="read pending events without polling the database; requires --outbox-file")
     parser.add_argument("--repeat-seconds", type=int, default=900)
+    parser.add_argument("--max-unacknowledged-seconds", type=int, default=900,
+                        help="escalate a stalled alert handoff independently of business health")
     args = parser.parse_args(argv)
     if not 60 <= args.repeat_seconds <= 86400:
         parser.error("repeat-seconds must be between 60 and 86400")
+    if not 60 <= args.max_unacknowledged_seconds <= 86400:
+        parser.error("max-unacknowledged-seconds must be between 60 and 86400")
+    if args.list_pending:
+        if not args.outbox_file:
+            parser.error("--list-pending requires --outbox-file")
+        try:
+            pending = update_outbox(args.outbox_file)
+        except (OSError, ValueError):
+            print(json.dumps({"status": "unavailable", "state_error": "Unable to read alert outbox."}))
+            return 2
+        print(json.dumps({"status": "pending" if pending else "clear",
+                          "pending_count": len(pending), "pending_events": pending,
+                          "handoff": handoff_summary(pending, int(time.time()), args.max_unacknowledged_seconds)}))
+        return 1 if pending else 0
     if args.ack_event:
         if not args.outbox_file or len(args.ack_event) != 32 or any(c not in "0123456789abcdef" for c in args.ack_event):
             parser.error("--ack-event requires --outbox-file and a valid event ID")
@@ -173,9 +230,7 @@ def main(argv=None):
             if args.outbox_file:
                 pending = update_outbox(args.outbox_file, snapshot, args.repeat_seconds)
                 snapshot["pending_events"] = pending
-                snapshot["handoff"] = {"pending_count": len(pending),
-                    "oldest_pending_seconds": max(0, int(time.time()) - min(e["observed_at_epoch"] for e in pending)) if pending else None,
-                    "status": "awaiting_acknowledgement" if pending else "clear"}
+                snapshot["handoff"] = handoff_summary(pending, int(time.time()), args.max_unacknowledged_seconds)
             else:
                 snapshot["transitions"] = update_state(args.state_file, snapshot, args.repeat_seconds)
         except (OSError, ValueError):
@@ -183,7 +238,7 @@ def main(argv=None):
             print(json.dumps(snapshot))
             return 2
     print(json.dumps(snapshot))
-    return 2 if snapshot["status"] == "unavailable" else 1 if snapshot["alerts"] or snapshot.get("pending_events") else 0
+    return 2 if snapshot["status"] == "unavailable" or snapshot.get("handoff", {}).get("status") == "overdue" else 1 if snapshot["alerts"] or snapshot.get("pending_events") else 0
 
 
 if __name__ == "__main__":

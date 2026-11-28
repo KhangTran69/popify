@@ -18,24 +18,49 @@ cleanup() {
   rm -rf -- "$work"
 }
 trap cleanup EXIT
-docker compose stop n8n
+# The preceding PostgreSQL outage/restore exercise leaves n8n stopped.
+docker compose up -d --no-deps --wait --wait-timeout 180 n8n
 id=$(docker compose ps -aq n8n)
 source=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.n8n"}}{{.Name}}{{end}}{{end}}' "$id")
 image=$(docker inspect --format '{{.Image}}' "$id")
 [[ -n "$source" && -n "$image" ]]
 digest() {
+  # Compare every regular file in the stopped synthetic volume, not only the
+  # database and import marker. Hash filenames and contents without printing them.
   docker run --rm --network none --user 0 --mount "type=volume,source=$1,target=/state,readonly" \
-    --entrypoint sh "$image" -ec 'cd /state; sha256sum database.sqlite commerceops-workflows-sha'
+    --entrypoint sh "$image" -ec 'set -o pipefail; cd /state; test -s database.sqlite; test -s commerceops-workflows-sha; find . -type f -exec sha256sum {} \; | LC_ALL=C sort | sha256sum'
 }
-original=$(digest "$source")
+api_image=$(docker inspect --format '{{.Image}}' "$(docker compose ps -q api)")
+sqlite_integrity() {
+  docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m --user 0 \
+    --mount "type=volume,source=$1,target=/state,readonly" --entrypoint python "$api_image" -c '
+import pathlib, shutil, sqlite3
+for name in ("database.sqlite", "database.sqlite-wal", "database.sqlite-journal"):
+    source = pathlib.Path("/state") / name
+    if source.exists():
+        shutil.copyfile(source, pathlib.Path("/tmp") / name)
+with sqlite3.connect("/tmp/database.sqlite") as db:
+    assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+'
+}
 gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "PoPify CI n8n <n8n@example.test>" rsa2048 encr 1d >/dev/null 2>&1
 recipient=$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10;exit}')
 started=$(date +%s)
+source scripts/verify_recovery_keyring.sh
+prepare_backup_keyring "$work" "$recipient"
+if bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/running.gpg"; then
+  echo "Backup of running n8n unexpectedly permitted" >&2; exit 1
+fi
+[[ ! -e "$work/running.gpg" ]]
+docker compose stop n8n
+# Verify a private temporary copy including any stopped WAL/journal.
+# SQLite may replay a journal on that copy, never on the source volume.
+sqlite_integrity "$source"
+original=$(digest "$source")
 bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/n8n.gpg"
 if bash scripts/backup_n8n_encrypted.sh "$recipient" "$work/n8n.gpg"; then
   echo "Archive overwrite unexpectedly allowed" >&2; exit 1
 fi
-source scripts/verify_recovery_keyring.sh
 prepare_recovery_keyring "$work" "$recipient" "$work/n8n.gpg"
 volume="popify-ci-n8n-$(basename "$work" | tr -cd 'a-zA-Z0-9')"
 docker volume create "$volume" >/dev/null
@@ -43,6 +68,8 @@ gpg --batch --decrypt "$work/n8n.gpg" |
   docker run --rm -i --network none --user 0 --mount "type=volume,source=$volume,target=/state" \
     --entrypoint sh "$image" -ec 'tar -C /state -xf -; chown -R node:node /state'
 [[ "$(digest "$volume")" == "$original" ]]
+sqlite_integrity "$volume"
+echo "PASS: running-volume backup rejected; complete stopped-volume file digest and SQLite integrity match before startup"
 cat > "$work/restore.yml" <<EOF
 volumes:
   n8n_data:

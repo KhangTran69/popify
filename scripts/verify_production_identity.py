@@ -8,7 +8,7 @@ import re
 import uuid
 import time
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, select, text, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 
@@ -17,7 +17,8 @@ from app.config import settings
 from app.db import engine, get_db
 from app.schema import migration_paths
 from scripts.migrate import migrate
-from app.identity import manage_account, managed_login, session_account
+from app.identity import manage_account, managed_login, session_account, revoke_session
+from app import identity
 from app.models import Approval, Audit, Case, ActionExecution, ExecutionReconciliation, Delivery, Order, utcnow
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -98,6 +99,87 @@ def verify_support_batches(sessions):
         future = db.scalar(select(Case).where(Case.request_key == "production-support-future"))
         assert future.status == "failed" and future.attempts == 1
     print("PASS: competing support batches created nine pending approvals exactly once at five-item limit and skipped future retry")
+
+
+def verify_worker_lock_contention(sessions):
+    """A lock timeout must preserve previously committed work and retry budgets."""
+    now = utcnow()
+    first_key, blocked_key = "ci-lock-first", "ci-lock-blocked"
+    with sessions() as db:
+        for key, external in ((first_key, first_key), (blocked_key, "production-batch-0")):
+            db.add(Delivery(webhook_id=key, topic="orders/create", shop_domain="demo.myshopify.com",
+                            payload={"id": external, "created_at": now.isoformat(), "updated_at": now.isoformat()},
+                            status="received"))
+        db.commit()
+    headers = {"X-N8N-Secret": settings.n8n_webhook_secret}
+    with TestClient(main.app, base_url="https://testserver", follow_redirects=False) as client:
+        with sessions() as blocker:
+            blocker.scalar(select(Order).where(Order.external_id == "production-batch-0").with_for_update())
+            response = client.post("/api/n8n/process-next?batch_size=5", headers=headers)
+            assert response.status_code == 503 and response.headers["Retry-After"] == "5"
+            with sessions() as db:
+                first = db.scalar(select(Delivery).where(Delivery.webhook_id == first_key))
+                blocked = db.scalar(select(Delivery).where(Delivery.webhook_id == blocked_key))
+                assert first.status == "processed" and first.attempts == 1
+                assert blocked.status == "received" and blocked.attempts == 0
+                last = db.scalar(select(Audit).where(Audit.entity_type == "workflow", Audit.entity_id == 1).order_by(Audit.id.desc()).limit(1))
+                assert last.event == "work_failed" and last.details == {"status": "unavailable", "reason": "database_lock_timeout"}
+            blocker.rollback()
+        assert client.post("/api/n8n/process-next?batch_size=5", headers=headers).json()["outcomes"]["processed"] == 1
+        with sessions() as db:
+            blocked = db.scalar(select(Delivery).where(Delivery.webhook_id == blocked_key))
+            assert blocked.status == "processed" and blocked.attempts == 1
+            db.add(Case(request_key="ci-lock-support", message="Synthetic inquiry", status="queued"))
+            db.commit()
+        with sessions() as blocker:
+            blocker.execute(text("LOCK TABLE approvals IN SHARE MODE"))
+            response = client.post("/api/n8n/triage-next?batch_size=5", headers=headers)
+            assert response.status_code == 503
+            with sessions() as db:
+                case = db.scalar(select(Case).where(Case.request_key == "ci-lock-support"))
+                assert case.status == "queued" and case.attempts == 0
+                assert not list(db.scalars(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id)))
+                last = db.scalar(select(Audit).where(Audit.entity_type == "workflow", Audit.entity_id == 2).order_by(Audit.id.desc()).limit(1))
+                assert last.event == "work_failed" and last.details["reason"] == "database_lock_timeout"
+            blocker.rollback()
+        assert client.post("/api/n8n/triage-next?batch_size=5", headers=headers).json()["outcomes"]["needs_review"] == 1
+        with sessions() as db:
+            case = db.scalar(select(Case).where(Case.request_key == "ci-lock-support"))
+            assert case.status == "needs_review" and case.attempts == 1
+            approvals = list(db.scalars(select(Approval).where(Approval.subject_type == "case", Approval.subject_id == case.id)))
+            assert len(approvals) == 1 and approvals[0].status == "pending"
+    print("PASS: PostgreSQL worker lock timeout returns retryable 503, preserves committed batch items and retry budgets, then drains exactly once")
+
+
+def verify_delayed_scan_contention(sessions):
+    keys = [f"ci-delayed-scan-{i}" for i in range(8)]
+    locked_key = keys[-1]
+    with sessions() as db:
+        for key in keys:
+            db.add(Order(external_id=key, order_number=key, created_at=utcnow()-timedelta(hours=settings.order_delay_hours+1)))
+        db.commit()
+    def scan():
+        with sessions() as db:
+            from app.workers import scan_delayed_orders
+            return scan_delayed_orders(db)
+    with sessions() as blocker:
+        locked = blocker.scalar(select(Order).where(Order.external_id == locked_key).with_for_update())
+        locked.fulfillment_status = "fulfilled"
+        blocker.flush()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: scan(), range(2)))
+        assert sum(result[1] for result in results) == len(keys)-1, results
+        blocker.commit()
+    assert scan()[1] == 0
+    with sessions() as db:
+        orders = list(db.scalars(select(Order).where(Order.external_id.in_(keys))))
+        for order in orders:
+            approvals = list(db.scalars(select(Approval).where(
+                Approval.subject_type == "order", Approval.subject_id == order.id,
+                Approval.proposed_action == "review_delayed_order")))
+            assert len(approvals) == (0 if order.external_id == locked_key else 1)
+            assert all(a.status == "pending" for a in approvals)
+    print("PASS: competing delayed scans report only their own inserts and skip an order being fulfilled")
 
 
 def verify_recovery(sessions, worker, support, support_token, reviewer, reviewer_token):
@@ -208,6 +290,120 @@ def verify_mutation_revocation_order(sessions):
     print("PASS: revocation serialized with authorized mutation; stale session denied after commit")
 
 
+def verify_admin_logout_order(sessions):
+    """An administrator's logout must serialize with account administration."""
+    with sessions() as db:
+        manage_account(db, "ci-race-admin", "create", role="admin", password=PASSWORD)
+        manage_account(db, "ci-race-target", "create", role="support", password=PASSWORD)
+        _, admin_token, wait = managed_login(db, "ci-race-admin", PASSWORD, "synthetic-admin-race")
+        assert admin_token and not wait
+
+    checked, release, logout_attempted = Event(), Event(), Event()
+    original_lookup = identity.session_account
+
+    def pause_after_revalidation(db, token, **kwargs):
+        account = original_lookup(db, token, **kwargs)
+        checked.set()
+        if not release.wait(10):
+            raise RuntimeError("Administrator race synchronization timed out")
+        return account
+
+    def change_role():
+        with sessions() as db:
+            manage_account(db, "ci-race-target", "role", role="reviewer",
+                           actor="ci-race-admin", protect_last_admin=True,
+                           administrator_token=admin_token)
+
+    def sign_out():
+        with sessions() as db:
+            account = original_lookup(db, admin_token)
+            assert account is not None
+            logout_attempted.set()
+            revoke_session(db, admin_token, account)
+
+    identity.session_account = pause_after_revalidation
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            change = pool.submit(change_role)
+            try:
+                assert checked.wait(5)
+                logout = pool.submit(sign_out)
+                assert logout_attempted.wait(5)
+                # The administrator session remains locked through the mutation.
+                try:
+                    logout.result(timeout=.5)
+                except TimeoutError:
+                    pass
+                else:
+                    raise AssertionError("Logout committed before the authorized account mutation")
+            finally:
+                release.set()
+            change.result(timeout=10)
+            logout.result(timeout=10)
+    finally:
+        identity.session_account = original_lookup
+
+    with sessions() as db:
+        assert original_lookup(db, admin_token) is None
+        from app.models import OperatorAccount
+        target = db.scalar(select(OperatorAccount).where(OperatorAccount.username == "ci-race-target"))
+        assert target.role == "reviewer"
+        try:
+            manage_account(db, "ci-race-target", "disable", actor="ci-race-admin",
+                           protect_last_admin=True, administrator_token=admin_token)
+        except PermissionError:
+            db.rollback()
+        else:
+            raise AssertionError("Logged-out administrator was allowed to mutate an account")
+        assert db.scalar(select(OperatorAccount.active).where(OperatorAccount.username == "ci-race-target"))
+    print("PASS: administrator logout serialized with account mutation; logged-out administrator denied")
+
+
+def verify_session_expiry_during_lock(sessions):
+    """An expiry predicate bound before waiting on a row lock is not sufficient."""
+    from app.models import OperatorSession
+    with sessions() as db:
+        manage_account(db, "ci-expiry-race", "create", role="support", password=PASSWORD)
+        _, token, wait = managed_login(db, "ci-expiry-race", PASSWORD, "synthetic-expiry")
+        assert token and not wait
+    digest = identity._digest(token)
+    real_clock = identity.utcnow
+    clock = [real_clock()]
+    expiry = clock[0] + timedelta(minutes=1)
+    with sessions() as db:
+        row = db.get(OperatorSession, digest)
+        row.expires_at = expiry
+        db.commit()
+    entered = Event()
+    def lookup():
+        with sessions() as db:
+            connection = db.connection()
+            def before_execute(conn, cursor, statement, parameters, context, executemany):
+                if "operator_sessions" in statement and "FOR SHARE" in statement:
+                    entered.set()
+            event.listen(connection, "before_cursor_execute", before_execute)
+            try:
+                return session_account(db, token, lock_mutation=True)
+            finally:
+                event.remove(connection, "before_cursor_execute", before_execute)
+    identity.utcnow = lambda: clock[0]
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with sessions() as blocker:
+                blocker.scalar(select(OperatorSession).where(OperatorSession.token_hash == digest).with_for_update())
+                future = pool.submit(lookup)
+                try:
+                    assert entered.wait(5)
+                    assert not future.done()
+                    clock[0] = expiry + timedelta(seconds=1)
+                finally:
+                    blocker.rollback()
+            assert future.result(timeout=10) is None
+    finally:
+        identity.utcnow = real_clock
+    print("PASS: session expiration rechecked after waiting for PostgreSQL session lock")
+
+
 def run():
     if os.environ.get("POPIFY_CONFIRM_DISPOSABLE") != "1" or not settings.managed_identity or engine.dialect.name != "postgresql" or os.environ.get("POPIFY_ENV") != "production":
         raise RuntimeError("Requires explicit disposable PostgreSQL and production managed-identity configuration.")
@@ -272,8 +468,12 @@ def run():
                 assert approval.actor == "ci-reviewer" and approval.status == "approved"
                 assert execution and execution.state == "succeeded"
             verify_mutation_revocation_order(sessions)
+            verify_admin_logout_order(sessions)
+            verify_session_expiry_during_lock(sessions)
             verify_delivery_batches(sessions)
             verify_support_batches(sessions)
+            verify_worker_lock_contention(sessions)
+            verify_delayed_scan_contention(sessions)
             verify_recovery(sessions, admin, support, support_token, reviewer, reviewer_token)
             cookie = reviewer.cookies.get("session")
             assert admin.post("/operators/ci-reviewer", data={"action": "revoke", "csrf_token": admin_token}).status_code == 303

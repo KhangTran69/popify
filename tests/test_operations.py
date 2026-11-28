@@ -22,7 +22,8 @@ def test_due_scheduled_exhausted_and_uncertain_are_distinct():
             Approval(kind="support", subject_type="case", subject_id=2, proposed_action="send_reply",
                      status="approved", execution_status="disputed"),
             Approval(kind="support", subject_type="case", subject_id=3, proposed_action="send_reply", status="pending"),
-            Audit(entity_type="workflow", entity_id=1, event="work_failed", correlation_id="synthetic"),
+            Audit(entity_type="workflow", entity_id=1, event="work_failed", correlation_id="synthetic",
+                  details={"reason": "database_lock_timeout", "private": "do not expose"}),
             Audit(entity_type="workflow", entity_id=2, event="poll_completed", correlation_id="synthetic"),
         ])
         db.commit()
@@ -30,6 +31,10 @@ def test_due_scheduled_exhausted_and_uncertain_are_distinct():
         orders = result["queues"]["orders"]
         assert orders["queued"] == 2 and orders["due"] == 1 and orders["scheduled"] == 1
         assert 150 <= orders["oldest_due_seconds"] < 160
+        assert 290 <= orders["next_scheduled_seconds"] <= 300
+        assert result["queues"]["support"]["next_scheduled_seconds"] is None
+        assert result["workers"][0]["last_failure_reason"] == "Database lock wait exceeded"
+        assert "do not expose" not in str(result)
         assert result["queues"]["support"]["exhausted"] == 1
         assert result["queues"]["uncertain_actions"] == 2
         assert result["queues"]["pending_review"]["count"] == 1

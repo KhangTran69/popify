@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+# Fail before workflow import, publication or worker startup on unsafe retention.
+node /commerceops-scripts/n8n-retention.cjs
 # Preserve the existing database and encryption key. Workflow IDs make updates idempotent.
 marker=/home/node/.n8n/commerceops-workflows-sha
 fingerprint=$(cat /workflows/*.json | sha256sum | cut -d ' ' -f 1)

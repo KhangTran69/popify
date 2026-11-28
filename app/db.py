@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from app.config import settings
 
@@ -24,3 +24,9 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def bound_worker_lock_wait(db):
+    """Limit database lock contention per worker transaction, not provider runtime."""
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SET LOCAL lock_timeout = '3s'"))
